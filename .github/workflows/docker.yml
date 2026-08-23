@@ -9,16 +9,34 @@ on:
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/donkey
 
 jobs:
-  image:
-    runs-on: ubuntu-24.04
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            platform_tag: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            platform_tag: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           persist-credentials: false
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -27,34 +45,60 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build native image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ env.IMAGE }}:build-${{ github.sha }}-${{ github.run_id }}-${{ matrix.platform_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=donkey-${{ matrix.platform_tag }}
+          cache-to: type=gha,mode=max,scope=donkey-${{ matrix.platform_tag }}
+          provenance: mode=max
+          sbom: true
+
+  merge:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Log in to GHCR
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
         uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
         with:
-          images: ghcr.io/${{ github.repository_owner }}/donkey
+          images: ${{ env.IMAGE }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: mode=max
-          sbom: true
-      - name: Verify published multi-platform manifest
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Create and verify multi-platform manifest
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/donkey
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          docker buildx imagetools inspect --raw "${IMAGE}:${version}" \
+          mapfile -t final_tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          test "${#final_tags[@]}" -gt 0
+          tag_args=()
+          for tag in "${final_tags[@]}"; do
+            tag_args+=(--tag "$tag")
+          done
+          docker buildx imagetools create "${tag_args[@]}" \
+            "${IMAGE}:build-${GITHUB_SHA}-${GITHUB_RUN_ID}-amd64" \
+            "${IMAGE}:build-${GITHUB_SHA}-${GITHUB_RUN_ID}-arm64"
+          docker buildx imagetools inspect --raw "${final_tags[0]}" \
             | jq -e '
                 [.manifests[]?.platform
                   | select(.os == "linux")
