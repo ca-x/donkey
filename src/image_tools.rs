@@ -27,7 +27,7 @@ use oci_client::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, IntoActiveModel,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    QueryFilter, QueryOrder, QuerySelect, Set, UpdateMany,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -138,6 +138,143 @@ struct FileEntry {
     size: u64,
 }
 
+const JOB_LEASE_MINUTES: i64 = 10;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JobKind {
+    Export,
+    Extract,
+    Copy,
+}
+
+impl JobKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "export" => Some(Self::Export),
+            "extract" => Some(Self::Extract),
+            "copy" => Some(Self::Copy),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Extract => "extract",
+            Self::Copy => "copy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JobStatus {
+    Pending,
+    Running,
+    Completed,
+    Skipped,
+    Failed,
+    Cancelled,
+}
+
+impl JobStatus {
+    #[cfg(test)]
+    const ALL: [Self; 6] = [
+        Self::Pending,
+        Self::Running,
+        Self::Completed,
+        Self::Skipped,
+        Self::Failed,
+        Self::Cancelled,
+    ];
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "skipped" => Some(Self::Skipped),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Pending, Self::Running | Self::Cancelled)
+                | (
+                    Self::Running,
+                    Self::Completed | Self::Skipped | Self::Failed | Self::Cancelled
+                )
+                | (
+                    Self::Failed | Self::Cancelled | Self::Skipped,
+                    Self::Pending
+                )
+        )
+    }
+}
+
+fn transition_update(
+    from: JobStatus,
+    to: JobStatus,
+    now: DateTime<Utc>,
+    error: Option<String>,
+) -> ApiResult<UpdateMany<image_job::Entity>> {
+    if !from.can_transition_to(to) {
+        return Err(AppError::bad_request("illegal image job transition"));
+    }
+
+    let mut changes = image_job::ActiveModel {
+        status: Set(to.as_str().into()),
+        stage: Set(match to {
+            JobStatus::Pending => "queued",
+            JobStatus::Running => "resolving",
+            _ => to.as_str(),
+        }
+        .into()),
+        error: Set(error),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    match to {
+        JobStatus::Running => {
+            changes.started_at = Set(Some(now));
+            changes.finished_at = Set(None);
+            changes.lease_until = Set(Some(now + chrono::Duration::minutes(JOB_LEASE_MINUTES)));
+            changes.cancel_requested = Set(false);
+        }
+        JobStatus::Pending => {
+            changes.progress_bytes = Set(0);
+            changes.total_bytes = Set(0);
+            changes.started_at = Set(None);
+            changes.finished_at = Set(None);
+            changes.lease_until = Set(None);
+            changes.cancel_requested = Set(false);
+        }
+        _ => {
+            changes.finished_at = Set(Some(now));
+            changes.lease_until = Set(None);
+            changes.cancel_requested = Set(to == JobStatus::Cancelled);
+        }
+    }
+
+    Ok(image_job::Entity::update_many()
+        .set(changes)
+        .filter(image_job::Column::Status.eq(from.as_str())))
+}
+
 fn default_true() -> bool {
     true
 }
@@ -188,18 +325,7 @@ impl ImageTools {
             wake: Arc::new(Notify::new()),
             last_cleanup: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
         };
-        image_job::Entity::update_many()
-            .col_expr(
-                image_job::Column::Status,
-                sea_orm::sea_query::Expr::value("pending"),
-            )
-            .col_expr(
-                image_job::Column::Stage,
-                sea_orm::sea_query::Expr::value("recovered"),
-            )
-            .filter(image_job::Column::Status.eq("running"))
-            .exec(&service.db)
-            .await?;
+        service.recover_abandoned_jobs(Utc::now()).await?;
         Ok(service)
     }
 
@@ -242,72 +368,122 @@ impl ImageTools {
     async fn tick(&self) -> ApiResult<()> {
         self.cleanup_storage(None).await?;
         self.enqueue_due_rules().await?;
-        let Some(job) = image_job::Entity::find()
+        let Some(job) = self.claim_next_job().await? else {
+            return Ok(());
+        };
+
+        let result = self.process_job(&job).await;
+        self.finish_job(job.id, result).await
+    }
+
+    async fn claim_next_job(&self) -> ApiResult<Option<image_job::Model>> {
+        let Some(id) = image_job::Entity::find()
+            .select_only()
+            .column(image_job::Column::Id)
             .filter(image_job::Column::Status.eq("pending"))
             .order_by_asc(image_job::Column::CreatedAt)
+            .into_tuple::<Uuid>()
             .one(&self.db)
             .await?
         else {
-            return Ok(());
+            return Ok(None);
         };
-        let mut active = job.clone().into_active_model();
-        active.status = Set("running".into());
-        active.stage = Set("resolving".into());
-        active.started_at = Set(Some(Utc::now()));
-        active.lease_until = Set(Some(Utc::now() + chrono::Duration::minutes(10)));
-        active.updated_at = Set(Utc::now());
-        active.update(&self.db).await?;
 
-        let result = self.process_job(&job).await;
-        let current = image_job::Entity::find_by_id(job.id)
+        let claimed = transition_update(JobStatus::Pending, JobStatus::Running, Utc::now(), None)?
+            .filter(image_job::Column::Id.eq(id))
+            .exec(&self.db)
+            .await?;
+        if claimed.rows_affected != 1 {
+            return Ok(None);
+        }
+
+        Ok(image_job::Entity::find_by_id(id).one(&self.db).await?)
+    }
+
+    async fn finish_job(&self, id: Uuid, result: ApiResult<JobOutcome>) -> ApiResult<()> {
+        let current = image_job::Entity::find_by_id(id)
             .one(&self.db)
             .await?
             .ok_or_else(|| AppError::not_found("image job"))?;
-        let was_cancelled = current.cancel_requested;
-        let mut active = current.into_active_model();
-        active.lease_until = Set(None);
-        active.finished_at = Set(Some(Utc::now()));
-        active.updated_at = Set(Utc::now());
-        match result {
-            _ if was_cancelled => {
-                active.status = Set("cancelled".into());
-                active.stage = Set("cancelled".into());
-                active.error = Set(None);
+        let (target, error) = if current.cancel_requested {
+            (JobStatus::Cancelled, None)
+        } else {
+            match result {
+                Ok(JobOutcome::Completed) => (JobStatus::Completed, None),
+                Ok(JobOutcome::Skipped) => (JobStatus::Skipped, None),
+                Err(error) => (JobStatus::Failed, Some(safe_error(&error))),
             }
-            Ok(outcome) => {
-                let value = match outcome {
-                    JobOutcome::Completed => "completed",
-                    JobOutcome::Skipped => "skipped",
-                };
-                active.status = Set(value.into());
-                active.stage = Set(value.into());
-                active.error = Set(None);
-            }
-            Err(error) => {
-                active.status = Set("failed".into());
-                active.stage = Set("failed".into());
-                active.error = Set(Some(safe_error(&error)));
+        };
+        let finished = transition_update(JobStatus::Running, target, Utc::now(), error)?
+            .filter(image_job::Column::Id.eq(id))
+            .filter(image_job::Column::CancelRequested.eq(current.cancel_requested))
+            .exec(&self.db)
+            .await?;
+        if finished.rows_affected == 1 {
+            return Ok(());
+        }
+
+        let current = image_job::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| AppError::not_found("image job"))?;
+        if current.status == JobStatus::Running.as_str() && current.cancel_requested {
+            let cancelled =
+                transition_update(JobStatus::Running, JobStatus::Cancelled, Utc::now(), None)?
+                    .filter(image_job::Column::Id.eq(id))
+                    .filter(image_job::Column::CancelRequested.eq(true))
+                    .exec(&self.db)
+                    .await?;
+            if cancelled.rows_affected == 1 {
+                return Ok(());
             }
         }
-        active.update(&self.db).await?;
-        Ok(())
+        Err(AppError::bad_request(
+            "image job is no longer in a finishable state",
+        ))
+    }
+
+    // v0.1 runs one worker per process. Leases support restart recovery only;
+    // they are not ownership tokens and do not provide cross-process fencing.
+    async fn recover_abandoned_jobs(&self, now: DateTime<Utc>) -> ApiResult<u64> {
+        let recovered = image_job::Entity::update_many()
+            .set(image_job::ActiveModel {
+                status: Set(JobStatus::Pending.as_str().into()),
+                stage: Set("recovered".into()),
+                error: Set(None),
+                cancel_requested: Set(false),
+                lease_until: Set(None),
+                started_at: Set(None),
+                finished_at: Set(None),
+                updated_at: Set(now),
+                ..Default::default()
+            })
+            .filter(image_job::Column::Status.eq(JobStatus::Running.as_str()))
+            .filter(
+                Condition::any()
+                    .add(image_job::Column::LeaseUntil.is_null())
+                    .add(image_job::Column::LeaseUntil.lte(now)),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(recovered.rows_affected)
     }
 
     async fn process_job(&self, job: &image_job::Model) -> ApiResult<JobOutcome> {
         let prepared = self.prepare_image(job).await?;
         self.update_job_manifest(job.id, &prepared).await?;
         self.check_cancelled(job.id).await?;
-        if job.kind == "copy"
+        if JobKind::parse(&job.kind) == Some(JobKind::Copy)
             && self
                 .copy_already_completed(job, &prepared.manifest_digest)
                 .await?
         {
             return Ok(JobOutcome::Skipped);
         }
-        match job.kind.as_str() {
-            "export" => self.export_image(job, &prepared).await?,
-            "extract" => self.extract_image(job, &prepared).await?,
-            "copy" => self.copy_image(job, &prepared).await?,
+        match JobKind::parse(&job.kind) {
+            Some(JobKind::Export) => self.export_image(job, &prepared).await?,
+            Some(JobKind::Extract) => self.extract_image(job, &prepared).await?,
+            Some(JobKind::Copy) => self.copy_image(job, &prepared).await?,
             _ => return Err(AppError::bad_request("unsupported image job kind")),
         }
         self.enforce_storage_quota(job.id).await?;
@@ -902,6 +1078,7 @@ impl ImageTools {
     }
 
     async fn set_progress(&self, id: Uuid, stage: &str, current: u64, total: u64) -> ApiResult<()> {
+        let now = Utc::now();
         image_job::Entity::update_many()
             .col_expr(
                 image_job::Column::Stage,
@@ -917,15 +1094,23 @@ impl ImageTools {
             )
             .col_expr(
                 image_job::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(Utc::now()),
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .col_expr(
+                image_job::Column::LeaseUntil,
+                sea_orm::sea_query::Expr::value(Some(
+                    now + chrono::Duration::minutes(JOB_LEASE_MINUTES),
+                )),
             )
             .filter(image_job::Column::Id.eq(id))
+            .filter(image_job::Column::Status.eq(JobStatus::Running.as_str()))
             .exec(&self.db)
             .await?;
         Ok(())
     }
 
     async fn set_stage(&self, id: Uuid, stage: &str) -> ApiResult<()> {
+        let now = Utc::now();
         image_job::Entity::update_many()
             .col_expr(
                 image_job::Column::Stage,
@@ -933,9 +1118,16 @@ impl ImageTools {
             )
             .col_expr(
                 image_job::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(Utc::now()),
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .col_expr(
+                image_job::Column::LeaseUntil,
+                sea_orm::sea_query::Expr::value(Some(
+                    now + chrono::Duration::minutes(JOB_LEASE_MINUTES),
+                )),
             )
             .filter(image_job::Column::Id.eq(id))
+            .filter(image_job::Column::Status.eq(JobStatus::Running.as_str()))
             .exec(&self.db)
             .await?;
         Ok(())
@@ -1010,6 +1202,8 @@ impl ImageTools {
         idempotency_key: Option<String>,
     ) -> ApiResult<image_job::Model> {
         validate_job(&input)?;
+        let kind = JobKind::parse(&input.kind)
+            .ok_or_else(|| AppError::bad_request("unsupported image job kind"))?;
         if let Some(key) = idempotency_key.as_deref()
             && let Some(existing) = image_job::Entity::find()
                 .filter(image_job::Column::IdempotencyKey.eq(key))
@@ -1021,8 +1215,8 @@ impl ImageTools {
         let now = Utc::now();
         let model = image_job::Model {
             id: Uuid::new_v4(),
-            kind: input.kind,
-            status: "pending".into(),
+            kind: kind.as_str().into(),
+            status: JobStatus::Pending.as_str().into(),
             source_ref: input.source_ref,
             source_node_id: input.source_node_id,
             source_credential_id: input.source_credential_id,
@@ -1317,15 +1511,48 @@ async fn cancel_job(
     State(service): State<ImageTools>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> ApiResult<StatusCode> {
-    image_job::Entity::update_many()
-        .col_expr(
-            image_job::Column::CancelRequested,
-            sea_orm::sea_query::Expr::value(true),
-        )
-        .filter(image_job::Column::Id.eq(id))
-        .exec(&service.db)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    let model = image_job::Entity::find_by_id(id)
+        .one(&service.db)
+        .await?
+        .ok_or_else(|| AppError::not_found("image job"))?;
+    let status = JobStatus::parse(&model.status)
+        .ok_or_else(|| AppError::bad_request("image job has an unknown status"))?;
+    let now = Utc::now();
+    let result = match status {
+        JobStatus::Pending => {
+            transition_update(JobStatus::Pending, JobStatus::Cancelled, now, None)?
+                .filter(image_job::Column::Id.eq(id))
+                .exec(&service.db)
+                .await?
+        }
+        JobStatus::Running => {
+            image_job::Entity::update_many()
+                .col_expr(
+                    image_job::Column::CancelRequested,
+                    sea_orm::sea_query::Expr::value(true),
+                )
+                .col_expr(
+                    image_job::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .filter(image_job::Column::Id.eq(id))
+                .filter(image_job::Column::Status.eq(JobStatus::Running.as_str()))
+                .exec(&service.db)
+                .await?
+        }
+        _ => return Err(AppError::bad_request("image job cannot be cancelled")),
+    };
+    if result.rows_affected == 1 {
+        Ok(StatusCode::NO_CONTENT)
+    } else if image_job::Entity::find_by_id(id)
+        .one(&service.db)
+        .await?
+        .is_none()
+    {
+        Err(AppError::not_found("image job"))
+    } else {
+        Err(AppError::bad_request("image job cannot be cancelled"))
+    }
 }
 
 async fn retry_job(
@@ -1336,14 +1563,29 @@ async fn retry_job(
         .one(&service.db)
         .await?
         .ok_or_else(|| AppError::not_found("image job"))?;
-    let mut active = model.into_active_model();
-    active.status = Set("pending".into());
-    active.stage = Set("queued".into());
-    active.error = Set(None);
-    active.cancel_requested = Set(false);
-    active.finished_at = Set(None);
-    active.updated_at = Set(Utc::now());
-    let model = active.update(&service.db).await?;
+    let status = JobStatus::parse(&model.status)
+        .ok_or_else(|| AppError::bad_request("image job has an unknown status"))?;
+    if !status.can_transition_to(JobStatus::Pending) {
+        return Err(AppError::bad_request("image job cannot be retried"));
+    }
+    let result = transition_update(status, JobStatus::Pending, Utc::now(), None)?
+        .filter(image_job::Column::Id.eq(id))
+        .exec(&service.db)
+        .await?;
+    if result.rows_affected != 1 {
+        if image_job::Entity::find_by_id(id)
+            .one(&service.db)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::not_found("image job"));
+        }
+        return Err(AppError::bad_request("image job cannot be retried"));
+    }
+    let model = image_job::Entity::find_by_id(id)
+        .one(&service.db)
+        .await?
+        .ok_or_else(|| AppError::not_found("image job"))?;
     service.wake.notify_one();
     Ok(Json(model))
 }
@@ -1671,7 +1913,7 @@ fn validate_credential(
 }
 
 fn validate_job(input: &JobInput) -> ApiResult<()> {
-    if !matches!(input.kind.as_str(), "export" | "extract" | "copy") {
+    if JobKind::parse(&input.kind).is_none() {
         return Err(AppError::bad_request(
             "job kind must be export, extract, or copy",
         ));
@@ -1945,6 +2187,252 @@ mod tests {
     use super::*;
     use httpmock::prelude::*;
     use secrecy::SecretString;
+
+    async fn test_service() -> (tempfile::TempDir, ImageTools) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.credential_key = Some(SecretString::from("77".repeat(32)));
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let config = Arc::new(config);
+        let nodes = NodeService::new(config.clone(), db.clone()).unwrap();
+        let service = ImageTools::new(config, db, nodes).await.unwrap();
+        (directory, service)
+    }
+
+    fn test_job(status: JobStatus, lease_until: Option<DateTime<Utc>>) -> image_job::Model {
+        let now = Utc::now();
+        let terminal = matches!(
+            status,
+            JobStatus::Completed | JobStatus::Skipped | JobStatus::Failed | JobStatus::Cancelled
+        );
+        image_job::Model {
+            id: Uuid::new_v4(),
+            kind: JobKind::Export.as_str().into(),
+            status: status.as_str().into(),
+            source_ref: "docker.io/library/alpine:latest".into(),
+            source_node_id: None,
+            source_credential_id: None,
+            destination_ref: None,
+            destination_credential_id: None,
+            platform_os: "linux".into(),
+            platform_arch: "amd64".into(),
+            output_format: Some("docker".into()),
+            resolved_digest: None,
+            index_digest: None,
+            stage: status.as_str().into(),
+            progress_bytes: 12,
+            total_bytes: 34,
+            artifact_path: None,
+            artifact_name: None,
+            error: terminal.then(|| "previous error".into()),
+            idempotency_key: None,
+            cancel_requested: status == JobStatus::Cancelled,
+            lease_until,
+            created_at: now,
+            updated_at: now,
+            started_at: (status != JobStatus::Pending).then_some(now),
+            finished_at: terminal.then_some(now),
+        }
+    }
+
+    async fn insert_test_job(
+        db: &DatabaseConnection,
+        status: JobStatus,
+        lease_until: Option<DateTime<Utc>>,
+    ) -> image_job::Model {
+        test_job(status, lease_until)
+            .into_active_model()
+            .insert(db)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn job_status_transition_matrix_is_explicit_and_strings_are_stable() {
+        for from in JobStatus::ALL {
+            assert_eq!(JobStatus::parse(from.as_str()), Some(from));
+            for to in JobStatus::ALL {
+                let expected = matches!(
+                    (from, to),
+                    (
+                        JobStatus::Pending,
+                        JobStatus::Running | JobStatus::Cancelled
+                    ) | (
+                        JobStatus::Running,
+                        JobStatus::Completed
+                            | JobStatus::Skipped
+                            | JobStatus::Failed
+                            | JobStatus::Cancelled
+                    ) | (
+                        JobStatus::Failed | JobStatus::Cancelled | JobStatus::Skipped,
+                        JobStatus::Pending
+                    )
+                );
+                assert_eq!(
+                    from.can_transition_to(to),
+                    expected,
+                    "{} -> {}",
+                    from.as_str(),
+                    to.as_str()
+                );
+            }
+        }
+        for (value, kind) in [
+            ("export", JobKind::Export),
+            ("extract", JobKind::Extract),
+            ("copy", JobKind::Copy),
+        ] {
+            assert_eq!(JobKind::parse(value), Some(kind));
+            assert_eq!(kind.as_str(), value);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_have_only_one_winner() {
+        let (_directory, service) = test_service().await;
+        let job = insert_test_job(&service.db, JobStatus::Pending, None).await;
+
+        let (first, second) = tokio::join!(service.claim_next_job(), service.claim_next_job());
+        let claimed = [first.unwrap(), second.unwrap()];
+        assert_eq!(claimed.iter().filter(|job| job.is_some()).count(), 1);
+        assert_eq!(claimed.iter().flatten().next().unwrap().id, job.id);
+
+        let stored = image_job::Entity::find_by_id(job.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, JobStatus::Running.as_str());
+        assert_eq!(stored.stage, "resolving");
+        assert!(stored.started_at.is_some());
+        assert!(stored.lease_until.is_some_and(|lease| lease > Utc::now()));
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_only_missing_or_expired_leases() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.credential_key = Some(SecretString::from("88".repeat(32)));
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let now = Utc::now();
+        let missing = insert_test_job(&db, JobStatus::Running, None).await;
+        let expired = insert_test_job(
+            &db,
+            JobStatus::Running,
+            Some(now - chrono::Duration::minutes(1)),
+        )
+        .await;
+        let live = insert_test_job(
+            &db,
+            JobStatus::Running,
+            Some(now + chrono::Duration::minutes(5)),
+        )
+        .await;
+        let config = Arc::new(config);
+        let nodes = NodeService::new(config.clone(), db.clone()).unwrap();
+
+        let service = ImageTools::new(config, db, nodes).await.unwrap();
+        for id in [missing.id, expired.id] {
+            let recovered = image_job::Entity::find_by_id(id)
+                .one(&service.db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.status, JobStatus::Pending.as_str());
+            assert_eq!(recovered.stage, "recovered");
+            assert!(recovered.lease_until.is_none());
+            assert!(recovered.started_at.is_none());
+        }
+        let live = image_job::Entity::find_by_id(live.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.status, JobStatus::Running.as_str());
+        assert_eq!(live.lease_until, Some(now + chrono::Duration::minutes(5)));
+    }
+
+    #[tokio::test]
+    async fn stage_and_progress_updates_refresh_running_lease() {
+        let (_directory, service) = test_service().await;
+        let old_lease = Utc::now() + chrono::Duration::seconds(1);
+        let job = insert_test_job(&service.db, JobStatus::Running, Some(old_lease)).await;
+
+        service.set_stage(job.id, "packing").await.unwrap();
+        service
+            .set_progress(job.id, "packing", 20, 40)
+            .await
+            .unwrap();
+
+        let stored = image_job::Entity::find_by_id(job.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.stage, "packing");
+        assert_eq!((stored.progress_bytes, stored.total_bytes), (20, 40));
+        assert!(stored.lease_until.is_some_and(|lease| lease > old_lease));
+    }
+
+    #[tokio::test]
+    async fn cancel_is_guarded_by_pending_or_running_status() {
+        let (_directory, service) = test_service().await;
+        for status in JobStatus::ALL {
+            let job = insert_test_job(&service.db, status, None).await;
+            let result = cancel_job(State(service.clone()), AxumPath(job.id)).await;
+            if matches!(status, JobStatus::Pending | JobStatus::Running) {
+                assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
+                let stored = image_job::Entity::find_by_id(job.id)
+                    .one(&service.db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(stored.cancel_requested);
+                assert_eq!(
+                    stored.status,
+                    if status == JobStatus::Pending {
+                        JobStatus::Cancelled.as_str()
+                    } else {
+                        JobStatus::Running.as_str()
+                    }
+                );
+            } else {
+                assert!(matches!(result, Err(AppError::BadRequest(_))));
+            }
+        }
+        assert!(matches!(
+            cancel_job(State(service), AxumPath(Uuid::new_v4())).await,
+            Err(AppError::NotFound("image job"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_is_guarded_by_retryable_terminal_status() {
+        let (_directory, service) = test_service().await;
+        for status in JobStatus::ALL {
+            let job = insert_test_job(&service.db, status, None).await;
+            let result = retry_job(State(service.clone()), AxumPath(job.id)).await;
+            if matches!(
+                status,
+                JobStatus::Failed | JobStatus::Cancelled | JobStatus::Skipped
+            ) {
+                let stored = result.unwrap().0;
+                assert_eq!(stored.status, JobStatus::Pending.as_str());
+                assert_eq!(stored.stage, "queued");
+                assert!(!stored.cancel_requested);
+                assert!(stored.error.is_none());
+                assert!(stored.started_at.is_none());
+                assert!(stored.finished_at.is_none());
+                assert!(stored.lease_until.is_none());
+            } else {
+                assert!(matches!(result, Err(AppError::BadRequest(_))));
+            }
+        }
+        assert!(matches!(
+            retry_job(State(service), AxumPath(Uuid::new_v4())).await,
+            Err(AppError::NotFound("image job"))
+        ));
+    }
 
     #[test]
     fn selected_source_digest_is_verified_independently_of_transport() {
