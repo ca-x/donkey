@@ -207,8 +207,10 @@ impl Scheduler {
                         RangeMode::Suppress,
                     )
                     .await?;
-                if response.status().is_success() && response.content_length().unwrap_or(0) > 0 {
-                    return Ok(capabilities_from_head(&response));
+                if response.status().is_success()
+                    && let Some(capabilities) = capabilities_from_head(&response)
+                {
+                    return Ok(capabilities);
                 }
 
                 let probe = self
@@ -474,9 +476,9 @@ fn speed_first_capacity(measured_bps: f64, success_rate: f64, active_chunks: usi
         / (active_chunks + 1) as f64
 }
 
-fn capabilities_from_head(response: &reqwest::Response) -> BlobCapabilities {
-    BlobCapabilities {
-        size: response.content_length().unwrap_or(0),
+fn capabilities_from_head(response: &reqwest::Response) -> Option<BlobCapabilities> {
+    Some(BlobCapabilities {
+        size: positive_content_length(response.headers())?,
         supports_range: identity_encoded(response)
             && response
                 .headers()
@@ -484,7 +486,21 @@ fn capabilities_from_head(response: &reqwest::Response) -> BlobCapabilities {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.eq_ignore_ascii_case("bytes")),
         media_type: response_media_type(response),
+    })
+}
+
+fn positive_content_length(headers: &HeaderMap) -> Option<u64> {
+    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
+    let value = values.next()?.as_bytes();
+    if values.next().is_some() || value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
     }
+    value
+        .iter()
+        .try_fold(0_u64, |length, digit| {
+            length.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+        })
+        .filter(|length| *length > 0)
 }
 
 fn capabilities_from_probe(response: &reqwest::Response) -> Option<BlobCapabilities> {
@@ -651,6 +667,28 @@ mod tests {
         assert!(content_range_matches(&headers, 10, 19, 100));
         assert!(!content_range_matches(&headers, 0, 9, 100));
         assert!(!content_range_matches(&headers, 10, 19, 200));
+    }
+
+    #[test]
+    fn head_length_requires_one_positive_decimal_wire_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "16".parse().unwrap());
+        assert_eq!(positive_content_length(&headers), Some(16));
+
+        for invalid in ["0", "+16", " 16", "16 ", "16, 16", "invalid"] {
+            headers.insert(header::CONTENT_LENGTH, invalid.parse().unwrap());
+            assert_eq!(positive_content_length(&headers), None, "{invalid}");
+        }
+
+        headers.insert(
+            header::CONTENT_LENGTH,
+            "18446744073709551616".parse().unwrap(),
+        );
+        assert_eq!(positive_content_length(&headers), None);
+
+        headers.insert(header::CONTENT_LENGTH, "16".parse().unwrap());
+        headers.append(header::CONTENT_LENGTH, "16".parse().unwrap());
+        assert_eq!(positive_content_length(&headers), None);
     }
 
     #[tokio::test]
