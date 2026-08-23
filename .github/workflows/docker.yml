@@ -106,17 +106,3 @@ jobs:
                 | ($architectures | index("amd64")) != null
                   and ($architectures | index("arm64")) != null
               ' >/dev/null
-      - name: Make GHCR package publicly pullable
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          owner_type="$(gh api "/repos/${GITHUB_REPOSITORY}" --jq '.owner.type')"
-          if [[ "$owner_type" == "Organization" ]]; then
-            gh api --method PATCH \
-              "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/donkey" \
-              -f visibility=public >/dev/null
-          else
-            gh api --method PATCH "/user/packages/container/donkey" \
-              -f visibility=public >/dev/null
-          fi

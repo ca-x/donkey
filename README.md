@@ -69,6 +69,8 @@ openssl rand -hex 32
 docker compose up -d
 ```
 
+GHCR 首次创建的 package 默认可能是 private。组织所有者可以在 GitHub Package settings 将 `ca-x/donkey` 改为 Public；修改前先执行 `docker login ghcr.io`，或保留 Compose 的本地 `build: .` 从源码构建。
+
 管理界面默认位于 `http://127.0.0.1:5003/login`，Registry 默认监听 `5443`。初始化变量只在用户表为空时创建管理员；重启不会覆盖已有密码或角色。Compose 用 `DONKEY_ADMIN_EXTERNAL_LOOPBACK=true` 声明容器端口只映射到宿主 loopback；如果修改端口映射使管理端离开本机，必须删除该声明、通过 HTTPS 反向代理提供，并设置 `DONKEY_ADMIN_EXTERNAL_TLS=true`。
 
 ### 管理登录与 OIDC
