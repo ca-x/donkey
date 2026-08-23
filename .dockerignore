@@ -1,0 +1,9 @@
+.git
+.github
+target
+data
+docs/images
+frontend/node_modules
+frontend/dist
+.env
+.firecrawl

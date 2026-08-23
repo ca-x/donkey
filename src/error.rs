@@ -1,0 +1,110 @@
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use serde::Serialize;
+use thiserror::Error;
+
+pub type ApiResult<T> = Result<T, AppError>;
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("{0}")]
+    BadRequest(String),
+    #[error("authentication required")]
+    Unauthorized,
+    #[error("access denied")]
+    Forbidden,
+    #[error("too many authentication attempts; try again later")]
+    RateLimited,
+    #[error("{0} not found")]
+    NotFound(&'static str),
+    #[error("upstream request failed: {0}")]
+    Upstream(String),
+    #[error("content integrity check failed")]
+    Integrity,
+    #[error("database operation failed")]
+    Database(#[from] sea_orm::DbErr),
+    #[error("I/O operation failed")]
+    Io(#[from] std::io::Error),
+    #[error("internal error")]
+    Internal(#[source] anyhow::Error),
+}
+
+impl AppError {
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::BadRequest(message.into())
+    }
+
+    pub fn not_found(resource: &'static str) -> Self {
+        Self::NotFound(resource)
+    }
+
+    pub fn internal(error: impl Into<anyhow::Error>) -> Self {
+        Self::Internal(error.into())
+    }
+
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Upstream(_) => StatusCode::BAD_GATEWAY,
+            Self::Integrity => StatusCode::BAD_GATEWAY,
+            Self::Database(_) | Self::Io(_) | Self::Internal(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+    }
+
+    fn code(&self) -> &'static str {
+        match self {
+            Self::BadRequest(_) => "bad_request",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::RateLimited => "rate_limited",
+            Self::NotFound(_) => "not_found",
+            Self::Upstream(_) => "upstream_error",
+            Self::Integrity => "integrity_error",
+            Self::Database(_) | Self::Io(_) | Self::Internal(_) => "internal_error",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorEnvelope {
+    error: ErrorBody,
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    code: &'static str,
+    message: String,
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        if status.is_server_error() {
+            tracing::error!(error = ?self, "request failed");
+        }
+        let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+            "The request could not be completed".to_owned()
+        } else {
+            self.to_string()
+        };
+        (
+            status,
+            Json(ErrorEnvelope {
+                error: ErrorBody {
+                    code: self.code(),
+                    message,
+                },
+            }),
+        )
+            .into_response()
+    }
+}

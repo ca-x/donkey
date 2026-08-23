@@ -1,0 +1,12 @@
+minimumReleaseAge: 1440
+onlyBuiltDependencies: []
+overrides:
+  use-sync-external-store: 1.6.0
+minimumReleaseAgeExclude:
+  - '@mantine/core@9.5.2'
+  - '@mantine/form@9.5.2'
+  - '@mantine/hooks@9.5.2'
+  - '@mantine/notifications@9.5.2'
+  - '@mantine/store@9.5.2'
+  - '@tanstack/query-core@5.102.1'
+  - '@tanstack/react-query@5.102.1'

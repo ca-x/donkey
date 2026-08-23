@@ -1,0 +1,668 @@
+use std::{path::Path, sync::Arc, time::Instant};
+
+use crate::{
+    cache::{CacheStore, CachedObject},
+    config::{Config, SchedulerPolicy},
+    error::{ApiResult, AppError},
+    nodes::{NodeService, NodeView},
+    upstream::{RangeMode, UpstreamService},
+};
+use dashmap::DashMap;
+use futures_util::{StreamExt, stream};
+use http::{HeaderMap, header};
+use http_content_range::ContentRange;
+use moka::future::Cache;
+use reqwest::StatusCode;
+use sha2::{Digest, Sha256};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncWriteExt},
+};
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub struct Scheduler {
+    config: Arc<Config>,
+    nodes: NodeService,
+    cache: CacheStore,
+    upstream: UpstreamService,
+    runtime_speeds: Arc<DashMap<Uuid, f64>>,
+    active_chunks: Arc<DashMap<Uuid, usize>>,
+    capabilities: Cache<String, BlobCapabilities>,
+}
+
+#[derive(Clone, Debug)]
+struct BlobCapabilities {
+    size: u64,
+    supports_range: bool,
+    media_type: String,
+}
+
+#[derive(Clone, Debug)]
+struct Chunk {
+    index: usize,
+    start: u64,
+    end: u64,
+    total_size: u64,
+}
+
+impl Scheduler {
+    pub fn new(
+        config: Arc<Config>,
+        nodes: NodeService,
+        cache: CacheStore,
+        upstream: UpstreamService,
+    ) -> Self {
+        Self {
+            config,
+            nodes,
+            cache,
+            upstream,
+            runtime_speeds: Arc::new(DashMap::new()),
+            active_chunks: Arc::new(DashMap::new()),
+            capabilities: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(600))
+                .build(),
+        }
+    }
+
+    pub async fn fetch_blob(
+        &self,
+        request_path: &str,
+        request_headers: &HeaderMap,
+        expected_digest: Option<&str>,
+        route_prefix: Option<&str>,
+    ) -> ApiResult<CachedObject> {
+        let authorization = request_headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        let key = CacheStore::key(request_path, authorization);
+        if let Some(object) = self.cache.get(&key).await? {
+            return Ok(object);
+        }
+
+        let guard = self.cache.lock(&key).await;
+        if let Some(object) = self.cache.get(&key).await? {
+            drop(guard);
+            return Ok(object);
+        }
+
+        let result = self
+            .fetch_uncached(
+                &key,
+                request_path,
+                request_headers,
+                expected_digest,
+                route_prefix,
+            )
+            .await;
+        drop(guard);
+        result
+    }
+
+    async fn fetch_uncached(
+        &self,
+        key: &str,
+        request_path: &str,
+        request_headers: &HeaderMap,
+        expected_digest: Option<&str>,
+        route_prefix: Option<&str>,
+    ) -> ApiResult<CachedObject> {
+        let nodes = self.nodes.enabled_registry_nodes(route_prefix).await?;
+        if nodes.is_empty() {
+            return Err(AppError::Upstream("no enabled Registry nodes".into()));
+        }
+
+        let capability_key = format!("{}:{}", nodes[0].node.url, request_path);
+        let capabilities = if let Some(value) = self.capabilities.get(&capability_key).await {
+            value
+        } else {
+            let detected = self
+                .detect_capabilities(&nodes, request_path, request_headers)
+                .await?;
+            self.capabilities
+                .insert(capability_key, detected.clone())
+                .await;
+            detected
+        };
+
+        let temp = tempfile::Builder::new()
+            .prefix("donkey-")
+            .tempdir_in(self.cache.temp_dir())
+            .map_err(AppError::from)?;
+        let merged = temp.path().join("object.partial");
+        let can_parallel = capabilities.supports_range
+            && capabilities.size >= self.config.parallel_threshold
+            && nodes.len() > 1;
+
+        if can_parallel {
+            tracing::info!(
+                path = request_path,
+                size = capabilities.size,
+                chunks = chunks(capabilities.size, self.config.chunk_size).len(),
+                nodes = nodes.len(),
+                "starting parallel Blob fetch"
+            );
+            if let Err(error) = self
+                .download_parallel(
+                    &nodes,
+                    request_path,
+                    request_headers,
+                    capabilities.size,
+                    temp.path(),
+                    &merged,
+                )
+                .await
+            {
+                tracing::warn!(
+                    ?error,
+                    path = request_path,
+                    "parallel fetch failed; falling back to one upstream"
+                );
+                let _ = tokio::fs::remove_file(&merged).await;
+                self.download_whole(&nodes, request_path, request_headers, &merged)
+                    .await?;
+            }
+        } else {
+            self.download_whole(&nodes, request_path, request_headers, &merged)
+                .await?;
+        }
+
+        let actual_size = tokio::fs::metadata(&merged).await?.len();
+        if capabilities.size > 0 && actual_size != capabilities.size {
+            return Err(AppError::Integrity);
+        }
+        if let Some(digest) = expected_digest {
+            verify_file(&merged, digest).await?;
+        }
+
+        self.cache
+            .admit(
+                key,
+                &merged,
+                &capabilities.media_type,
+                expected_digest.map(str::to_owned),
+            )
+            .await
+    }
+
+    async fn detect_capabilities(
+        &self,
+        nodes: &[NodeView],
+        request_path: &str,
+        request_headers: &HeaderMap,
+    ) -> ApiResult<BlobCapabilities> {
+        let mut last_error = None;
+        for node in nodes {
+            let started = Instant::now();
+            let result = async {
+                let response = self
+                    .upstream
+                    .send(
+                        node,
+                        http::Method::HEAD,
+                        request_path,
+                        request_headers,
+                        RangeMode::Suppress,
+                    )
+                    .await?;
+                if response.status().is_success() && response.content_length().unwrap_or(0) > 0 {
+                    return Ok(capabilities_from_head(&response));
+                }
+
+                let probe = self
+                    .upstream
+                    .send(
+                        node,
+                        http::Method::GET,
+                        request_path,
+                        request_headers,
+                        RangeMode::Exact(0, 0),
+                    )
+                    .await?;
+                capabilities_from_probe(&probe).ok_or_else(|| {
+                    AppError::Upstream(format!(
+                        "{} does not expose Blob length or Range metadata",
+                        node.node.name
+                    ))
+                })
+            }
+            .await;
+            self.nodes
+                .record_transfer(node.node.id, 0, started.elapsed(), result.is_ok())
+                .await;
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| AppError::Upstream("capability detection failed".into())))
+    }
+
+    async fn download_parallel(
+        &self,
+        nodes: &[NodeView],
+        request_path: &str,
+        request_headers: &HeaderMap,
+        total_size: u64,
+        temp_dir: &Path,
+        merged: &Path,
+    ) -> ApiResult<()> {
+        let chunks = chunks(total_size, self.config.chunk_size);
+        let concurrency = self.config.chunk_concurrency.min(chunks.len()).max(1);
+        let results = stream::iter(chunks.clone())
+            .map(|chunk| {
+                let scheduler = self.clone();
+                let nodes = nodes.to_vec();
+                let request_path = request_path.to_owned();
+                let request_headers = request_headers.clone();
+                let part_path = temp_dir.join(format!("{:08}.part", chunk.index));
+                async move {
+                    scheduler
+                        .download_chunk(&nodes, &request_path, &request_headers, &chunk, &part_path)
+                        .await
+                        .map(|_| (chunk.index, part_path))
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut ordered = vec![None; chunks.len()];
+        for result in results {
+            let (index, path) = result?;
+            ordered[index] = Some(path);
+        }
+        let mut output = File::create(merged).await?;
+        for path in ordered {
+            let path = path.ok_or(AppError::Integrity)?;
+            let mut input = File::open(path).await?;
+            tokio::io::copy(&mut input, &mut output).await?;
+        }
+        output.flush().await?;
+        Ok(())
+    }
+
+    async fn download_chunk(
+        &self,
+        nodes: &[NodeView],
+        request_path: &str,
+        request_headers: &HeaderMap,
+        chunk: &Chunk,
+        destination: &Path,
+    ) -> ApiResult<()> {
+        let mut last_error = None;
+        for node in self.ordered_nodes(nodes, chunk.index) {
+            let lease = self.acquire(node.node.id);
+            let started = Instant::now();
+            let result = async {
+                let response = self
+                    .upstream
+                    .send(
+                        node,
+                        http::Method::GET,
+                        request_path,
+                        request_headers,
+                        RangeMode::Exact(chunk.start, chunk.end),
+                    )
+                    .await?;
+                if response.status() != StatusCode::PARTIAL_CONTENT {
+                    return Err(AppError::Upstream(format!(
+                        "{} ignored Range with status {}",
+                        node.node.name,
+                        response.status()
+                    )));
+                }
+                let expected = chunk.end - chunk.start + 1;
+                if response.content_length() != Some(expected) {
+                    return Err(AppError::Integrity);
+                }
+                if !content_range_matches(
+                    response.headers(),
+                    chunk.start,
+                    chunk.end,
+                    chunk.total_size,
+                ) {
+                    return Err(AppError::Integrity);
+                }
+                stream_response_to_file(response, destination, Some(expected)).await
+            }
+            .await;
+            self.observe_speed(
+                node.node.id,
+                chunk.end - chunk.start + 1,
+                started.elapsed(),
+                result.is_ok(),
+            );
+            drop(lease);
+            self.nodes
+                .record_transfer(
+                    node.node.id,
+                    chunk.end - chunk.start + 1,
+                    started.elapsed(),
+                    result.is_ok(),
+                )
+                .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed a chunk".into())))
+    }
+
+    async fn download_whole(
+        &self,
+        nodes: &[NodeView],
+        request_path: &str,
+        request_headers: &HeaderMap,
+        destination: &Path,
+    ) -> ApiResult<()> {
+        let mut last_error = None;
+        for node in self.ordered_nodes(nodes, 0) {
+            let lease = self.acquire(node.node.id);
+            let started = Instant::now();
+            let result = async {
+                let response = self
+                    .upstream
+                    .send(
+                        node,
+                        http::Method::GET,
+                        request_path,
+                        request_headers,
+                        RangeMode::Suppress,
+                    )
+                    .await?;
+                if !response.status().is_success() {
+                    return Err(AppError::Upstream(format!(
+                        "{} returned {}",
+                        node.node.name,
+                        response.status()
+                    )));
+                }
+                let length = response.content_length();
+                stream_response_to_file(response, destination, length).await
+            }
+            .await;
+            let bytes = tokio::fs::metadata(destination)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            self.observe_speed(node.node.id, bytes, started.elapsed(), result.is_ok());
+            drop(lease);
+            self.nodes
+                .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
+                .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(destination).await;
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed".into())))
+    }
+
+    fn ordered_nodes<'a>(&self, nodes: &'a [NodeView], sequence: usize) -> Vec<&'a NodeView> {
+        let mut ordered = nodes.iter().collect::<Vec<_>>();
+        match self.config.scheduler_policy {
+            SchedulerPolicy::Balanced => {
+                if !ordered.is_empty() {
+                    let offset = sequence % ordered.len();
+                    ordered.rotate_left(offset);
+                }
+            }
+            SchedulerPolicy::SpeedFirst => ordered.sort_by(|left, right| {
+                self.available_capacity(right)
+                    .total_cmp(&self.available_capacity(left))
+            }),
+        }
+        ordered
+    }
+
+    fn available_capacity(&self, node: &NodeView) -> f64 {
+        let measured = self
+            .runtime_speeds
+            .get(&node.node.id)
+            .map(|value| *value)
+            .unwrap_or(node.metric.speed_bps.max(0) as f64);
+        let active = self
+            .active_chunks
+            .get(&node.node.id)
+            .map(|value| *value)
+            .unwrap_or(0);
+        speed_first_capacity(measured, node.metric.success_rate, active)
+    }
+
+    fn acquire(&self, node_id: Uuid) -> ActiveChunkLease {
+        self.active_chunks
+            .entry(node_id)
+            .and_modify(|value| *value += 1)
+            .or_insert(1);
+        ActiveChunkLease {
+            node_id,
+            active_chunks: self.active_chunks.clone(),
+        }
+    }
+
+    fn observe_speed(
+        &self,
+        node_id: Uuid,
+        bytes: u64,
+        elapsed: std::time::Duration,
+        success: bool,
+    ) {
+        if success && bytes > 0 && elapsed.as_secs_f64() > 0.0 {
+            let sample = bytes as f64 / elapsed.as_secs_f64();
+            self.runtime_speeds
+                .entry(node_id)
+                .and_modify(|value| *value = *value * 0.7 + sample * 0.3)
+                .or_insert(sample);
+        } else if !success {
+            self.runtime_speeds
+                .entry(node_id)
+                .and_modify(|value| *value *= 0.5);
+        }
+    }
+}
+
+fn speed_first_capacity(measured_bps: f64, success_rate: f64, active_chunks: usize) -> f64 {
+    let discovery_floor = 256.0 * 1024.0;
+    measured_bps.max(discovery_floor) * success_rate.clamp(0.05, 1.0).powi(2)
+        / (active_chunks + 1) as f64
+}
+
+fn capabilities_from_head(response: &reqwest::Response) -> BlobCapabilities {
+    BlobCapabilities {
+        size: response.content_length().unwrap_or(0),
+        supports_range: identity_encoded(response)
+            && response
+                .headers()
+                .get(header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.eq_ignore_ascii_case("bytes")),
+        media_type: response_media_type(response),
+    }
+}
+
+fn capabilities_from_probe(response: &reqwest::Response) -> Option<BlobCapabilities> {
+    if response.status() == StatusCode::PARTIAL_CONTENT {
+        let range = response
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(ContentRange::parse)?;
+        let ContentRange::Bytes(range) = range else {
+            return None;
+        };
+        if range.first_byte != 0 || range.last_byte != 0 {
+            return None;
+        }
+        return Some(BlobCapabilities {
+            size: range.complete_length,
+            supports_range: identity_encoded(response),
+            media_type: response_media_type(response),
+        });
+    }
+    if response.status().is_success() {
+        return response.content_length().map(|size| BlobCapabilities {
+            size,
+            supports_range: false,
+            media_type: response_media_type(response),
+        });
+    }
+    None
+}
+
+fn identity_encoded(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| value.eq_ignore_ascii_case("identity"))
+}
+
+fn response_media_type(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned()
+}
+
+fn content_range_matches(headers: &HeaderMap, start: u64, end: u64, total: u64) -> bool {
+    matches!(
+        headers
+            .get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(ContentRange::parse),
+        Some(ContentRange::Bytes(value))
+            if value.first_byte == start
+                && value.last_byte == end
+                && value.complete_length == total
+    )
+}
+
+struct ActiveChunkLease {
+    node_id: Uuid,
+    active_chunks: Arc<DashMap<Uuid, usize>>,
+}
+
+impl Drop for ActiveChunkLease {
+    fn drop(&mut self) {
+        if let Some(mut value) = self.active_chunks.get_mut(&self.node_id) {
+            *value = value.saturating_sub(1);
+        }
+    }
+}
+
+async fn stream_response_to_file(
+    response: reqwest::Response,
+    destination: &Path,
+    expected: Option<u64>,
+) -> ApiResult<()> {
+    let mut file = File::create(destination).await?;
+    let mut received = 0_u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| AppError::Upstream(error.to_string()))?;
+        received = received.saturating_add(chunk.len() as u64);
+        if let Some(expected) = expected
+            && received > expected
+        {
+            return Err(AppError::Integrity);
+        }
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    if expected.is_some_and(|value| value != received) {
+        return Err(AppError::Integrity);
+    }
+    Ok(())
+}
+
+fn chunks(total: u64, chunk_size: u64) -> Vec<Chunk> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    while start < total {
+        let end = (start + chunk_size - 1).min(total - 1);
+        result.push(Chunk {
+            index: result.len(),
+            start,
+            end,
+            total_size: total,
+        });
+        start = end + 1;
+    }
+    result
+}
+
+async fn verify_file(path: &Path, expected_digest: &str) -> ApiResult<()> {
+    let expected = expected_digest
+        .strip_prefix("sha256:")
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| AppError::bad_request("unsupported or invalid Blob digest"))?;
+    let mut file = File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = hex::encode(hasher.finalize());
+    if !constant_time_eq::constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+        return Err(AppError::Integrity);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_without_gaps_or_overlap() {
+        let parts = chunks(11, 4);
+        assert_eq!(
+            parts.iter().map(|p| (p.start, p.end)).collect::<Vec<_>>(),
+            vec![(0, 3), (4, 7), (8, 10)]
+        );
+    }
+
+    #[test]
+    fn speed_first_prefers_capacity_not_only_raw_speed() {
+        let fast_idle = speed_first_capacity(8_000_000.0, 0.98, 0);
+        let fast_busy = speed_first_capacity(8_000_000.0, 0.98, 7);
+        let medium_idle = speed_first_capacity(2_000_000.0, 0.99, 0);
+        assert!(fast_idle > medium_idle);
+        assert!(medium_idle > fast_busy);
+    }
+
+    #[test]
+    fn content_range_must_match_the_assigned_chunk() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_RANGE, "bytes 10-19/100".parse().unwrap());
+        assert!(content_range_matches(&headers, 10, 19, 100));
+        assert!(!content_range_matches(&headers, 0, 9, 100));
+        assert!(!content_range_matches(&headers, 10, 19, 200));
+    }
+
+    #[tokio::test]
+    async fn verifies_digest_without_loading_whole_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        tokio::fs::write(&path, b"hello world").await.unwrap();
+        verify_file(
+            &path,
+            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+        )
+        .await
+        .unwrap();
+    }
+}
