@@ -107,6 +107,8 @@ DONKEY_ADMIN_EXTERNAL_TLS=true
 
 OIDC 使用 Discovery、Authorization Code、PKCE、`state` 和 `nonce`。用户表为空时，第一个成功创建的本地或 OIDC 用户成为管理员；后续 OIDC 用户默认只有读取权限。生产部署最好先用本地初始化管理员完成所有权确认，再开放 OIDC 登录入口。
 
+管理前端支持反向代理子路径。代理把外部前缀（例如 `/console`）剥离后转发到管理端口即可；前端会从脚本地址自动推导前缀，并同步用于静态资源、API、OIDC、文件下载和客户端路由。根路径部署仍保持原有 URL。
+
 ### TLS 与 `docker login`
 
 Docker 客户端通常要求镜像源使用 HTTPS。把证书放到 `./certs`，然后设置：

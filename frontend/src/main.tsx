@@ -9,6 +9,7 @@ import '@mantine/notifications/styles.css'
 import './styles.css'
 import './i18n'
 import { App } from './App'
+import { adminBasePath } from './basePath'
 import { theme } from './theme'
 
 const queryClient = new QueryClient({
@@ -25,7 +26,7 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <MantineProvider theme={theme} defaultColorScheme="auto">
       <QueryClientProvider client={queryClient}>
-        <BrowserRouter>
+        <BrowserRouter basename={adminBasePath || undefined}>
           <App />
         </BrowserRouter>
         <Notifications position="top-right" limit={3} />

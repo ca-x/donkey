@@ -27,6 +27,7 @@ import {
 import { NavLink as RouterNavLink, useLocation, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
+import { adminUrl } from '../basePath'
 import { useAuth } from '../useAuth'
 
 const navigation = [
@@ -130,7 +131,7 @@ function Brand({ compact = false }: { compact?: boolean }) {
     <Group gap={compact ? 8 : 10} wrap="nowrap">
       <img
         className={compact ? 'brand-logo brand-logo--compact' : 'brand-logo'}
-        src="/donkey-logo.webp"
+        src={adminUrl('/donkey-logo.webp')}
         width={compact ? 36 : 48}
         height={compact ? 36 : 48}
         alt=""

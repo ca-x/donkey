@@ -21,6 +21,7 @@ import { useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { api, ApiError } from '../api'
+import { adminUrl } from '../basePath'
 import type { AuthUser } from '../types'
 
 export function LoginPage() {
@@ -68,7 +69,7 @@ export function LoginPage() {
 
       <section className="login-layout" aria-labelledby="login-title">
         <div className="login-identity">
-          <img className="login-logo" src="/donkey-logo.webp" width="112" height="112" alt="Donkey" />
+          <img className="login-logo" src={adminUrl('/donkey-logo.webp')} width="112" height="112" alt="Donkey" />
           <Text className="login-wordmark">DONKEY</Text>
           <Text c="dimmed" size="sm">Registry control plane</Text>
         </div>
@@ -113,7 +114,7 @@ export function LoginPage() {
             {config.data?.oidc_enabled && (
               <Button
                 component="a"
-                href={`/api/auth/oidc/start?return_to=${encodeURIComponent(returnTo)}`}
+                href={`${adminUrl('/api/auth/oidc/start')}?return_to=${encodeURIComponent(returnTo)}`}
                 variant="default"
               >
                 {t('login.continueWith', { provider: config.data.oidc_name })}

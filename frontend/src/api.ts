@@ -17,6 +17,7 @@ import type {
   AuthConfig,
   AuthUser,
 } from './types'
+import { adminUrl } from './basePath'
 
 interface ErrorEnvelope {
   error?: {
@@ -36,7 +37,7 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`/api${path}`, {
+  const response = await fetch(adminUrl(`/api${path}`), {
     ...init,
     credentials: 'same-origin',
     headers: {
