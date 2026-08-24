@@ -1,9 +1,7 @@
 import {
   ActionIcon,
   Box,
-  Button,
   Group,
-  Modal,
   Paper,
   Progress,
   SimpleGrid,
@@ -19,6 +17,7 @@ import { IconClock, IconDatabase, IconFlame, IconTrash } from '@tabler/icons-rea
 import { useTranslation } from 'react-i18next'
 import { api, formatBytes } from '../api'
 import { MetricCard } from '../components/MetricCard'
+import { NamedConfirmDialog } from '../components/NamedConfirmDialog'
 import { PageHeader } from '../components/PageHeader'
 import { EmptyState, ErrorState, LoadingState } from '../components/States'
 import type { CacheEntry } from '../types'
@@ -74,27 +73,20 @@ export function CachePage() {
             </Table>
           </Table.ScrollContainer>
           <Stack className="mobile-cache-list" gap="sm">
-            {entries.map((entry) => <CacheCard key={entry.key} entry={entry} date={(value) => dateFormatter.format(new Date(value))} remove={canWrite ? () => setPendingDelete(entry) : undefined} />)}
+            {entries.map((entry) => <CacheCard key={entry.key} entry={entry} date={(value) => dateFormatter.format(new Date(value))} remove={canWrite ? () => setPendingDelete(entry) : undefined} removing={remove.isPending && remove.variables === entry.key} />)}
           </Stack>
         </Paper>
       )}
-      <Modal
+      <NamedConfirmDialog
         opened={pendingDelete !== null}
-        onClose={() => setPendingDelete(null)}
         title={t('cache.confirmDeleteTitle')}
-        centered
-        classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }}
-        transitionProps={{ transition: 'pop', duration: 220, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}
-      >
-        <Stack>
-          <Text size="sm">{t('cache.confirmDeleteMessage')}</Text>
-          <Text ff="monospace" size="xs" c="dimmed" style={{ overflowWrap: 'anywhere' }}>{pendingDelete?.digest ?? pendingDelete?.key}</Text>
-          <Group justify="flex-end">
-            <Button variant="default" onClick={() => setPendingDelete(null)}>{t('common.cancel')}</Button>
-            <Button color="red" loading={remove.isPending} onClick={() => pendingDelete && remove.mutate(pendingDelete.key)}>{t('cache.remove')}</Button>
-          </Group>
-        </Stack>
-      </Modal>
+        name={pendingDelete?.digest ?? pendingDelete?.key ?? ''}
+        consequence={t('cache.confirmDeleteMessage')}
+        confirmLabel={t('cache.remove')}
+        loading={remove.isPending}
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => pendingDelete && remove.mutate(pendingDelete.key)}
+      />
     </Stack>
   )
 }
@@ -104,9 +96,9 @@ function CacheRow({ entry, date, remove, removing }: { entry: CacheEntry; date: 
   return <Table.Tr><Table.Td><Box maw={380}><Text ff="monospace" size="xs" truncate>{entry.digest ?? entry.key}</Text><Text size="xs" c="dimmed" truncate mt={3}>{entry.media_type}</Text></Box></Table.Td><Table.Td><Text fw={620}>{formatBytes(entry.size_bytes)}</Text></Table.Td><Table.Td><Text size="sm" fw={620}>{entry.hit_count}</Text></Table.Td><Table.Td><Text size="sm">{date(entry.last_accessed_at)}</Text></Table.Td><Table.Td>{remove && <Tooltip label={t('cache.remove')}><ActionIcon variant="subtle" color="red" aria-label={t('cache.remove')} loading={removing} onClick={remove}><IconTrash size={17} /></ActionIcon></Tooltip>}</Table.Td></Table.Tr>
 }
 
-function CacheCard({ entry, date, remove }: { entry: CacheEntry; date: (value: string) => string; remove?: () => void }) {
+function CacheCard({ entry, date, remove, removing }: { entry: CacheEntry; date: (value: string) => string; remove?: () => void; removing: boolean }) {
   const { t } = useTranslation()
-  return <Paper className="cache-mobile-card"><Group justify="space-between" wrap="nowrap"><Box className="cache-mobile-copy"><Text ff="monospace" size="xs" truncate>{entry.digest ?? entry.key}</Text><Text size="xs" c="dimmed">{formatBytes(entry.size_bytes)} · {entry.hit_count} {t('cache.hits')}</Text></Box>{remove && <ActionIcon variant="subtle" color="red" aria-label={t('cache.remove')} onClick={remove}><IconTrash size={17} /></ActionIcon>}</Group><Text size="xs" c="dimmed" mt="sm">{t('cache.lastAccess')}: {date(entry.last_accessed_at)}</Text></Paper>
+  return <Paper className="cache-mobile-card"><Group justify="space-between" wrap="nowrap"><Box className="cache-mobile-copy"><Text ff="monospace" size="xs" truncate>{entry.digest ?? entry.key}</Text><Text size="xs" c="dimmed">{formatBytes(entry.size_bytes)} · {entry.hit_count} {t('cache.hits')}</Text></Box>{remove && <ActionIcon variant="subtle" color="red" aria-label={t('cache.remove')} loading={removing} onClick={remove}><IconTrash size={17} /></ActionIcon>}</Group><Text size="xs" c="dimmed" mt="sm">{t('cache.lastAccess')}: {date(entry.last_accessed_at)}</Text></Paper>
 }
 
 function formatDuration(seconds: number) {

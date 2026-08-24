@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useEffect, type ReactNode } from 'react'
 import {
   ActionIcon,
   Box,
@@ -11,6 +11,7 @@ import {
 } from '@mantine/core'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useMantineColorScheme } from '@mantine/core'
+import { notifications } from '@mantine/notifications'
 import {
   IconActivityHeartbeat,
   IconArrowsShuffle,
@@ -47,7 +48,14 @@ export function AppShell({ children }: { children: ReactNode }) {
   const dark = colorScheme === 'dark'
   const toggleTheme = () => setColorScheme(dark ? 'light' : 'dark')
   const toggleLanguage = () => void i18n.changeLanguage(i18n.resolvedLanguage === 'zh' ? 'en' : 'zh')
-  const logout = useMutation({ mutationFn: api.logout, onSuccess: () => { queryClient.removeQueries({ queryKey: ['auth-me'] }); void navigate('/login', { replace: true }) } })
+  const logout = useMutation({
+    mutationFn: api.logout,
+    onSuccess: () => { queryClient.removeQueries({ queryKey: ['auth-me'] }); void navigate('/login', { replace: true }) },
+    onError: (error: Error) => notifications.show({ color: 'red', title: t('shell.logoutFailed'), message: error.message }),
+  })
+  useEffect(() => {
+    document.getElementById('main-content')?.focus({ preventScroll: true })
+  }, [location.pathname])
   return (
     <div className="app-frame">
       <a className="skip-link" href="#main-content">

@@ -1,6 +1,7 @@
 import { createTheme, rem } from '@mantine/core'
 
 export const theme = createTheme({
+  respectReducedMotion: true,
   primaryColor: 'blue',
   primaryShade: { light: 8, dark: 5 },
   fontFamily: 'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',

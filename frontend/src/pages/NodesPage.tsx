@@ -33,6 +33,7 @@ import {
 import { api, formatBytes, formatRate } from '../api'
 import { useTranslation } from 'react-i18next'
 import { PageHeader } from '../components/PageHeader'
+import { NamedConfirmDialog } from '../components/NamedConfirmDialog'
 import { EmptyState, ErrorState, LoadingState } from '../components/States'
 import type { AuthMode, NodeInput, NodeKind, NodeView } from '../types'
 import { useAuth } from '../useAuth'
@@ -63,16 +64,18 @@ export function NodesPage() {
   const { t } = useTranslation()
   const canWrite = useAuth().role === 'admin'
   const [tab, setTab] = useState<string | null>('all')
-  const [editing, setEditing] = useState<NodeView | null | undefined>(undefined)
+  const [dialog, setDialog] = useState<{ opened: boolean; value: NodeView | null; revision: number }>({ opened: false, value: null, revision: 0 })
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: api.nodes, refetchInterval: 20_000 })
   const filtered = (nodes.data ?? []).filter((item) => tab === 'all' || item.node.kind === tab)
+  const openDialog = (value: NodeView | null) => setDialog((current) => ({ opened: true, value, revision: current.revision + 1 }))
+  const closeDialog = () => setDialog((current) => ({ ...current, opened: false }))
 
   return (
     <Stack gap={24}>
       <PageHeader
         title={t('nodes.title')}
         description={t('nodes.description')}
-        action={canWrite ? <Button leftSection={<IconPlus size={18} />} onClick={() => setEditing(null)} className="pressable">{t('nodes.add')}</Button> : undefined}
+        action={canWrite ? <Button leftSection={<IconPlus size={18} />} onClick={() => openDialog(null)} className="pressable">{t('nodes.add')}</Button> : undefined}
       />
       <Tabs value={tab} onChange={setTab} variant="default" className="node-tabs">
         <Tabs.List>
@@ -82,12 +85,12 @@ export function NodesPage() {
       {nodes.isLoading ? <LoadingState label={t('nodes.reading')} /> : null}
       {nodes.error ? <ErrorState error={nodes.error} retry={() => void nodes.refetch()} /> : null}
       {!nodes.isLoading && !nodes.error && filtered.length === 0 ? (
-        <EmptyState title={t('nodes.emptyTitle')} description={t('nodes.emptyDesc')} action={canWrite ? <Button variant="light" onClick={() => setEditing(null)}>{t('nodes.add')}</Button> : undefined} />
+        <EmptyState title={t('nodes.emptyTitle')} description={t('nodes.emptyDesc')} action={canWrite ? <Button variant="light" onClick={() => openDialog(null)}>{t('nodes.add')}</Button> : undefined} />
       ) : null}
       <SimpleGrid cols={{ base: 1, xl: 2 }} spacing="md">
-        {filtered.map((item) => <NodeCard key={item.node.id} item={item} canWrite={canWrite} edit={() => setEditing(item)} />)}
+        {filtered.map((item) => <NodeCard key={item.node.id} item={item} canWrite={canWrite} edit={() => openDialog(item)} />)}
       </SimpleGrid>
-      {canWrite && <NodeDialog value={editing} close={() => setEditing(undefined)} />}
+      {canWrite && <NodeDialog key={dialog.revision} opened={dialog.opened} value={dialog.value} close={closeDialog} />}
     </Stack>
   )
 }
@@ -148,14 +151,27 @@ function Metric({ label, value }: { label: string; value: string }) {
   return <Box><Text size="xs" c="dimmed">{label}</Text><Text fw={650} mt={3}>{value}</Text></Box>
 }
 
-function NodeDialog({ value, close }: { value: NodeView | null | undefined; close: () => void }) {
+function NodeDialog({ opened, value, close }: { opened: boolean; value: NodeView | null; close: () => void }) {
   const { t } = useTranslation()
   const client = useQueryClient()
-  const opened = value !== undefined
-  const editing = value ?? null
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const editing = value
   const form = useForm<NodeInput>({
     mode: 'controlled',
-    initialValues,
+    initialValues: editing ? {
+      name: editing.node.name,
+      url: editing.node.url,
+      kind: editing.node.kind,
+      route_prefix: editing.node.route_prefix,
+      enabled: editing.node.enabled,
+      priority: editing.node.priority,
+      cf_preferred: editing.node.cf_preferred,
+      connect_ip: editing.node.connect_ip,
+      auth_mode: editing.node.auth_mode,
+      auth_username: editing.node.auth_username,
+      auth_header: editing.node.auth_header,
+      auth_secret: null,
+    } : initialValues,
     validate: {
       name: (v) => v.trim().length === 0 ? t('nodes.validationName') : v.length > 80 ? t('nodes.validationName') : null,
       url: (v) => /^https?:\/\//.test(v) ? null : t('nodes.validationUrl'),
@@ -164,24 +180,6 @@ function NodeDialog({ value, close }: { value: NodeView | null | undefined; clos
       auth_secret: (v, values) => !editing && values.auth_mode !== 'none' && !v ? t('nodes.validationSecret') : null,
     },
   })
-
-  const resetFor = (node: NodeView | null) => {
-    form.setValues(node ? {
-      name: node.node.name,
-      url: node.node.url,
-      kind: node.node.kind,
-      route_prefix: node.node.route_prefix,
-      enabled: node.node.enabled,
-      priority: node.node.priority,
-      cf_preferred: node.node.cf_preferred,
-      connect_ip: node.node.connect_ip,
-      auth_mode: node.node.auth_mode,
-      auth_username: node.node.auth_username,
-      auth_header: node.node.auth_header,
-      auth_secret: null,
-    } : initialValues)
-    form.resetDirty()
-  }
 
   const save = useMutation({
     mutationFn: (input: NodeInput) => editing ? api.updateNode(editing.node.id, input) : api.createNode(input),
@@ -198,6 +196,7 @@ function NodeDialog({ value, close }: { value: NodeView | null | undefined; clos
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['nodes'] })
       notifications.show({ color: 'green', title: t('nodes.deleted'), message: editing!.node.name })
+      setConfirmDelete(false)
       close()
     },
     onError: (error: Error) => notifications.show({ color: 'red', title: t('nodes.deleteFailed'), message: error.message }),
@@ -207,7 +206,6 @@ function NodeDialog({ value, close }: { value: NodeView | null | undefined; clos
     <Modal
       opened={opened}
       onClose={close}
-      onEnterTransitionEnd={() => resetFor(editing)}
       title={t(editing ? 'nodes.editTitle' : 'nodes.createTitle')}
       size="lg"
       centered
@@ -245,7 +243,7 @@ function NodeDialog({ value, close }: { value: NodeView | null | undefined; clos
           {form.values.auth_mode === 'header' && <TextInput label={t('nodes.headerName')} placeholder="X-Registry-Token" {...form.getInputProps('auth_header')} />}
           {form.values.auth_mode !== 'none' && <PasswordInput label={t(editing?.auth_configured ? 'nodes.newSecret' : 'nodes.secret')} description={t('nodes.secretDesc')} autoComplete="new-password" {...form.getInputProps('auth_secret')} />}
           <Group justify="space-between" mt="sm">
-            {editing ? <Button type="button" color="red" variant="subtle" leftSection={<IconTrash size={17} />} loading={remove.isPending} onClick={() => remove.mutate()}>{t('common.delete')}</Button> : <span />}
+            {editing ? <Button type="button" color="red" variant="subtle" leftSection={<IconTrash size={17} />} onClick={() => setConfirmDelete(true)}>{t('common.delete')}</Button> : <span />}
             <Group>
               <Button type="button" variant="default" onClick={close}>{t('common.cancel')}</Button>
               <Button type="submit" leftSection={<IconBolt size={17} />} loading={save.isPending} className="pressable">{t('nodes.saveNode')}</Button>
@@ -253,6 +251,15 @@ function NodeDialog({ value, close }: { value: NodeView | null | undefined; clos
           </Group>
         </Stack>
       </form>
+      {editing && <NamedConfirmDialog
+        opened={confirmDelete}
+        title={t('nodes.confirmDeleteTitle')}
+        name={editing.node.name}
+        consequence={t('nodes.confirmDeleteMessage')}
+        loading={remove.isPending}
+        onCancel={() => setConfirmDelete(false)}
+        onConfirm={() => remove.mutate()}
+      />}
     </Modal>
   )
 }
