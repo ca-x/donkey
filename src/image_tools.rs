@@ -275,6 +275,12 @@ fn transition_update(
         .filter(image_job::Column::Status.eq(from.as_str())))
 }
 
+fn abandoned_lease(now: DateTime<Utc>) -> Condition {
+    Condition::any()
+        .add(image_job::Column::LeaseUntil.is_null())
+        .add(image_job::Column::LeaseUntil.lte(now))
+}
+
 fn default_true() -> bool {
     true
 }
@@ -446,6 +452,11 @@ impl ImageTools {
     // v0.1 runs one worker per process. Leases support restart recovery only;
     // they are not ownership tokens and do not provide cross-process fencing.
     async fn recover_abandoned_jobs(&self, now: DateTime<Utc>) -> ApiResult<u64> {
+        let cancelled = transition_update(JobStatus::Running, JobStatus::Cancelled, now, None)?
+            .filter(image_job::Column::CancelRequested.eq(true))
+            .filter(abandoned_lease(now))
+            .exec(&self.db)
+            .await?;
         let recovered = image_job::Entity::update_many()
             .set(image_job::ActiveModel {
                 status: Set(JobStatus::Pending.as_str().into()),
@@ -459,14 +470,11 @@ impl ImageTools {
                 ..Default::default()
             })
             .filter(image_job::Column::Status.eq(JobStatus::Running.as_str()))
-            .filter(
-                Condition::any()
-                    .add(image_job::Column::LeaseUntil.is_null())
-                    .add(image_job::Column::LeaseUntil.lte(now)),
-            )
+            .filter(image_job::Column::CancelRequested.eq(false))
+            .filter(abandoned_lease(now))
             .exec(&self.db)
             .await?;
-        Ok(recovered.rows_affected)
+        Ok(cancelled.rows_affected + recovered.rows_affected)
     }
 
     async fn process_job(&self, job: &image_job::Model) -> ApiResult<JobOutcome> {
@@ -1517,41 +1525,53 @@ async fn cancel_job(
         .ok_or_else(|| AppError::not_found("image job"))?;
     let status = JobStatus::parse(&model.status)
         .ok_or_else(|| AppError::bad_request("image job has an unknown status"))?;
-    let now = Utc::now();
-    let result = match status {
-        JobStatus::Pending => {
-            transition_update(JobStatus::Pending, JobStatus::Cancelled, now, None)?
-                .filter(image_job::Column::Id.eq(id))
-                .exec(&service.db)
-                .await?
+    cancel_job_from_status(&service, id, status).await
+}
+
+async fn cancel_job_from_status(
+    service: &ImageTools,
+    id: Uuid,
+    mut status: JobStatus,
+) -> ApiResult<StatusCode> {
+    loop {
+        let now = Utc::now();
+        let result = match status {
+            JobStatus::Pending => {
+                transition_update(JobStatus::Pending, JobStatus::Cancelled, now, None)?
+                    .filter(image_job::Column::Id.eq(id))
+                    .exec(&service.db)
+                    .await?
+            }
+            JobStatus::Running => {
+                image_job::Entity::update_many()
+                    .col_expr(
+                        image_job::Column::CancelRequested,
+                        sea_orm::sea_query::Expr::value(true),
+                    )
+                    .col_expr(
+                        image_job::Column::UpdatedAt,
+                        sea_orm::sea_query::Expr::value(now),
+                    )
+                    .filter(image_job::Column::Id.eq(id))
+                    .filter(image_job::Column::Status.eq(JobStatus::Running.as_str()))
+                    .exec(&service.db)
+                    .await?
+            }
+            _ => return Err(AppError::bad_request("image job cannot be cancelled")),
+        };
+        if result.rows_affected == 1 {
+            return Ok(StatusCode::NO_CONTENT);
         }
-        JobStatus::Running => {
-            image_job::Entity::update_many()
-                .col_expr(
-                    image_job::Column::CancelRequested,
-                    sea_orm::sea_query::Expr::value(true),
-                )
-                .col_expr(
-                    image_job::Column::UpdatedAt,
-                    sea_orm::sea_query::Expr::value(now),
-                )
-                .filter(image_job::Column::Id.eq(id))
-                .filter(image_job::Column::Status.eq(JobStatus::Running.as_str()))
-                .exec(&service.db)
-                .await?
+
+        let model = image_job::Entity::find_by_id(id)
+            .one(&service.db)
+            .await?
+            .ok_or_else(|| AppError::not_found("image job"))?;
+        if model.status == JobStatus::Running.as_str() && model.cancel_requested {
+            return Ok(StatusCode::NO_CONTENT);
         }
-        _ => return Err(AppError::bad_request("image job cannot be cancelled")),
-    };
-    if result.rows_affected == 1 {
-        Ok(StatusCode::NO_CONTENT)
-    } else if image_job::Entity::find_by_id(id)
-        .one(&service.db)
-        .await?
-        .is_none()
-    {
-        Err(AppError::not_found("image job"))
-    } else {
-        Err(AppError::bad_request("image job cannot be cancelled"))
+        status = JobStatus::parse(&model.status)
+            .ok_or_else(|| AppError::bad_request("image job has an unknown status"))?;
     }
 }
 
@@ -2247,6 +2267,15 @@ mod tests {
             .unwrap()
     }
 
+    async fn insert_cancel_requested_job(
+        db: &DatabaseConnection,
+        lease_until: Option<DateTime<Utc>>,
+    ) -> image_job::Model {
+        let mut job = test_job(JobStatus::Running, lease_until);
+        job.cancel_requested = true;
+        job.into_active_model().insert(db).await.unwrap()
+    }
+
     #[test]
     fn job_status_transition_matrix_is_explicit_and_strings_are_stable() {
         for from in JobStatus::ALL {
@@ -2309,6 +2338,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_retries_when_claim_wins_after_pending_read() {
+        let (_directory, service) = test_service().await;
+        let job = insert_test_job(&service.db, JobStatus::Pending, None).await;
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+        let cancel_service = service.clone();
+
+        let cancel = tokio::spawn(async move {
+            let observed = image_job::Entity::find_by_id(job.id)
+                .one(&cancel_service.db)
+                .await
+                .unwrap()
+                .unwrap();
+            let status = JobStatus::parse(&observed.status).unwrap();
+            read_tx.send(()).unwrap();
+            claimed_rx.await.unwrap();
+            cancel_job_from_status(&cancel_service, job.id, status).await
+        });
+        read_rx.await.unwrap();
+        assert!(service.claim_next_job().await.unwrap().is_some());
+        claimed_tx.send(()).unwrap();
+
+        assert_eq!(cancel.await.unwrap().unwrap(), StatusCode::NO_CONTENT);
+        let stored = image_job::Entity::find_by_id(job.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, JobStatus::Running.as_str());
+        assert!(stored.cancel_requested);
+    }
+
+    #[tokio::test]
     async fn startup_recovers_only_missing_or_expired_leases() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = Config::for_test(directory.path().to_owned());
@@ -2349,6 +2411,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(live.status, JobStatus::Running.as_str());
+        assert_eq!(live.lease_until, Some(now + chrono::Duration::minutes(5)));
+    }
+
+    #[tokio::test]
+    async fn startup_finishes_abandoned_cancel_requests_without_reexecution() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.credential_key = Some(SecretString::from("99".repeat(32)));
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let now = Utc::now();
+        let missing = insert_cancel_requested_job(&db, None).await;
+        let expired =
+            insert_cancel_requested_job(&db, Some(now - chrono::Duration::minutes(1))).await;
+        let live = insert_cancel_requested_job(&db, Some(now + chrono::Duration::minutes(5))).await;
+        let config = Arc::new(config);
+        let nodes = NodeService::new(config.clone(), db.clone()).unwrap();
+
+        let service = ImageTools::new(config, db, nodes).await.unwrap();
+        for id in [missing.id, expired.id] {
+            let cancelled = image_job::Entity::find_by_id(id)
+                .one(&service.db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cancelled.status, JobStatus::Cancelled.as_str());
+            assert_eq!(cancelled.stage, JobStatus::Cancelled.as_str());
+            assert!(cancelled.cancel_requested);
+            assert!(cancelled.lease_until.is_none());
+            assert!(cancelled.finished_at.is_some());
+        }
+        let live = image_job::Entity::find_by_id(live.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.status, JobStatus::Running.as_str());
+        assert!(live.cancel_requested);
         assert_eq!(live.lease_until, Some(now + chrono::Duration::minutes(5)));
     }
 
