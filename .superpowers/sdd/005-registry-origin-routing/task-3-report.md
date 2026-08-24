@@ -32,3 +32,36 @@ Runtime browser acceptance was not run in this subtask because the controller ex
 ## Concerns
 
 No implementation blocker or known gate failure. v0.2.0 intentionally rejects an old database, so deployment must follow the documented backup and clean-database procedure.
+
+## Review correction pass
+
+The Task 3 review and controller browser QA identified four follow-up issues. This pass fixes them without changing backend contracts or adding dependencies:
+
+- Node and Registry-route forms now expose `aria-busy`, disable their fieldsets, hide the close affordance, reject outside/Escape close, and disable Cancel while a save is pending. The route manager also lifts the editor-saving state to block manager close and create/edit transitions. Successful completion uses a dedicated current-editor completion path, so an originating save cannot be dismissed and reopened as another editor before its callback finishes.
+- Route key and path prefix validation now uses the backend-equivalent `trim().toLowerCase()` normalization, excludes only the current route ID, and checks every sibling route before mutation. Invalid slash variants are rejected by the backend-matching identifier grammar; whitespace/case variants collide locally. Residual HTTP 409 saves use safe localized Chinese/English conflict copy while the backend remains authoritative.
+- A new node selects only an enabled default/first route. With all routes disabled its initial `registry_route_id` is empty and required validation blocks submit; editing may retain its currently bound disabled route but cannot select a different disabled route.
+- Mantine's dark primary shade changed from blue 5 (`#339af0`, 2.991:1 against white) to blue 8 (`#1971c2`, 5.021:1), exceeding WCAG AA 4.5:1 for the filled Add node button while retaining the filled primary hierarchy.
+
+### Source-level behavior evidence
+
+A dependency-free Node probe against the implemented normalization/default/contrast formulas reported:
+
+```text
+key whitespace/case duplicate: true
+prefix whitespace/case duplicate: true
+slash variant rejected: true
+all-disabled default empty: true
+white/blue-8 contrast: 5.021:1
+```
+
+Source review also confirmed both save modals bind `onClose`, `withCloseButton`, `closeOnClickOutside`, and `closeOnEscape` to pending state, and the route manager guards parent close/open/edit transitions. The controller will rerun browser/axe acceptance; no post-fix browser claim is made here.
+
+### Fresh review-fix verification
+
+- `pnpm --dir frontend lint` — passed.
+- `pnpm --dir frontend build` — passed (`tsc -b`, Vite; 7,745 modules transformed).
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --locked --all-targets -- -D warnings` — passed.
+- `cargo test --locked --all-targets` — passed: 67 unit tests and 9 integration tests, 0 failures.
+- `cargo build --locked` — passed for Donkey v0.2.0.
+- `git diff --check` — passed.

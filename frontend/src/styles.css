@@ -459,6 +459,13 @@ a,
   backdrop-filter: blur(5px);
 }
 
+.pending-form {
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
 .cache-usage-panel {
   padding: 15px 18px;
 }

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ActionIcon, Box, Button, Group, Modal, Select, SimpleGrid, Stack, Switch, Text, TextInput, Tooltip } from '@mantine/core'
 import { useForm } from '@mantine/form'
 import { notifications } from '@mantine/notifications'
@@ -17,17 +17,31 @@ function isBuiltInRoute(route: RegistryRoute) {
 
 export function RegistryRoutesDialog({ opened, routes, close }: { opened: boolean; routes: RegistryRoute[]; close: () => void }) {
   const { t } = useTranslation()
+  const [editorSaving, setEditorSaving] = useState(false)
   const [editor, setEditor] = useState<{ opened: boolean; value: RegistryRoute | null; revision: number }>({ opened: false, value: null, revision: 0 })
-  const openEditor = (value: RegistryRoute | null) => setEditor((current) => ({ opened: true, value, revision: current.revision + 1 }))
-  const closeEditor = () => setEditor((current) => ({ ...current, opened: false }))
+  const openEditor = (value: RegistryRoute | null) => {
+    if (editorSaving) return
+    setEditor((current) => ({ opened: true, value, revision: current.revision + 1 }))
+  }
+  const closeEditor = () => {
+    if (editorSaving) return
+    setEditor((current) => ({ ...current, opened: false }))
+  }
+  const completeEditor = () => {
+    setEditorSaving(false)
+    setEditor((current) => ({ ...current, opened: false }))
+  }
+  const closeManager = () => {
+    if (!editorSaving) close()
+  }
 
   return (
     <Modal.Stack>
-      <Modal stackId="registry-routes" opened={opened} onClose={close} title={t('nodes.routesTitle')} size="lg" centered classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }} transitionProps={{ transition: 'pop', duration: 200, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}>
+      <Modal stackId="registry-routes" opened={opened} onClose={closeManager} title={t('nodes.routesTitle')} size="lg" centered withCloseButton={!editorSaving} closeOnClickOutside={!editorSaving} closeOnEscape={!editorSaving} classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }} transitionProps={{ transition: 'pop', duration: 200, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}>
         <Stack gap="md">
           <Group justify="space-between" align="flex-start">
             <Text size="sm" c="dimmed" className="route-manager-description">{t('nodes.routesDescription')}</Text>
-            <Button size="sm" leftSection={<IconPlus size={17} />} onClick={() => openEditor(null)}>{t('nodes.addRoute')}</Button>
+            <Button size="sm" leftSection={<IconPlus size={17} />} disabled={editorSaving} onClick={() => openEditor(null)}>{t('nodes.addRoute')}</Button>
           </Group>
           <Stack gap={0} className="registry-route-list">
             {routes.map((route) => (
@@ -41,13 +55,13 @@ export function RegistryRoutesDialog({ opened, routes, close }: { opened: boolea
                   </Group>
                   <Text size="xs" c="dimmed" mt={3}>{route.canonical_registry} · {route.path_prefix ? `/${route.path_prefix}` : t('nodes.rootNamespace')} · {t(`nodes.mode.${route.repository_mode}`)}</Text>
                 </Box>
-                <Tooltip label={t('common.edit')}><ActionIcon variant="subtle" aria-label={`${t('common.edit')} ${route.name}`} onClick={() => openEditor(route)}><IconEdit size={18} /></ActionIcon></Tooltip>
+                <Tooltip label={t('common.edit')}><ActionIcon variant="subtle" aria-label={`${t('common.edit')} ${route.name}`} disabled={editorSaving} onClick={() => openEditor(route)}><IconEdit size={18} /></ActionIcon></Tooltip>
               </Group>
             ))}
           </Stack>
         </Stack>
       </Modal>
-      <RegistryRouteEditor key={editor.revision} opened={editor.opened} value={editor.value} routes={routes} close={closeEditor} />
+      <RegistryRouteEditor key={editor.revision} opened={editor.opened} value={editor.value} routes={routes} close={closeEditor} complete={completeEditor} setSaving={setEditorSaving} />
     </Modal.Stack>
   )
 }
@@ -75,7 +89,11 @@ function routeInitialValues(route: RegistryRoute | null): RegistryRouteFormValue
 }
 
 function validRouteIdentifier(value: string) {
-  return /^[a-z0-9][a-z0-9_-]{0,31}$/.test(value.trim())
+  return /^[a-z0-9][a-z0-9_-]{0,31}$/.test(normalizeRouteIdentifier(value))
+}
+
+function normalizeRouteIdentifier(value: string) {
+  return value.trim().toLowerCase()
 }
 
 function validCanonicalRegistry(value: string) {
@@ -105,7 +123,7 @@ function validCanonicalRegistry(value: string) {
   return !port || (/^\d{1,5}$/.test(port) && Number(port) > 0 && Number(port) <= 65535)
 }
 
-function RegistryRouteEditor({ opened, value, routes, close }: { opened: boolean; value: RegistryRoute | null; routes: RegistryRoute[]; close: () => void }) {
+function RegistryRouteEditor({ opened, value, routes, close, complete, setSaving }: { opened: boolean; value: RegistryRoute | null; routes: RegistryRoute[]; close: () => void; complete: () => void; setSaving: (saving: boolean) => void }) {
   const { t } = useTranslation()
   const client = useQueryClient()
   const editing = value
@@ -116,12 +134,18 @@ function RegistryRouteEditor({ opened, value, routes, close }: { opened: boolean
     mode: 'controlled',
     initialValues: routeInitialValues(editing),
     validate: {
-      key: (v) => validRouteIdentifier(v) ? null : t('nodes.validationRouteKey'),
+      key: (v) => {
+        if (!validRouteIdentifier(v)) return t('nodes.validationRouteKey')
+        const normalized = normalizeRouteIdentifier(v)
+        return routes.some((route) => route.id !== editing?.id && normalizeRouteIdentifier(route.key) === normalized) ? t('routeFeedback.keyInUse') : null
+      },
       name: (v) => v.trim().length > 0 && v.trim().length <= 80 ? null : t('nodes.validationRouteName'),
       canonical_registry: (v) => validCanonicalRegistry(v) ? null : t('nodes.validationCanonicalRegistry'),
       path_prefix: (v, values) => {
         if (values.is_default) return v.trim() ? t('nodes.validationDefaultPrefix') : null
-        return validRouteIdentifier(v) ? null : t('nodes.validationPathPrefix')
+        if (!validRouteIdentifier(v)) return t('nodes.validationPathPrefix')
+        const normalized = normalizeRouteIdentifier(v)
+        return routes.some((route) => route.id !== editing?.id && route.path_prefix !== null && normalizeRouteIdentifier(route.path_prefix) === normalized) ? t('routeFeedback.prefixInUse') : null
       },
       repository_mode: (v) => ['docker_hub_library', 'passthrough'].includes(v) ? null : t('nodes.validationRepositoryMode'),
       is_default: (v) => v && routes.some((route) => route.is_default && route.id !== editing?.id) ? t('nodes.validationDefaultConflict') : null,
@@ -132,10 +156,10 @@ function RegistryRouteEditor({ opened, value, routes, close }: { opened: boolean
     mutationFn: (values: RegistryRouteFormValues) => {
       const input: RegistryRouteInput = {
         ...values,
-        key: values.key.trim().toLowerCase(),
+        key: normalizeRouteIdentifier(values.key),
         name: values.name.trim(),
         canonical_registry: values.canonical_registry.trim().toLowerCase(),
-        path_prefix: values.path_prefix.trim().toLowerCase() || null,
+        path_prefix: normalizeRouteIdentifier(values.path_prefix) || null,
       }
       return editing ? api.updateRegistryRoute(editing.id, input) : api.createRegistryRoute(input)
     },
@@ -144,10 +168,14 @@ function RegistryRouteEditor({ opened, value, routes, close }: { opened: boolean
       void client.invalidateQueries({ queryKey: ['nodes'] })
       void client.invalidateQueries({ queryKey: ['dashboard'] })
       notifications.show({ color: 'green', title: t(editing ? 'nodes.routeUpdated' : 'nodes.routeCreated'), message: t('nodes.routeSavedMessage') })
-      close()
+      complete()
     },
-    onError: (error: Error) => notifications.show({ color: 'red', title: t('nodes.routeSaveFailed'), message: error.message }),
+    onError: (error: Error) => {
+      const message = error instanceof ApiError && error.status === 409 ? t('routeFeedback.conflict') : error.message
+      notifications.show({ color: 'red', title: t('nodes.routeSaveFailed'), message })
+    },
   })
+  useEffect(() => setSaving(save.isPending), [save.isPending, setSaving])
   const remove = useMutation({
     mutationFn: () => api.deleteRegistryRoute(editing!.id),
     onSuccess: () => {
@@ -168,12 +196,16 @@ function RegistryRouteEditor({ opened, value, routes, close }: { opened: boolean
     setDeleteError(null)
     setConfirmDelete(true)
   }
+  const requestClose = () => {
+    if (!save.isPending) close()
+  }
 
   return (
     <>
-      <Modal stackId="registry-route-editor" opened={opened} onClose={close} title={t(editing ? 'nodes.editRouteTitle' : 'nodes.createRouteTitle')} size="md" centered classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }} transitionProps={{ transition: 'pop', duration: 200, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}>
-        <form onSubmit={form.onSubmit((values) => save.mutate(values))}>
-          <Stack gap="md">
+      <Modal stackId="registry-route-editor" opened={opened} onClose={requestClose} title={t(editing ? 'nodes.editRouteTitle' : 'nodes.createRouteTitle')} size="md" centered withCloseButton={!save.isPending} closeOnClickOutside={!save.isPending} closeOnEscape={!save.isPending} classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }} transitionProps={{ transition: 'pop', duration: 200, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}>
+        <form aria-busy={save.isPending} onSubmit={form.onSubmit((values) => save.mutate(values))}>
+          <fieldset className="pending-form" disabled={save.isPending}>
+            <Stack gap="md">
             <SimpleGrid cols={{ base: 1, sm: 2 }}>
               <TextInput label={t('nodes.routeKey')} description={t('nodes.routeKeyDesc')} readOnly={builtIn} required {...form.getInputProps('key')} />
               <TextInput label={t('nodes.routeName')} required {...form.getInputProps('name')} />
@@ -188,11 +220,12 @@ function RegistryRouteEditor({ opened, value, routes, close }: { opened: boolean
             <Group justify="space-between" mt="sm">
               {editing && !builtIn ? <Button type="button" color="red" variant="subtle" leftSection={<IconTrash size={17} />} onClick={openDelete}>{t('common.delete')}</Button> : <span />}
               <Group>
-                <Button type="button" variant="default" onClick={close}>{t('common.cancel')}</Button>
+                <Button type="button" variant="default" disabled={save.isPending} onClick={requestClose}>{t('common.cancel')}</Button>
                 <Button type="submit" loading={save.isPending}>{t('common.save')}</Button>
               </Group>
             </Group>
-          </Stack>
+            </Stack>
+          </fieldset>
         </form>
       </Modal>
       {editing && !builtIn ? <NamedConfirmDialog

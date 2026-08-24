@@ -43,7 +43,6 @@ import { useAuth } from '../useAuth'
 function defaultRouteId(routes: RegistryRoute[]) {
   return routes.find((route) => route.is_default && route.enabled)?.id
     ?? routes.find((route) => route.enabled)?.id
-    ?? routes[0]?.id
     ?? ''
 }
 
@@ -198,7 +197,7 @@ function NodeDialog({ opened, value, routes, close }: { opened: boolean; value: 
     validate: {
       name: (v) => v.trim().length === 0 || v.length > 80 ? t('nodes.validationName') : null,
       url: (v) => /^https?:\/\//.test(v) ? null : t('nodes.validationUrl'),
-      registry_route_id: (v) => routes.some((route) => route.id === v) ? null : t('nodes.validationRoute'),
+      registry_route_id: (v) => routes.some((route) => route.id === v && (route.enabled || route.id === editing?.node.registry_route_id)) ? null : t('nodes.validationRoute'),
       auth_username: (v, values) => values.auth_mode === 'basic' && !v?.trim() ? t('nodes.validationUsername') : null,
       auth_header: (v, values) => values.auth_mode === 'header' && !v?.trim() ? t('nodes.validationHeader') : null,
       auth_secret: (v, values) => !editing && values.auth_mode !== 'none' && !v ? t('nodes.validationSecret') : null,
@@ -231,12 +230,16 @@ function NodeDialog({ opened, value, routes, close }: { opened: boolean; value: 
     label: `${route.name} · ${route.canonical_registry}${route.enabled ? '' : ` · ${t('common.disabled')}`}`,
     disabled: !route.enabled && route.id !== editing?.node.registry_route_id,
   }))
+  const requestClose = () => {
+    if (!save.isPending) close()
+  }
 
   return (
     <Modal.Stack>
-      <Modal stackId="node-editor" opened={opened} onClose={close} title={t(editing ? 'nodes.editTitle' : 'nodes.createTitle')} size="lg" centered classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }} transitionProps={{ transition: 'pop', duration: 220, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}>
-        <form onSubmit={form.onSubmit((values) => save.mutate(values))}>
-          <Stack gap="md">
+      <Modal stackId="node-editor" opened={opened} onClose={requestClose} title={t(editing ? 'nodes.editTitle' : 'nodes.createTitle')} size="lg" centered withCloseButton={!save.isPending} closeOnClickOutside={!save.isPending} closeOnEscape={!save.isPending} classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }} transitionProps={{ transition: 'pop', duration: 220, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}>
+        <form aria-busy={save.isPending} onSubmit={form.onSubmit((values) => save.mutate(values))}>
+          <fieldset className="pending-form" disabled={save.isPending}>
+            <Stack gap="md">
             <SimpleGrid cols={{ base: 1, sm: 2 }}>
               <TextInput label={t('nodes.name')} placeholder={t('nodes.namePlaceholder')} required {...form.getInputProps('name')} />
               <Select label={t('nodes.registryNamespace')} description={t('nodes.registryNamespaceDesc')} data={routeOptions} searchable required {...form.getInputProps('registry_route_id')} />
@@ -267,11 +270,12 @@ function NodeDialog({ opened, value, routes, close }: { opened: boolean; value: 
             <Group justify="space-between" mt="sm">
               {editing ? <Button type="button" color="red" variant="subtle" leftSection={<IconTrash size={17} />} onClick={() => setConfirmDelete(true)}>{t('common.delete')}</Button> : <span />}
               <Group>
-                <Button type="button" variant="default" onClick={close}>{t('common.cancel')}</Button>
+                <Button type="button" variant="default" disabled={save.isPending} onClick={requestClose}>{t('common.cancel')}</Button>
                 <Button type="submit" leftSection={<IconBolt size={17} />} loading={save.isPending} className="pressable">{t('nodes.saveNode')}</Button>
               </Group>
             </Group>
-          </Stack>
+            </Stack>
+          </fieldset>
         </form>
       </Modal>
       {editing && <NamedConfirmDialog stackId="node-delete-confirm" opened={confirmDelete} title={t('nodes.confirmDeleteTitle')} name={editing.node.name} consequence={t('nodes.confirmDeleteMessage')} loading={remove.isPending} onCancel={() => setConfirmDelete(false)} onConfirm={() => remove.mutate()} />}

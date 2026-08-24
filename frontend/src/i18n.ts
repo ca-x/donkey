@@ -4,6 +4,7 @@ import { initReactI18next } from 'react-i18next'
 const resources = {
   zh: {
     translation: {
+      routeFeedback: { keyInUse: '路由键已被其他命名空间使用', prefixInUse: '路径前缀已被其他命名空间使用', conflict: '路由键、路径前缀或默认设置与现有命名空间冲突，请检查后重试' },
       nav: { overview: '概览', nodes: '加速节点', nodesShort: '节点', cache: '缓存', domain: '域名加速', domainShort: '转换', imageTools: '镜像工具', imageToolsShort: '工具', settings: '设置与部署', settingsShort: '设置' },
       shell: { skip: '跳到主要内容', mainNav: '主导航', mobileNav: '移动端主导航', connected: '服务已连接', registryHealthy: 'Registry v2 正常', light: '切换到浅色主题', dark: '切换到暗色主题', language: 'Switch to English', logoutFailed: '无法退出登录' },
       login: { title: '登录', description: '登录以管理这个 Donkey 实例。', username: '用户名', password: '密码', submit: '登录', invalid: '用户名或密码不正确。', rateLimited: '尝试次数过多，请稍后再试。', configFailed: '无法读取登录配置。', oidcFailed: '单点登录未完成，请重试。', or: '或者', continueWith: '使用 {{provider}} 登录', notConfigured: '尚未配置登录方式，请设置管理员或 OIDC 环境变量。', admin: '管理员', member: '成员', logout: '退出登录' },
@@ -19,6 +20,7 @@ const resources = {
   },
   en: {
     translation: {
+      routeFeedback: { keyInUse: 'Another namespace already uses this route key', prefixInUse: 'Another namespace already uses this path prefix', conflict: 'The route key, path prefix, or default setting conflicts with another namespace. Review the form and try again.' },
       nav: { overview: 'Overview', nodes: 'Upstreams', nodesShort: 'Nodes', cache: 'Cache', domain: 'DomainFold', domainShort: 'Convert', imageTools: 'Image tools', imageToolsShort: 'Tools', settings: 'Settings & deploy', settingsShort: 'Settings' },
       shell: { skip: 'Skip to main content', mainNav: 'Main navigation', mobileNav: 'Mobile navigation', connected: 'Service connected', registryHealthy: 'Registry v2 healthy', light: 'Switch to light theme', dark: 'Switch to dark theme', language: '切换到中文', logoutFailed: 'Unable to sign out' },
       login: { title: 'Sign in', description: 'Sign in to manage this Donkey instance.', username: 'Username', password: 'Password', submit: 'Sign in', invalid: 'The username or password is incorrect.', rateLimited: 'Too many attempts. Try again later.', configFailed: 'Unable to load sign-in configuration.', oidcFailed: 'Single sign-on did not complete. Try again.', or: 'or', continueWith: 'Continue with {{provider}}', notConfigured: 'No sign-in method is configured. Set the administrator or OIDC environment variables.', admin: 'Administrator', member: 'Member', logout: 'Sign out' },
