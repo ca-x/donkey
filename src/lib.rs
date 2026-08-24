@@ -10,6 +10,7 @@ pub mod error;
 pub mod image_tools;
 pub mod nodes;
 pub mod registry;
+pub mod registry_routes;
 pub mod scheduler;
 pub mod security;
 pub mod server;

@@ -155,10 +155,6 @@ static DENIED_NETWORKS: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
     .collect()
 });
 
-pub fn valid_node_kind(kind: &str) -> bool {
-    matches!(kind, "dockerhub" | "ghcr" | "registry")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

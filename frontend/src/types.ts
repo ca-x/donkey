@@ -1,5 +1,5 @@
-export type NodeKind = 'dockerhub' | 'ghcr' | 'registry'
 export type AuthMode = 'none' | 'basic' | 'bearer' | 'header'
+export type RepositoryMode = 'docker_hub_library' | 'passthrough'
 
 export interface AuthUser {
   id: string | null
@@ -31,8 +31,7 @@ export interface NodeModel {
   id: string
   name: string
   url: string
-  kind: NodeKind
-  route_prefix: string | null
+  registry_route_id: string
   enabled: boolean
   priority: number
   cf_preferred: boolean
@@ -49,13 +48,13 @@ export interface NodeView {
   metric: NodeMetric
   score: number
   auth_configured: boolean
+  route: RegistryRouteSummary
 }
 
 export interface NodeInput {
   name: string
   url: string
-  kind: NodeKind
-  route_prefix: string | null
+  registry_route_id: string
   enabled: boolean
   priority: number
   cf_preferred: boolean
@@ -64,6 +63,32 @@ export interface NodeInput {
   auth_username: string | null
   auth_header: string | null
   auth_secret: string | null
+}
+
+export interface RegistryRouteSummary {
+  id: string
+  key: string
+  name: string
+  canonical_registry: string
+  path_prefix: string | null
+  repository_mode: RepositoryMode
+  enabled: boolean
+}
+
+export interface RegistryRoute extends RegistryRouteSummary {
+  is_default: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface RegistryRouteInput {
+  key: string
+  name: string
+  canonical_registry: string
+  path_prefix: string | null
+  repository_mode: RepositoryMode
+  is_default: boolean
+  enabled: boolean
 }
 
 export interface CacheEntry {

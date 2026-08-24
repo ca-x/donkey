@@ -244,7 +244,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(authenticated.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(authenticated.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -416,6 +416,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read.status(), StatusCode::OK);
+
+        let route_read = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/registry-routes")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(route_read.status(), StatusCode::OK);
+
+        let route_write = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/registry-routes")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(route_write.status(), StatusCode::FORBIDDEN);
 
         let write = router
             .oneshot(

@@ -1,6 +1,7 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import { api, ApiError } from './api'
 import { AuthProvider } from './components/AuthProvider'
 import { AppShell } from './components/AppShell'
@@ -16,7 +17,20 @@ const LoginPage = lazy(() => import('./pages/LoginPage').then((module) => ({ def
 
 export function App() {
   const location = useLocation()
+  const { t, i18n } = useTranslation()
   const session = useQuery({ queryKey: ['auth-me'], queryFn: api.me, retry: false, staleTime: 30_000 })
+  useEffect(() => {
+    const titleKey: Record<string, string> = {
+      '/': 'dashboard.title',
+      '/nodes': 'nodes.title',
+      '/cache': 'cache.title',
+      '/domainfold': 'domain.title',
+      '/image-tools': 'imageTools.title',
+      '/settings': 'settings.title',
+      '/login': 'login.title',
+    }
+    document.title = `Donkey · ${t(titleKey[location.pathname] ?? 'dashboard.title')}`
+  }, [i18n.resolvedLanguage, location.pathname, t])
   if (location.pathname === '/login') {
     if (session.data) return <Navigate to="/" replace />
     return <Suspense fallback={<LoadingState />}><LoginPage /></Suspense>

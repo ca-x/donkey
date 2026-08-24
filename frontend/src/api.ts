@@ -6,6 +6,8 @@ import type {
   MappingInput,
   NodeInput,
   NodeView,
+  RegistryRoute,
+  RegistryRouteInput,
   RuntimeConfig,
   RegistryCredential,
   ImageJob,
@@ -75,6 +77,12 @@ export const api = {
     request<NodeView>(`/nodes/${id}`, { method: 'PUT', body: json(input) }),
   deleteNode: (id: string) => request<void>(`/nodes/${id}`, { method: 'DELETE' }),
   probeNode: (id: string) => request<NodeView>(`/nodes/${id}/probe`, { method: 'POST' }),
+  registryRoutes: () => request<RegistryRoute[]>('/registry-routes'),
+  createRegistryRoute: (input: RegistryRouteInput) =>
+    request<RegistryRoute>('/registry-routes', { method: 'POST', body: json(input) }),
+  updateRegistryRoute: (id: string, input: RegistryRouteInput) =>
+    request<RegistryRoute>(`/registry-routes/${id}`, { method: 'PUT', body: json(input) }),
+  deleteRegistryRoute: (id: string) => request<void>(`/registry-routes/${id}`, { method: 'DELETE' }),
   cache: (limit = 250) => request<CacheEntry[]>(`/cache?limit=${limit}`),
   deleteCache: (key: string) => request<void>(`/cache/${key}`, { method: 'DELETE' }),
   mappings: () => request<Mapping[]>('/mappings'),

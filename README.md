@@ -42,6 +42,8 @@ Donkey 是一个 Rust 编写的 OCI / Docker Registry 拉取代理。它支持�
 
 ## Docker Compose
 
+> **v0.2.0 数据要求：** 必须使用干净的 SQLite 数据库，不能原地复用 v0.1 的数据库。升级前先停止 Donkey 并备份 `/data`，然后使用新的空数据卷（或清空数据库文件）启动，再在管理界面重新配置用户、Registry 命名空间和节点。缓存文件可另行保留，但不要把旧 `donkey.db` 带入 v0.2.0。
+
 ```bash
 git clone https://github.com/ca-x/donkey.git
 cd donkey
@@ -108,9 +110,9 @@ docker login registry.example.com
 
 Donkey 验证客户端凭据后会移除该 Authorization，再按节点配置向上游换取 Bearer token。Donkey 的登录密码不会发送给上游。
 
-## 添加上游节点
+## 配置 Registry 命名空间与节点
 
-在「加速节点」页面添加 Registry 根地址，例如：
+「加速节点」页面把逻辑 Registry 与镜像端点分开管理。干净数据库会创建两个内置命名空间：Docker Hub 是根命名空间，GHCR 使用 `ghcr` 路径前缀。先选择「管理命名空间」，再为对应命名空间添加一个或多个镜像端点，例如：
 
 ```text
 https://docker.1ms.run
@@ -121,6 +123,18 @@ https://registry-1.docker.io
 1ms 付费节点使用标准 Docker Basic 认证：认证方式选择 `Docker / HTTP Basic`，用户名填写 `1ms`，密钥填写 1ms 生成的 Docker secret。需要先设置 `DONKEY_CREDENTIAL_KEY`。
 
 默认只接受解析到公开 IP 的 HTTPS 上游。内网 Registry 需要显式设置 `DONKEY_ALLOW_PRIVATE_UPSTREAMS=true`；HTTP 上游还需设置 `DONKEY_ALLOW_INSECURE_UPSTREAMS=true`。
+
+客户端拉取示例（将域名替换为你的 Donkey Registry）：
+
+```bash
+# Docker Hub 默认命名空间
+docker pull registry.example.com/library/alpine:latest
+
+# GHCR 内置命名空间；对应上游 ghcr.io/owner/image:tag
+docker pull registry.example.com/ghcr/owner/image:tag
+```
+
+自定义 Registry 也使用独立且唯一的路径前缀。内置命名空间可以编辑、启用或停用，但不能删除；仍被节点引用的自定义命名空间也不能删除。
 
 ## 镜像工具
 
@@ -212,6 +226,8 @@ Linux 的 `/etc/docker/daemon.json`：
 }
 ```
 
+Docker daemon 的 `registry-mirrors` 通常只接管 Docker Hub 拉取，不会自动代理 `ghcr.io` 等任意 Registry。Docker Hub 可以继续使用原镜像名（例如 `docker pull alpine`）；GHCR 请显式使用 Donkey 的命名空间地址，例如 `docker pull registry.example.com/ghcr/owner/image:tag`。
+
 然后重启 Docker：
 
 ```bash
@@ -282,7 +298,7 @@ cargo test --locked --all-targets
 
 ## English summary
 
-Donkey is a Rust OCI Registry pull-through proxy with multi-source Range downloads, digest verification, filesystem caching, encrypted Registry credentials, local/OIDC administration sessions, image extraction/export/copy tools, CONNECT tunneling, and an embedded React console. See `.env.example` for deployment settings.
+Donkey is a Rust OCI Registry pull-through proxy with multi-source Range downloads, digest verification, filesystem caching, encrypted Registry credentials, local/OIDC administration sessions, image extraction/export/copy tools, CONNECT tunneling, and an embedded React console. v0.2.0 requires a clean SQLite database. Docker Hub uses the root namespace (`registry.example.com/library/alpine`), while GHCR uses the built-in `/ghcr` namespace (`registry.example.com/ghcr/owner/image`); Docker daemon `registry-mirrors` normally applies only to Docker Hub. See `.env.example` for deployment settings.
 
 ## License
 

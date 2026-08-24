@@ -216,17 +216,11 @@ impl CacheStore {
     }
 
     pub async fn stats(&self) -> ApiResult<CacheStats> {
-        let entries = db::all_cache_entries(&self.db).await?;
+        let aggregate = db::cache_aggregate(&self.db).await?;
         Ok(CacheStats {
-            entries: entries.len(),
-            bytes: entries
-                .iter()
-                .map(|entry| entry.size_bytes.max(0) as u64)
-                .sum(),
-            hits: entries
-                .iter()
-                .map(|entry| entry.hit_count.max(0) as u64)
-                .sum(),
+            entries: aggregate.entries.min(usize::MAX as u64) as usize,
+            bytes: aggregate.bytes,
+            hits: aggregate.hits,
         })
     }
 
@@ -339,6 +333,7 @@ fn retention_score(
 mod tests {
     use super::CacheStore;
     use crate::Config;
+    use futures_util::future::try_join_all;
     use std::sync::Arc;
 
     #[test]
@@ -375,5 +370,27 @@ mod tests {
         let stats = cache.stats().await.unwrap();
         assert!(stats.bytes <= 100, "cache used {} bytes", stats.bytes);
         assert_eq!(stats.entries, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cache_hits_do_not_lose_increments() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let cache = CacheStore::new(Arc::new(config), db).await.unwrap();
+        let temporary = directory.path().join("object.partial");
+        tokio::fs::write(&temporary, b"payload").await.unwrap();
+        let key = "c".repeat(64);
+        cache
+            .admit(&key, &temporary, "application/octet-stream", None)
+            .await
+            .unwrap();
+
+        let hits = 64;
+        let results = try_join_all((0..hits).map(|_| cache.get(&key)))
+            .await
+            .unwrap();
+        assert!(results.into_iter().all(|result| result.is_some()));
+        assert_eq!(cache.stats().await.unwrap().hits, hits);
     }
 }

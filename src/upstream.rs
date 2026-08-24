@@ -170,8 +170,9 @@ impl UpstreamService {
 
     async fn token(&self, node: &NodeView, challenge: &BearerChallenge) -> ApiResult<Arc<str>> {
         let key = format!(
-            "{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}",
             node.node.id,
+            node.node.registry_route_id,
             node.node.updated_at.timestamp_millis(),
             challenge.realm,
             challenge.service.as_deref().unwrap_or_default(),
@@ -280,8 +281,8 @@ impl UpstreamService {
             .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
         let realm_host = realm.host_str().map(str::to_ascii_lowercase);
         let same_origin = node_host == realm_host;
-        let official_docker_auth =
-            node.node.kind == "dockerhub" && realm_host.as_deref() == Some("auth.docker.io");
+        let official_docker_auth = node.route.canonical_registry == "docker.io"
+            && realm_host.as_deref() == Some("auth.docker.io");
         if same_origin || official_docker_auth {
             Ok(())
         } else {

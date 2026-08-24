@@ -20,6 +20,10 @@ pub enum AppError {
     RateLimited,
     #[error("{0} not found")]
     NotFound(&'static str),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    Unavailable(String),
     #[error("upstream request failed: {0}")]
     Upstream(String),
     #[error("content integrity check failed")]
@@ -41,6 +45,28 @@ impl AppError {
         Self::NotFound(resource)
     }
 
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
+    }
+
+    pub fn map_constraint(
+        error: sea_orm::DbErr,
+        unique_message: &'static str,
+        foreign_key_message: &'static str,
+    ) -> Self {
+        match error.sql_err() {
+            Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => Self::conflict(unique_message),
+            Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_)) => {
+                Self::conflict(foreign_key_message)
+            }
+            Some(_) | None => Self::Database(error),
+        }
+    }
+
     pub fn internal(error: impl Into<anyhow::Error>) -> Self {
         Self::Internal(error.into())
     }
@@ -52,6 +78,8 @@ impl AppError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::Integrity => StatusCode::BAD_GATEWAY,
             Self::Database(_) | Self::Io(_) | Self::Internal(_) => {
@@ -67,6 +95,8 @@ impl AppError {
             Self::Forbidden => "forbidden",
             Self::RateLimited => "rate_limited",
             Self::NotFound(_) => "not_found",
+            Self::Conflict(_) => "conflict",
+            Self::Unavailable(_) => "unavailable",
             Self::Upstream(_) => "upstream_error",
             Self::Integrity => "integrity_error",
             Self::Database(_) | Self::Io(_) | Self::Internal(_) => "internal_error",
