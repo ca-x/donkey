@@ -203,17 +203,19 @@ function NodeDialog({ opened, value, close }: { opened: boolean; value: NodeView
   })
 
   return (
-    <Modal
-      opened={opened}
-      onClose={close}
-      title={t(editing ? 'nodes.editTitle' : 'nodes.createTitle')}
-      size="lg"
-      centered
-      classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }}
-      transitionProps={{ transition: 'pop', duration: 220, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}
-    >
-      <form onSubmit={form.onSubmit((values) => save.mutate(values))}>
-        <Stack gap="md">
+    <Modal.Stack>
+      <Modal
+        stackId="node-editor"
+        opened={opened}
+        onClose={close}
+        title={t(editing ? 'nodes.editTitle' : 'nodes.createTitle')}
+        size="lg"
+        centered
+        classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }}
+        transitionProps={{ transition: 'pop', duration: 220, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}
+      >
+        <form onSubmit={form.onSubmit((values) => save.mutate(values))}>
+          <Stack gap="md">
           <SimpleGrid cols={{ base: 1, sm: 2 }}>
             <TextInput label={t('nodes.name')} placeholder={t('nodes.namePlaceholder')} required {...form.getInputProps('name')} />
             <Select label={t('nodes.type')} data={[{ value: 'dockerhub', label: t('nodes.dockerhub') }, { value: 'ghcr', label: t('nodes.ghcr') }, { value: 'registry', label: t('nodes.registry') }]} {...form.getInputProps('kind')} />
@@ -249,9 +251,11 @@ function NodeDialog({ opened, value, close }: { opened: boolean; value: NodeView
               <Button type="submit" leftSection={<IconBolt size={17} />} loading={save.isPending} className="pressable">{t('nodes.saveNode')}</Button>
             </Group>
           </Group>
-        </Stack>
-      </form>
+          </Stack>
+        </form>
+      </Modal>
       {editing && <NamedConfirmDialog
+        stackId="node-delete-confirm"
         opened={confirmDelete}
         title={t('nodes.confirmDeleteTitle')}
         name={editing.node.name}
@@ -260,6 +264,6 @@ function NodeDialog({ opened, value, close }: { opened: boolean; value: NodeView
         onCancel={() => setConfirmDelete(false)}
         onConfirm={() => remove.mutate()}
       />}
-    </Modal>
+    </Modal.Stack>
   )
 }

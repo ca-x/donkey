@@ -11,6 +11,7 @@ type NamedConfirmDialogProps = {
   onCancel: () => void
   onConfirm: () => void
   confirmLabel?: string
+  stackId?: string
 }
 
 export function NamedConfirmDialog({
@@ -22,6 +23,7 @@ export function NamedConfirmDialog({
   onCancel,
   onConfirm,
   confirmLabel,
+  stackId,
 }: NamedConfirmDialogProps) {
   const { t } = useTranslation()
   const confirming = useRef(false)
@@ -29,7 +31,7 @@ export function NamedConfirmDialog({
     if (!opened || !loading) confirming.current = false
   }, [loading, opened])
   const cancel = () => {
-    if (!loading) onCancel()
+    if (!loading && !confirming.current) onCancel()
   }
   const confirm = () => {
     if (loading || confirming.current) return
@@ -42,7 +44,9 @@ export function NamedConfirmDialog({
       opened={opened}
       onClose={cancel}
       title={title}
+      stackId={stackId}
       centered
+      withCloseButton={!loading}
       closeOnClickOutside={!loading}
       closeOnEscape={!loading}
       classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }}

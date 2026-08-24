@@ -14,7 +14,8 @@
   --border: rgba(255, 255, 255, 0.085);
   --border-strong: rgba(255, 255, 255, 0.14);
   --text: #f4f7fb;
-  --muted: #8b99ae;
+  --muted: #9aa8bb;
+  --mantine-color-dimmed: #9aa8bb;
   --blue: #26a9ff;
   --blue-soft: rgba(38, 169, 255, 0.12);
   --green: #35d07f;
@@ -720,6 +721,19 @@ button.image-file-card:active {
   .mantine-Input-input {
     min-height: 44px;
     font-size: 1rem;
+  }
+
+  .mantine-Switch-body,
+  .mantine-Checkbox-body {
+    min-height: 44px;
+    align-items: center;
+  }
+
+  .mantine-Switch-label,
+  .mantine-Checkbox-label {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
   }
 }
 
