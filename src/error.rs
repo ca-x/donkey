@@ -3,7 +3,9 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use sea_orm::{DbErr, RuntimeErr};
 use serde::Serialize;
+use std::ops::Deref;
 use thiserror::Error;
 
 pub type ApiResult<T> = Result<T, AppError>;
@@ -63,6 +65,7 @@ impl AppError {
             Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_)) => {
                 Self::conflict(foreign_key_message)
             }
+            None if is_sqlite_foreign_key_trigger(&error) => Self::conflict(foreign_key_message),
             Some(_) | None => Self::Database(error),
         }
     }
@@ -102,6 +105,19 @@ impl AppError {
             Self::Database(_) | Self::Io(_) | Self::Internal(_) => "internal_error",
         }
     }
+}
+
+fn is_sqlite_foreign_key_trigger(error: &DbErr) -> bool {
+    let (DbErr::Exec(RuntimeErr::SqlxError(error)) | DbErr::Query(RuntimeErr::SqlxError(error))) =
+        error
+    else {
+        return false;
+    };
+    let sea_orm::sqlx::Error::Database(database_error) = error.deref() else {
+        return false;
+    };
+    database_error.code().as_deref() == Some("1811")
+        && database_error.message() == "FOREIGN KEY constraint failed"
 }
 
 #[derive(Serialize)]

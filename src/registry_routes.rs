@@ -475,6 +475,7 @@ async fn seed_builtin(db: &DatabaseConnection, route: registry_route::Model) -> 
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+    use sea_orm::ConnectionTrait;
 
     fn custom_input(key: &str, prefix: &str) -> RegistryRouteInput {
         RegistryRouteInput {
@@ -596,6 +597,27 @@ mod tests {
         .unwrap();
         service.delete(created.id).await.unwrap();
         assert!(service.get(created.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sqlite_restrict_trigger_maps_to_a_stable_conflict() {
+        let db = db::connect("sqlite::memory:").await.unwrap();
+        let service = RegistryRouteService::new(db.clone());
+        let route = service
+            .create(custom_input("trigger-race", "trigger-race"))
+            .await
+            .unwrap();
+        db.execute_unprepared(
+            "CREATE TRIGGER simulate_fk_restrict BEFORE DELETE ON registry_routes \
+             WHEN OLD.key = 'trigger-race' BEGIN \
+             SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END",
+        )
+        .await
+        .unwrap();
+
+        let error = service.delete(route.id).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(error.to_string(), ROUTE_IN_USE_CONFLICT);
     }
 
     #[tokio::test]
