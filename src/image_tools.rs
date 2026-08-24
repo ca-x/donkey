@@ -374,6 +374,7 @@ impl ImageTools {
     async fn tick(&self) -> ApiResult<()> {
         self.cleanup_storage(None).await?;
         self.enqueue_due_rules().await?;
+        self.recover_abandoned_jobs(Utc::now()).await?;
         let Some(job) = self.claim_next_job().await? else {
             return Ok(());
         };
@@ -395,6 +396,10 @@ impl ImageTools {
             return Ok(None);
         };
 
+        self.claim_selected_job(id).await
+    }
+
+    async fn claim_selected_job(&self, id: Uuid) -> ApiResult<Option<image_job::Model>> {
         let claimed = transition_update(JobStatus::Pending, JobStatus::Running, Utc::now(), None)?
             .filter(image_job::Column::Id.eq(id))
             .exec(&self.db)
@@ -449,9 +454,22 @@ impl ImageTools {
         ))
     }
 
-    // v0.1 runs one worker per process. Leases support restart recovery only;
+    // v0.1 runs one worker per process. Leases support abandonment recovery;
     // they are not ownership tokens and do not provide cross-process fencing.
     async fn recover_abandoned_jobs(&self, now: DateTime<Utc>) -> ApiResult<u64> {
+        let has_abandoned = image_job::Entity::find()
+            .select_only()
+            .column(image_job::Column::Id)
+            .filter(image_job::Column::Status.eq(JobStatus::Running.as_str()))
+            .filter(abandoned_lease(now))
+            .into_tuple::<Uuid>()
+            .one(&self.db)
+            .await?
+            .is_some();
+        if !has_abandoned {
+            return Ok(0);
+        }
+
         let cancelled = transition_update(JobStatus::Running, JobStatus::Cancelled, now, None)?
             .filter(image_job::Column::CancelRequested.eq(true))
             .filter(abandoned_lease(now))
@@ -2317,11 +2335,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_claims_have_only_one_winner() {
+    async fn same_selected_id_has_only_one_claim_cas_winner() {
         let (_directory, service) = test_service().await;
         let job = insert_test_job(&service.db, JobStatus::Pending, None).await;
 
-        let (first, second) = tokio::join!(service.claim_next_job(), service.claim_next_job());
+        let (first, second) = tokio::join!(
+            service.claim_selected_job(job.id),
+            service.claim_selected_job(job.id)
+        );
         let claimed = [first.unwrap(), second.unwrap()];
         assert_eq!(claimed.iter().filter(|job| job.is_some()).count(), 1);
         assert_eq!(claimed.iter().flatten().next().unwrap().id, job.id);
@@ -2449,6 +2470,56 @@ mod tests {
         assert_eq!(live.status, JobStatus::Running.as_str());
         assert!(live.cancel_requested);
         assert_eq!(live.lease_until, Some(now + chrono::Duration::minutes(5)));
+    }
+
+    #[tokio::test]
+    async fn later_tick_recovers_jobs_preserved_with_future_leases_at_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.credential_key = Some(SecretString::from("aa".repeat(32)));
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let now = Utc::now();
+        let mut abandoned = test_job(JobStatus::Running, Some(now + chrono::Duration::minutes(5)));
+        abandoned.source_ref.clear();
+        let abandoned = abandoned.into_active_model().insert(&db).await.unwrap();
+        let cancelled =
+            insert_cancel_requested_job(&db, Some(now + chrono::Duration::minutes(5))).await;
+        let config = Arc::new(config);
+        let nodes = NodeService::new(config.clone(), db.clone()).unwrap();
+        let service = ImageTools::new(config, db, nodes).await.unwrap();
+
+        for id in [abandoned.id, cancelled.id] {
+            let preserved = image_job::Entity::find_by_id(id)
+                .one(&service.db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(preserved.status, JobStatus::Running.as_str());
+        }
+        image_job::Entity::update_many()
+            .col_expr(
+                image_job::Column::LeaseUntil,
+                sea_orm::sea_query::Expr::value(Some(now - chrono::Duration::minutes(1))),
+            )
+            .filter(image_job::Column::Id.is_in([abandoned.id, cancelled.id]))
+            .exec(&service.db)
+            .await
+            .unwrap();
+
+        service.tick().await.unwrap();
+
+        let abandoned = image_job::Entity::find_by_id(abandoned.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let cancelled = image_job::Entity::find_by_id(cancelled.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(abandoned.status, JobStatus::Failed.as_str());
+        assert_eq!(cancelled.status, JobStatus::Cancelled.as_str());
     }
 
     #[tokio::test]
