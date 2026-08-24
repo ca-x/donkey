@@ -31,20 +31,24 @@ Donkey 是一个可自托管、可审计的 Docker/OCI 镜像与通用下载加�
 - 不支持 Range、返回压缩内容、未知长度或兼容性不足时回退到最佳单源获取。
 - 缓存采用内容寻址文件，命中时支持 GET/HEAD 和客户端 Range。并发相同 miss 只执行一次下载。
 - 管理端口支持带 Basic Auth 的 CONNECT；目标必须命中配置的域名规则，支持把 `host:443` 重映射到本地 Registry TLS 端口。
+- Registry 路由把客户端命名空间映射到规范上游 Registry：默认路由占用根命名空间，其他路由使用唯一的路径前缀。Docker Hub 内置路由使用根路径，GHCR 内置路由使用 `/ghcr`。
+- Docker Hub 示例为 `registry.example.com/library/alpine:latest`；GHCR 示例为 `registry.example.com/ghcr/owner/image:tag`。Docker daemon 的 `registry-mirrors` 通常只影响 Docker Hub，不自动接管 GHCR 等其他 Registry。
 
 ### Control plane
 
 - SeaORM 管理 SQLite；默认数据库为 `${DONKEY_DATA_DIR}/donkey.db`。
-- 持久化节点、节点测量、缓存索引和 DomainFold 映射。
-- 节点支持 Docker Hub、GHCR、通用 Registry、HTTP/SOCKS 代理和 DomainFold 分类；第一版调度实际使用 HTTP(S) Registry 节点，其他类型可被 CONNECT/DomainFold 使用。
+- 持久化 Registry 路由、节点、节点测量、缓存索引和域名下载映射。每个节点必须绑定一个 Registry 路由；同一路由可有多个镜像端点参与调度。
+- Registry 路由包含唯一键、规范 Registry、可选访问路径、仓库路径模式、默认状态和启用状态。内置 Docker Hub/GHCR 路由不可删除；被节点引用的自定义路由不可删除。
+- v0.2.0 要求干净的 SQLite 数据库，不支持从 v0.1 数据库原地升级。升级前必须备份 `/data`，再用空数据库启动并重新配置用户、Registry 路由和节点。
 - 后台健康检查可配置间隔；失败不会阻塞请求路径。
-- API 提供 dashboard、节点 CRUD/即时测速、缓存列表/清理、DomainFold 映射 CRUD/链接转换和运行时配置读取。
+- API 提供 dashboard、Registry 路由 CRUD、节点 CRUD/即时测速、缓存列表/清理、域名下载映射 CRUD/链接转换和运行时配置读取。
 - 所有输入有长度、枚举、URL、路径和数值边界；错误响应不暴露堆栈。
 
 ### Web console
 
 - React 19 + TypeScript + Vite，使用 Mantine、TanStack Query、React Router、Recharts 与 Tabler Icons。
-- 页面：概览、节点、缓存、域名加速、设置/部署说明。
+- 页面：概览、节点、缓存、域名加速、设置/部署说明。Registry 路由管理保留在节点页弹层中，不增加导航项。
+- 节点页按 Registry 路由筛选节点，并分别显示逻辑 Registry 与镜像端点；节点表单必须选择 Registry 命名空间。
 - 视觉语言为深色、高对比、紧凑的运维控制台；信息层级优先，不复刻参考截图。
 - 375/768/1024/1440 px 均无横向滚动。桌面侧栏在窄屏变为底部导航；表格在移动端变为信息卡。
 - 触控目标至少 44×44 px；可键盘导航；图标按钮有可访问名称；焦点可见；颜色不作为唯一状态编码。

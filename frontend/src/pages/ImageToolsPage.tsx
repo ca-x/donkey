@@ -104,7 +104,7 @@ export function ImageToolsPage() {
 }
 
 function sourceNodeOptions(nodes: NodeView[], direct: string) {
-  return [{ value: '', label: direct }, ...nodes.filter((node) => ['dockerhub', 'ghcr', 'registry'].includes(node.node.kind)).map((node) => ({ value: node.node.id, label: `${node.node.name} · ${node.node.url}` }))]
+  return [{ value: '', label: direct }, ...nodes.map((node) => ({ value: node.node.id, label: `${node.node.name} · ${node.route.name} · ${node.node.url}` }))]
 }
 
 function credentialOptions(credentials: RegistryCredential[], empty: string) {

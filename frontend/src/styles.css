@@ -331,6 +331,28 @@ a,
   border-bottom: 0;
 }
 
+.route-manager-description {
+  max-width: 34rem;
+  line-height: 1.55;
+}
+
+.registry-route-list {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface-muted);
+}
+
+.registry-route-row {
+  min-height: 64px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--border);
+}
+
+.registry-route-row:last-child {
+  border-bottom: 0;
+}
+
 .route-rank {
   width: 21px;
   flex: none;
@@ -698,6 +720,10 @@ button.image-file-card:active {
   .image-tool-flow {
     padding: 15px;
   }
+
+  .registry-route-row {
+    min-height: 72px;
+  }
 }
 
 @media (max-width: 24em) {
@@ -802,6 +828,7 @@ button.image-file-card:active {
   .cache-mobile-card,
   .image-file-card,
   .credential-row,
+  .registry-route-list,
   .mobile-header,
   .mobile-nav,
   .desktop-sidebar {
@@ -823,6 +850,7 @@ button.image-file-card:active {
   .cache-mobile-card,
   .image-file-card,
   .credential-row,
+  .registry-route-list,
   .mobile-header,
   .mobile-nav,
   .desktop-sidebar,

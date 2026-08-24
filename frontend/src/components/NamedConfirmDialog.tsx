@@ -1,4 +1,4 @@
-import { Button, Group, Modal, Stack, Text } from '@mantine/core'
+import { Alert, Button, Group, Modal, Stack, Text } from '@mantine/core'
 import { useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -12,6 +12,7 @@ type NamedConfirmDialogProps = {
   onConfirm: () => void
   confirmLabel?: string
   stackId?: string
+  error?: string | null
 }
 
 export function NamedConfirmDialog({
@@ -24,6 +25,7 @@ export function NamedConfirmDialog({
   onConfirm,
   confirmLabel,
   stackId,
+  error,
 }: NamedConfirmDialogProps) {
   const { t } = useTranslation()
   const confirming = useRef(false)
@@ -57,6 +59,7 @@ export function NamedConfirmDialog({
           <Text fw={680} style={{ overflowWrap: 'anywhere' }}>{name}</Text>
           <Text c="dimmed" size="sm" mt={6}>{consequence}</Text>
         </div>
+        {error && <Alert color="red" role="alert">{error}</Alert>}
         <Group justify="flex-end">
           <Button variant="default" data-autofocus disabled={loading} onClick={cancel}>{t('common.cancel')}</Button>
           <Button color="red" loading={loading} onClick={confirm}>{confirmLabel ?? t('common.delete')}</Button>
