@@ -65,3 +65,4 @@ Source review also confirmed both save modals bind `onClose`, `withCloseButton`,
 - `cargo test --locked --all-targets` — passed: 67 unit tests and 9 integration tests, 0 failures.
 - `cargo build --locked` — passed for Donkey v0.2.0.
 - `git diff --check` — passed.
+Controller browser QA refreshed `docs/images/nodes-light-zh.png` with the verified 1440 px light Chinese v0.2.0 Registry Route UI and no visible tooltip.
