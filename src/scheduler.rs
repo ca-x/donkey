@@ -72,7 +72,7 @@ impl Scheduler {
         request_path: &str,
         request_headers: &HeaderMap,
         expected_digest: Option<&str>,
-        route_prefix: Option<&str>,
+        registry_route_id: Uuid,
     ) -> ApiResult<CachedObject> {
         let authorization = request_headers
             .get(header::AUTHORIZATION)
@@ -94,7 +94,7 @@ impl Scheduler {
                 request_path,
                 request_headers,
                 expected_digest,
-                route_prefix,
+                registry_route_id,
             )
             .await;
         drop(guard);
@@ -107,11 +107,13 @@ impl Scheduler {
         request_path: &str,
         request_headers: &HeaderMap,
         expected_digest: Option<&str>,
-        route_prefix: Option<&str>,
+        registry_route_id: Uuid,
     ) -> ApiResult<CachedObject> {
-        let nodes = self.nodes.enabled_registry_nodes(route_prefix).await?;
+        let nodes = self.nodes.enabled_registry_nodes(registry_route_id).await?;
         if nodes.is_empty() {
-            return Err(AppError::Upstream("no enabled Registry nodes".into()));
+            return Err(AppError::unavailable(
+                "resolved Registry route has no enabled nodes",
+            ));
         }
 
         let capability_key = format!("{}:{}", nodes[0].node.url, request_path);

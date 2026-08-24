@@ -5,7 +5,7 @@ use http::{HeaderName, HeaderValue};
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, ExprTrait, QueryFilter, sea_query::Expr,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -14,6 +14,7 @@ use crate::{
     crypto::CredentialCipher,
     db::{self, node, node_metric},
     error::{ApiResult, AppError},
+    registry_routes::RegistryRouteSummary,
     security,
 };
 
@@ -25,11 +26,11 @@ pub struct NodeService {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeInput {
     pub name: String,
     pub url: String,
-    pub kind: String,
-    pub route_prefix: Option<String>,
+    pub registry_route_id: Uuid,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_priority")]
@@ -44,12 +45,69 @@ pub struct NodeInput {
     pub auth_secret: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct NodeView {
     pub node: node::Model,
     pub metric: node_metric::Model,
     pub score: f64,
     pub auth_configured: bool,
+    pub route: RegistryRouteSummary,
+}
+
+#[derive(Serialize)]
+struct NodeViewWire<'a> {
+    node: NodeSafeView<'a>,
+    metric: &'a node_metric::Model,
+    score: f64,
+    auth_configured: bool,
+    route: &'a RegistryRouteSummary,
+}
+
+#[derive(Serialize)]
+struct NodeSafeView<'a> {
+    id: &'a Uuid,
+    name: &'a str,
+    url: &'a str,
+    registry_route_id: &'a Uuid,
+    enabled: bool,
+    priority: i32,
+    cf_preferred: bool,
+    connect_ip: &'a Option<String>,
+    auth_mode: &'a str,
+    auth_username: &'a Option<String>,
+    auth_header: &'a Option<String>,
+    created_at: &'a chrono::DateTime<Utc>,
+    updated_at: &'a chrono::DateTime<Utc>,
+}
+
+impl Serialize for NodeView {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        NodeViewWire {
+            node: NodeSafeView {
+                id: &self.node.id,
+                name: &self.node.name,
+                url: &self.node.url,
+                registry_route_id: &self.node.registry_route_id,
+                enabled: self.node.enabled,
+                priority: self.node.priority,
+                cf_preferred: self.node.cf_preferred,
+                connect_ip: &self.node.connect_ip,
+                auth_mode: &self.node.auth_mode,
+                auth_username: &self.node.auth_username,
+                auth_header: &self.node.auth_header,
+                created_at: &self.node.created_at,
+                updated_at: &self.node.updated_at,
+            },
+            metric: &self.metric,
+            score: self.score,
+            auth_configured: self.auth_configured,
+            route: &self.route,
+        }
+        .serialize(serializer)
+    }
 }
 
 fn default_true() -> bool {
@@ -69,17 +127,7 @@ impl NodeService {
     pub async fn list(&self) -> ApiResult<Vec<NodeView>> {
         let mut views = Vec::new();
         for node in db::list_nodes(&self.db).await? {
-            let metric = db::metric_for(&self.db, node.id)
-                .await?
-                .unwrap_or_else(|| empty_metric(node.id));
-            let score = score(&node, &metric, self.config.scheduler_policy);
-            let auth_configured = node.auth_secret_enc.is_some();
-            views.push(NodeView {
-                node,
-                metric,
-                score,
-                auth_configured,
-            });
+            views.push(self.view(node).await?);
         }
         views.sort_by(|a, b| b.score.total_cmp(&a.score));
         Ok(views)
@@ -87,44 +135,34 @@ impl NodeService {
 
     pub async fn enabled_registry_nodes(
         &self,
-        route_prefix: Option<&str>,
+        registry_route_id: Uuid,
     ) -> ApiResult<Vec<NodeView>> {
-        Ok(self
-            .list()
-            .await?
-            .into_iter()
-            .filter(|view| {
-                view.node.enabled
-                    && matches!(view.node.kind.as_str(), "dockerhub" | "ghcr" | "registry")
-                    && view.node.route_prefix.as_deref() == route_prefix
-            })
-            .collect())
-    }
-
-    pub async fn route_prefixes(&self) -> ApiResult<Vec<String>> {
-        let mut prefixes = db::list_nodes(&self.db)
+        let mut views = Vec::new();
+        for node in db::list_nodes_for_route(&self.db, registry_route_id)
             .await?
             .into_iter()
             .filter(|node| node.enabled)
-            .filter_map(|node| node.route_prefix)
-            .collect::<Vec<_>>();
-        prefixes.sort();
-        prefixes.dedup();
-        Ok(prefixes)
+        {
+            views.push(self.view(node).await?);
+        }
+        Ok(views)
     }
 
     pub async fn create(&self, input: NodeInput) -> ApiResult<NodeView> {
         validate_input(&input)?;
         self.require_registry_auth_for_secret(&input.auth_mode)?;
+        let route = crate::db::registry_route::Entity::find_by_id(input.registry_route_id)
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| AppError::bad_request("Registry route does not exist"))?;
         let validated = security::validate_upstream(&input.url, &self.config).await?;
         let canonical = validated.url.to_string();
-        let route_prefix = normalize_route_prefix(input.route_prefix, &input.kind)?;
-        if db::get_node_by_url_and_prefix(&self.db, &canonical, route_prefix.as_deref())
+        if db::get_node_by_route_and_url(&self.db, route.id, &canonical)
             .await?
             .is_some()
         {
             return Err(AppError::bad_request(
-                "an upstream with this URL already exists",
+                "an upstream with this URL already exists in this Registry route",
             ));
         }
         if let Some(ip) = &input.connect_ip {
@@ -137,8 +175,7 @@ impl NodeService {
             id: Uuid::new_v4(),
             name: input.name.trim().to_owned(),
             url: canonical,
-            kind: input.kind,
-            route_prefix,
+            registry_route_id: route.id,
             enabled: input.enabled,
             priority: input.priority,
             cf_preferred: input.cf_preferred,
@@ -153,27 +190,32 @@ impl NodeService {
         let node = db::insert_node(&self.db, node).await?;
         let metric = empty_metric(node.id);
         db::upsert_metric(&self.db, metric.clone()).await?;
-        let score = score(&node, &metric, self.config.scheduler_policy);
-        let auth_configured = node.auth_secret_enc.is_some();
-        Ok(NodeView {
-            node,
-            metric,
-            score,
-            auth_configured,
-        })
+        self.view_with(node, metric, route).await
     }
 
     pub async fn update(&self, id: Uuid, input: NodeInput) -> ApiResult<NodeView> {
         validate_input(&input)?;
         self.require_registry_auth_for_secret(&input.auth_mode)?;
+        let route = crate::db::registry_route::Entity::find_by_id(input.registry_route_id)
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| AppError::bad_request("Registry route does not exist"))?;
         let validated = security::validate_upstream(&input.url, &self.config).await?;
         let mut node = db::get_node(&self.db, id)
             .await?
             .ok_or_else(|| AppError::not_found("node"))?;
+        let canonical = validated.url.to_string();
+        if db::get_node_by_route_and_url(&self.db, route.id, &canonical)
+            .await?
+            .is_some_and(|existing| existing.id != id)
+        {
+            return Err(AppError::bad_request(
+                "an upstream with this URL already exists in this Registry route",
+            ));
+        }
         node.name = input.name.trim().to_owned();
-        node.url = validated.url.to_string();
-        node.route_prefix = normalize_route_prefix(input.route_prefix, &input.kind)?;
-        node.kind = input.kind;
+        node.url = canonical;
+        node.registry_route_id = route.id;
         node.enabled = input.enabled;
         node.priority = input.priority;
         node.cf_preferred = input.cf_preferred;
@@ -191,14 +233,7 @@ impl NodeService {
         let metric = db::metric_for(&self.db, id)
             .await?
             .unwrap_or_else(|| empty_metric(id));
-        let score = score(&node, &metric, self.config.scheduler_policy);
-        let auth_configured = node.auth_secret_enc.is_some();
-        Ok(NodeView {
-            node,
-            metric,
-            score,
-            auth_configured,
-        })
+        self.view_with(node, metric, route).await
     }
 
     pub async fn delete(&self, id: Uuid) -> ApiResult<()> {
@@ -238,22 +273,13 @@ impl NodeService {
         let node = db::get_node(&self.db, id)
             .await?
             .ok_or_else(|| AppError::not_found("node"))?;
-        if !node.enabled || !matches!(node.kind.as_str(), "dockerhub" | "ghcr" | "registry") {
+        let view = self.view(node).await?;
+        if !view.node.enabled || !view.route.enabled {
             return Err(AppError::bad_request(
-                "selected image source node is disabled or not a Registry node",
+                "selected image source node or its Registry route is disabled",
             ));
         }
-        let metric = db::metric_for(&self.db, id)
-            .await?
-            .unwrap_or_else(|| empty_metric(id));
-        let score = score(&node, &metric, self.config.scheduler_policy);
-        let auth_configured = node.auth_secret_enc.is_some();
-        Ok(NodeView {
-            node,
-            metric,
-            score,
-            auth_configured,
-        })
+        Ok(view)
     }
 
     pub async fn probe(&self, id: Uuid) -> ApiResult<NodeView> {
@@ -262,6 +288,30 @@ impl NodeService {
             .ok_or_else(|| AppError::not_found("node"))?;
         let metric = self.probe_model(&node).await;
         db::upsert_metric(&self.db, metric.clone()).await?;
+        let route = crate::db::registry_route::Entity::find_by_id(node.registry_route_id)
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| AppError::internal(anyhow::anyhow!("node has no Registry route")))?;
+        self.view_with(node, metric, route).await
+    }
+
+    async fn view(&self, node: node::Model) -> ApiResult<NodeView> {
+        let route = crate::db::registry_route::Entity::find_by_id(node.registry_route_id)
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| AppError::internal(anyhow::anyhow!("node has no Registry route")))?;
+        let metric = db::metric_for(&self.db, node.id)
+            .await?
+            .unwrap_or_else(|| empty_metric(node.id));
+        self.view_with(node, metric, route).await
+    }
+
+    async fn view_with(
+        &self,
+        node: node::Model,
+        metric: node_metric::Model,
+        route: crate::db::registry_route::Model,
+    ) -> ApiResult<NodeView> {
         let score = score(&node, &metric, self.config.scheduler_policy);
         let auth_configured = node.auth_secret_enc.is_some();
         Ok(NodeView {
@@ -269,6 +319,7 @@ impl NodeService {
             metric,
             score,
             auth_configured,
+            route: (&route).into(),
         })
     }
 
@@ -483,9 +534,6 @@ fn validate_input(input: &NodeInput) -> ApiResult<()> {
             "name must be between 1 and 80 characters",
         ));
     }
-    if !security::valid_node_kind(&input.kind) {
-        return Err(AppError::bad_request("unsupported node kind"));
-    }
     if !(0..=1000).contains(&input.priority) {
         return Err(AppError::bad_request("priority must be between 0 and 1000"));
     }
@@ -535,23 +583,6 @@ fn normalized_header(value: Option<String>) -> ApiResult<Option<String>> {
     Ok(Some(name.to_string()))
 }
 
-fn normalize_route_prefix(value: Option<String>, kind: &str) -> ApiResult<Option<String>> {
-    let value = trimmed(value).or_else(|| (kind == "ghcr").then(|| "ghcr".to_owned()));
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let normalized = value.trim_matches('/').to_ascii_lowercase();
-    if normalized.is_empty()
-        || normalized.len() > 32
-        || !normalized.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-        })
-    {
-        return Err(AppError::bad_request("invalid Registry route prefix"));
-    }
-    Ok(Some(normalized))
-}
-
 fn trimmed(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
@@ -565,6 +596,7 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry_routes::{DOCKER_HUB_ROUTE_ID, GHCR_ROUTE_ID};
     use secrecy::SecretString;
 
     #[test]
@@ -574,8 +606,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "node".into(),
             url: "https://registry.example/".into(),
-            kind: "registry".into(),
-            route_prefix: None,
+            registry_route_id: DOCKER_HUB_ROUTE_ID,
             enabled: true,
             priority: 100,
             cf_preferred: false,
@@ -615,8 +646,7 @@ mod tests {
             .create(NodeInput {
                 name: "authenticated".into(),
                 url: "http://127.0.0.1:5000".into(),
-                kind: "registry".into(),
-                route_prefix: None,
+                registry_route_id: DOCKER_HUB_ROUTE_ID,
                 enabled: true,
                 priority: 10,
                 cf_preferred: false,
@@ -632,5 +662,50 @@ mod tests {
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("top-secret"));
         assert!(!json.contains(view.node.auth_secret_enc.as_deref().unwrap()));
+        assert!(!json.contains("auth_secret_enc"));
+        assert!(!json.contains("route_prefix"));
+        assert!(!json.contains("\"kind\""));
+        assert_eq!(view.route.id, DOCKER_HUB_ROUTE_ID);
+    }
+
+    #[tokio::test]
+    async fn mirror_urls_are_unique_within_but_not_across_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = db::connect(&config.database_url).await.unwrap();
+        let service = NodeService::new(Arc::new(config), db).unwrap();
+        let input = |registry_route_id| NodeInput {
+            name: "shared mirror".into(),
+            url: "http://127.0.0.1:5000".into(),
+            registry_route_id,
+            enabled: true,
+            priority: 10,
+            cf_preferred: false,
+            connect_ip: None,
+            auth_mode: "none".into(),
+            auth_username: None,
+            auth_header: None,
+            auth_secret: None,
+        };
+
+        service.create(input(DOCKER_HUB_ROUTE_ID)).await.unwrap();
+        service.create(input(GHCR_ROUTE_ID)).await.unwrap();
+        assert!(service.create(input(DOCKER_HUB_ROUTE_ID)).await.is_err());
+        assert_eq!(
+            service
+                .enabled_registry_nodes(DOCKER_HUB_ROUTE_ID)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            service
+                .enabled_registry_nodes(GHCR_ROUTE_ID)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

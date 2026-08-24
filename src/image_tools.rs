@@ -2726,8 +2726,7 @@ mod tests {
             .create(crate::nodes::NodeInput {
                 name: "header mirror".into(),
                 url: upstream.base_url(),
-                kind: "registry".into(),
-                route_prefix: None,
+                registry_route_id: crate::registry_routes::DOCKER_HUB_ROUTE_ID,
                 enabled: true,
                 priority: 1,
                 cf_preferred: false,

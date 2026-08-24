@@ -3,7 +3,8 @@ use std::sync::Arc;
 use sea_orm::DatabaseConnection;
 
 use crate::{
-    cache::CacheStore, config::Config, error::AppError, nodes::NodeService, scheduler::Scheduler,
+    cache::CacheStore, config::Config, error::AppError, nodes::NodeService,
+    registry_routes::RegistryRouteService, scheduler::Scheduler,
 };
 
 #[derive(Clone)]
@@ -12,6 +13,7 @@ pub struct AppState {
     pub db: DatabaseConnection,
     pub auth: crate::auth::AuthService,
     pub nodes: NodeService,
+    pub registry_routes: RegistryRouteService,
     pub cache: CacheStore,
     pub upstream: crate::upstream::UpstreamService,
     pub scheduler: Scheduler,
@@ -30,6 +32,7 @@ impl AppState {
             ));
         }
         let nodes = NodeService::new(config.clone(), db.clone())?;
+        let registry_routes = RegistryRouteService::new(db.clone());
         let auth = crate::auth::AuthService::new(config.clone(), db.clone()).await?;
         let cache = CacheStore::new(config.clone(), db.clone()).await?;
         let upstream = crate::upstream::UpstreamService::new(config.clone(), nodes.clone());
@@ -46,6 +49,7 @@ impl AppState {
             db,
             auth,
             nodes,
+            registry_routes,
             cache,
             upstream,
             scheduler,
@@ -72,8 +76,7 @@ mod tests {
             .create(NodeInput {
                 name: "private".into(),
                 url: "http://127.0.0.1:5000".into(),
-                kind: "registry".into(),
-                route_prefix: None,
+                registry_route_id: crate::registry_routes::DOCKER_HUB_ROUTE_ID,
                 enabled: true,
                 priority: 1,
                 cf_preferred: false,

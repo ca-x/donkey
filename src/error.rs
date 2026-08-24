@@ -20,6 +20,8 @@ pub enum AppError {
     RateLimited,
     #[error("{0} not found")]
     NotFound(&'static str),
+    #[error("{0}")]
+    Unavailable(String),
     #[error("upstream request failed: {0}")]
     Upstream(String),
     #[error("content integrity check failed")]
@@ -41,6 +43,10 @@ impl AppError {
         Self::NotFound(resource)
     }
 
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
+    }
+
     pub fn internal(error: impl Into<anyhow::Error>) -> Self {
         Self::Internal(error.into())
     }
@@ -52,6 +58,7 @@ impl AppError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::Integrity => StatusCode::BAD_GATEWAY,
             Self::Database(_) | Self::Io(_) | Self::Internal(_) => {
@@ -67,6 +74,7 @@ impl AppError {
             Self::Forbidden => "forbidden",
             Self::RateLimited => "rate_limited",
             Self::NotFound(_) => "not_found",
+            Self::Unavailable(_) => "unavailable",
             Self::Upstream(_) => "upstream_error",
             Self::Integrity => "integrity_error",
             Self::Database(_) | Self::Io(_) | Self::Internal(_) => "internal_error",

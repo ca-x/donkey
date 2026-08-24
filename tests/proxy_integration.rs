@@ -15,7 +15,10 @@ mod proxy_integration {
         http::{HeaderMap, Method, StatusCode, header},
         response::Response,
     };
-    use donkey::{AppState, Config, nodes::NodeInput, server::registry_router};
+    use donkey::{
+        AppState, Config, nodes::NodeInput, registry_routes::DOCKER_HUB_ROUTE_ID,
+        server::registry_router,
+    };
     use sha2::{Digest, Sha256};
     use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
     use tower::ServiceExt;
@@ -240,8 +243,7 @@ mod proxy_integration {
                 .create(NodeInput {
                     name: format!("fixture-{index}"),
                     url: fixture.url(),
-                    kind: "registry".into(),
-                    route_prefix: None,
+                    registry_route_id: DOCKER_HUB_ROUTE_ID,
                     enabled: true,
                     priority: index as i32,
                     cf_preferred: false,

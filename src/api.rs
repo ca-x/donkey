@@ -13,6 +13,7 @@ use crate::{
     domainfold::{self, ConvertInput, ConvertOutput, MappingInput},
     error::ApiResult,
     nodes::{NodeInput, NodeView},
+    registry_routes::{RegistryRouteInput, RegistryRouteView},
     state::AppState,
 };
 
@@ -23,6 +24,14 @@ pub fn router() -> Router<AppState> {
         .route("/nodes", get(list_nodes).post(create_node))
         .route("/nodes/{id}", put(update_node).delete(delete_node))
         .route("/nodes/{id}/probe", post(probe_node))
+        .route(
+            "/registry-routes",
+            get(list_registry_routes).post(create_registry_route),
+        )
+        .route(
+            "/registry-routes/{id}",
+            put(update_registry_route).delete(delete_registry_route),
+        )
         .route("/cache", get(list_cache))
         .route("/cache/{key}", axum::routing::delete(delete_cache))
         .route("/mappings", get(list_mappings).post(create_mapping))
@@ -97,6 +106,38 @@ async fn probe_node(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<NodeView>> {
     Ok(Json(state.nodes.probe(id).await?))
+}
+
+async fn list_registry_routes(
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<RegistryRouteView>>> {
+    Ok(Json(state.registry_routes.list().await?))
+}
+
+async fn create_registry_route(
+    State(state): State<AppState>,
+    Json(input): Json<RegistryRouteInput>,
+) -> ApiResult<(StatusCode, Json<RegistryRouteView>)> {
+    Ok((
+        StatusCode::CREATED,
+        Json(state.registry_routes.create(input).await?),
+    ))
+}
+
+async fn update_registry_route(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<RegistryRouteInput>,
+) -> ApiResult<Json<RegistryRouteView>> {
+    Ok(Json(state.registry_routes.update(id, input).await?))
+}
+
+async fn delete_registry_route(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    state.registry_routes.delete(id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
