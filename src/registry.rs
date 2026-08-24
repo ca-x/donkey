@@ -45,6 +45,15 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
     let resolved = route_registry_path(&state, request.uri()).await?;
     let upstream_path = resolved.upstream_path;
     let registry_route_id = resolved.route.id;
+    let nodes = state
+        .nodes
+        .enabled_registry_nodes(registry_route_id)
+        .await?;
+    if nodes.is_empty() {
+        return Err(AppError::unavailable(
+            "resolved Registry route has no enabled nodes",
+        ));
+    }
     if upstream_path.contains("/blobs/") {
         let digest = upstream_path
             .rsplit_once("/blobs/")
@@ -64,14 +73,14 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
         } else {
             let object = state
                 .scheduler
-                .fetch_blob(&upstream_path, request.headers(), digest, registry_route_id)
+                .fetch_blob(&upstream_path, request.headers(), digest, nodes)
                 .await?;
             return serve_cached(&state.cache, object, request).await;
         }
     }
     let method = request.method().clone();
     let headers = request.headers().clone();
-    proxy_passthrough(&state, method, upstream_path, headers, registry_route_id).await
+    proxy_passthrough(&state, method, upstream_path, headers, nodes).await
 }
 
 async fn serve_cached(
@@ -153,17 +162,8 @@ async fn proxy_passthrough(
     method: Method,
     path: String,
     request_headers: HeaderMap,
-    registry_route_id: uuid::Uuid,
+    nodes: Vec<crate::nodes::NodeView>,
 ) -> ApiResult<Response> {
-    let nodes = state
-        .nodes
-        .enabled_registry_nodes(registry_route_id)
-        .await?;
-    if nodes.is_empty() {
-        return Err(AppError::unavailable(
-            "resolved Registry route has no enabled nodes",
-        ));
-    }
     let mut last_error = None;
     for node in nodes {
         let result = async {
@@ -212,7 +212,8 @@ async fn route_registry_path(state: &AppState, uri: &http::Uri) -> ApiResult<Res
     };
     let marker = ["/manifests/", "/blobs/", "/tags/"]
         .into_iter()
-        .find_map(|marker| rest.rfind(marker).map(|index| (marker, index)));
+        .filter_map(|marker| rest.rfind(marker).map(|index| (marker, index)))
+        .max_by_key(|(_, index)| *index);
     let Some((_marker, marker_index)) = marker else {
         let route = require_enabled_route(state.registry_routes.default_route().await?)?;
         return Ok(ResolvedRegistryPath {
@@ -412,6 +413,93 @@ mod tests {
         disabled.update(&state.db).await.unwrap();
         let error = route_registry_path(&state, &uri).await.unwrap_err();
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn cached_blob_get_and_head_require_an_enabled_route_node() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let node = state
+            .nodes
+            .create(NodeInput {
+                name: "docker".into(),
+                url: "http://127.0.0.1:5001".into(),
+                registry_route_id: DOCKER_HUB_ROUTE_ID,
+                enabled: true,
+                priority: 1,
+                cf_preferred: false,
+                connect_ip: None,
+                auth_mode: "none".into(),
+                auth_username: None,
+                auth_header: None,
+                auth_secret: None,
+            })
+            .await
+            .unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let client_path = format!("/v2/test/blobs/{digest}");
+        let upstream_path = format!("/v2/library/test/blobs/{digest}");
+        let cache_key = CacheStore::key(&upstream_path, None);
+        let temporary = directory.path().join("primed-blob");
+        tokio::fs::write(&temporary, b"cached").await.unwrap();
+        state
+            .cache
+            .admit(
+                &cache_key,
+                &temporary,
+                "application/octet-stream",
+                Some(digest),
+            )
+            .await
+            .unwrap();
+
+        let mut disabled = node.node;
+        disabled.enabled = false;
+        disabled.updated_at = chrono::Utc::now();
+        crate::db::save_node(&state.db, disabled).await.unwrap();
+
+        for method in [Method::GET, Method::HEAD] {
+            let result = handle_inner(
+                state.clone(),
+                Request::builder()
+                    .method(method.clone())
+                    .uri(&client_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(response) => panic!("{method} unexpectedly returned {}", response.status()),
+            };
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    #[tokio::test]
+    async fn uses_the_rightmost_operation_marker_after_named_repository_components() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let uri: http::Uri = "/v2/team/manifests/blobs/tags/image/tags/list?n=10"
+            .parse()
+            .unwrap();
+        let resolved = route_registry_path(&state, &uri).await.unwrap();
+        assert_eq!(resolved.route.id, DOCKER_HUB_ROUTE_ID);
+        assert_eq!(
+            resolved.upstream_path,
+            "/v2/team/manifests/blobs/tags/image/tags/list?n=10"
+        );
+
+        let short: http::Uri = "/v2/busybox/manifests/latest?source=test".parse().unwrap();
+        let resolved = route_registry_path(&state, &short).await.unwrap();
+        assert_eq!(
+            resolved.upstream_path,
+            "/v2/library/busybox/manifests/latest?source=test"
+        );
     }
 
     #[test]

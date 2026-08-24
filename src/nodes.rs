@@ -18,6 +18,9 @@ use crate::{
     security,
 };
 
+const NODE_ROUTE_CONFLICT: &str = "Registry route changed or no longer exists";
+const NODE_URL_CONFLICT: &str = "node URL already exists in this Registry route";
+
 #[derive(Clone)]
 pub struct NodeService {
     config: Arc<Config>,
@@ -154,16 +157,14 @@ impl NodeService {
         let route = crate::db::registry_route::Entity::find_by_id(input.registry_route_id)
             .one(&self.db)
             .await?
-            .ok_or_else(|| AppError::bad_request("Registry route does not exist"))?;
+            .ok_or_else(|| AppError::conflict(NODE_ROUTE_CONFLICT))?;
         let validated = security::validate_upstream(&input.url, &self.config).await?;
         let canonical = validated.url.to_string();
         if db::get_node_by_route_and_url(&self.db, route.id, &canonical)
             .await?
             .is_some()
         {
-            return Err(AppError::bad_request(
-                "an upstream with this URL already exists in this Registry route",
-            ));
+            return Err(AppError::conflict(NODE_URL_CONFLICT));
         }
         if let Some(ip) = &input.connect_ip {
             ip.parse::<std::net::IpAddr>()
@@ -187,7 +188,9 @@ impl NodeService {
             created_at: now,
             updated_at: now,
         };
-        let node = db::insert_node(&self.db, node).await?;
+        let node = db::insert_node(&self.db, node)
+            .await
+            .map_err(map_node_write_error)?;
         let metric = empty_metric(node.id);
         db::upsert_metric(&self.db, metric.clone()).await?;
         self.view_with(node, metric, route).await
@@ -199,7 +202,7 @@ impl NodeService {
         let route = crate::db::registry_route::Entity::find_by_id(input.registry_route_id)
             .one(&self.db)
             .await?
-            .ok_or_else(|| AppError::bad_request("Registry route does not exist"))?;
+            .ok_or_else(|| AppError::conflict(NODE_ROUTE_CONFLICT))?;
         let validated = security::validate_upstream(&input.url, &self.config).await?;
         let mut node = db::get_node(&self.db, id)
             .await?
@@ -209,9 +212,7 @@ impl NodeService {
             .await?
             .is_some_and(|existing| existing.id != id)
         {
-            return Err(AppError::bad_request(
-                "an upstream with this URL already exists in this Registry route",
-            ));
+            return Err(AppError::conflict(NODE_URL_CONFLICT));
         }
         node.name = input.name.trim().to_owned();
         node.url = canonical;
@@ -229,7 +230,9 @@ impl NodeService {
             node.auth_secret_enc = self.seal_secret(&node.auth_mode, Some(secret))?;
         }
         node.updated_at = Utc::now();
-        let node = db::save_node(&self.db, node).await?;
+        let node = db::save_node(&self.db, node)
+            .await
+            .map_err(map_node_write_error)?;
         let metric = db::metric_for(&self.db, id)
             .await?
             .unwrap_or_else(|| empty_metric(id));
@@ -488,6 +491,10 @@ impl NodeService {
     }
 }
 
+fn map_node_write_error(error: sea_orm::DbErr) -> AppError {
+    AppError::map_constraint(error, NODE_URL_CONFLICT, NODE_ROUTE_CONFLICT)
+}
+
 pub fn score(node: &node::Model, metric: &node_metric::Model, policy: SchedulerPolicy) -> f64 {
     if !node.enabled {
         return -1.0;
@@ -596,8 +603,46 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry_routes::{DOCKER_HUB_ROUTE_ID, GHCR_ROUTE_ID};
+    use crate::registry_routes::{
+        DOCKER_HUB_ROUTE_ID, GHCR_ROUTE_ID, RegistryRouteInput, RegistryRouteService,
+    };
+    use axum::http::StatusCode;
     use secrecy::SecretString;
+
+    fn plain_node_input(registry_route_id: Uuid) -> NodeInput {
+        NodeInput {
+            name: "shared mirror".into(),
+            url: "http://127.0.0.1:5000".into(),
+            registry_route_id,
+            enabled: true,
+            priority: 10,
+            cf_preferred: false,
+            connect_ip: None,
+            auth_mode: "none".into(),
+            auth_username: None,
+            auth_header: None,
+            auth_secret: None,
+        }
+    }
+
+    fn assert_one_success_one_conflict<T>(left: ApiResult<T>, right: ApiResult<T>) {
+        let mut successes = 0;
+        let mut conflicts = 0;
+        for result in [left, right] {
+            match result {
+                Ok(_) => successes += 1,
+                Err(error) => {
+                    assert_eq!(error.status(), StatusCode::CONFLICT);
+                    let message = error.to_string().to_ascii_lowercase();
+                    assert!(!message.contains("sql"));
+                    assert!(!message.contains("constraint"));
+                    conflicts += 1;
+                }
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(conflicts, 1);
+    }
 
     #[test]
     fn healthy_fast_node_scores_higher() {
@@ -674,23 +719,20 @@ mod tests {
         let config = Config::for_test(directory.path().to_owned());
         let db = db::connect(&config.database_url).await.unwrap();
         let service = NodeService::new(Arc::new(config), db).unwrap();
-        let input = |registry_route_id| NodeInput {
-            name: "shared mirror".into(),
-            url: "http://127.0.0.1:5000".into(),
-            registry_route_id,
-            enabled: true,
-            priority: 10,
-            cf_preferred: false,
-            connect_ip: None,
-            auth_mode: "none".into(),
-            auth_username: None,
-            auth_header: None,
-            auth_secret: None,
-        };
-
-        service.create(input(DOCKER_HUB_ROUTE_ID)).await.unwrap();
-        service.create(input(GHCR_ROUTE_ID)).await.unwrap();
-        assert!(service.create(input(DOCKER_HUB_ROUTE_ID)).await.is_err());
+        service
+            .create(plain_node_input(DOCKER_HUB_ROUTE_ID))
+            .await
+            .unwrap();
+        service
+            .create(plain_node_input(GHCR_ROUTE_ID))
+            .await
+            .unwrap();
+        assert!(
+            service
+                .create(plain_node_input(DOCKER_HUB_ROUTE_ID))
+                .await
+                .is_err()
+        );
         assert_eq!(
             service
                 .enabled_registry_nodes(DOCKER_HUB_ROUTE_ID)
@@ -707,5 +749,45 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_node_create_conflict_is_stable() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = db::connect(&config.database_url).await.unwrap();
+        let service = NodeService::new(Arc::new(config), db).unwrap();
+        let (left, right) = tokio::join!(
+            service.create(plain_node_input(DOCKER_HUB_ROUTE_ID)),
+            service.create(plain_node_input(DOCKER_HUB_ROUTE_ID)),
+        );
+        assert_one_success_one_conflict(left, right);
+    }
+
+    #[tokio::test]
+    async fn route_delete_racing_node_create_has_one_stable_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = db::connect(&config.database_url).await.unwrap();
+        let nodes = NodeService::new(Arc::new(config), db.clone()).unwrap();
+        let routes = RegistryRouteService::new(db);
+        let route = routes
+            .create(RegistryRouteInput {
+                key: "race-delete".into(),
+                name: "Race delete".into(),
+                canonical_registry: "registry.example".into(),
+                path_prefix: Some("race-delete".into()),
+                repository_mode: "passthrough".into(),
+                is_default: false,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let (delete, create) = tokio::join!(
+            routes.delete(route.id),
+            nodes.create(plain_node_input(route.id)),
+        );
+        assert_one_success_one_conflict(delete, create.map(|_| ()));
     }
 }

@@ -339,7 +339,7 @@ pub async fn connect(database_url: &str) -> Result<DatabaseConnection, DbErr> {
         .after_connect(|db| {
             Box::pin(async move {
                 db.execute_unprepared(
-                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+                    "PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
                 )
                 .await?;
                 Ok(())
@@ -347,6 +347,7 @@ pub async fn connect(database_url: &str) -> Result<DatabaseConnection, DbErr> {
         });
     let db = Database::connect(options).await?;
     reject_legacy_node_schema(&db).await?;
+    db.execute_unprepared("PRAGMA journal_mode=WAL;").await?;
     let schema = Schema::new(db.get_database_backend());
 
     db.execute(
@@ -814,6 +815,31 @@ mod tests {
         old.close().await.unwrap();
     }
 
+    async fn journal_mode(url: &str) -> String {
+        let db = Database::connect(url).await.unwrap();
+        let mode = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA journal_mode".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "journal_mode")
+            .unwrap();
+        db.close().await.unwrap();
+        mode
+    }
+
+    fn directory_entries(path: &std::path::Path) -> Vec<String> {
+        let mut entries = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
     async fn assert_expected_indexes(db: &DatabaseConnection) {
         for (table, expected) in EXPECTED_INDEXES {
             let indexes = db
@@ -900,9 +926,13 @@ mod tests {
             directory.path().join("old.db").display()
         );
         create_v0_database(&url).await;
+        let mode_before = journal_mode(&url).await;
+        let entries_before = directory_entries(directory.path());
 
         let error = connect(&url).await.unwrap_err();
         assert!(error.to_string().contains("delete and recreate"));
+        assert_eq!(journal_mode(&url).await, mode_before);
+        assert_eq!(directory_entries(directory.path()), entries_before);
 
         let unchanged = Database::connect(&url).await.unwrap();
         let columns = unchanged

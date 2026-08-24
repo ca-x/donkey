@@ -18,6 +18,8 @@ pub const DOCKER_HUB_ROUTE_ID: Uuid = Uuid::from_u128(0x4f6a_9e7b_2d17_4b6a_9b4f
 pub const GHCR_ROUTE_ID: Uuid = Uuid::from_u128(0x4f6a_9e7b_2d17_4b6a_9b4f_7e76_b8d8_a002);
 pub const DOCKER_HUB_ROUTE_KEY: &str = "dockerhub";
 pub const GHCR_ROUTE_KEY: &str = "ghcr";
+const ROUTE_CONFIGURATION_CONFLICT: &str = "Registry route conflicts with existing configuration";
+const ROUTE_IN_USE_CONFLICT: &str = "Registry route is in use by one or more nodes";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -177,7 +179,8 @@ impl RegistryRouteService {
         }
         .into_active_model()
         .insert(&self.db)
-        .await?;
+        .await
+        .map_err(map_route_write_error)?;
         Ok(route.into())
     }
 
@@ -216,7 +219,11 @@ impl RegistryRouteService {
             created_at: ActiveValue::Unchanged(route.created_at),
             updated_at: ActiveValue::Set(route.updated_at),
         };
-        Ok(active.update(&self.db).await?.into())
+        Ok(active
+            .update(&self.db)
+            .await
+            .map_err(map_route_write_error)?
+            .into())
     }
 
     pub async fn delete(&self, id: Uuid) -> ApiResult<()> {
@@ -227,13 +234,14 @@ impl RegistryRouteService {
             ));
         }
         if db::count_nodes_for_route(&self.db, id).await? != 0 {
-            return Err(AppError::bad_request(
-                "Registry route is in use by one or more nodes",
-            ));
+            return Err(AppError::conflict(ROUTE_IN_USE_CONFLICT));
         }
         let deleted = registry_route::Entity::delete_by_id(route.id)
             .exec(&self.db)
-            .await?;
+            .await
+            .map_err(|error| {
+                AppError::map_constraint(error, ROUTE_CONFIGURATION_CONFLICT, ROUTE_IN_USE_CONFLICT)
+            })?;
         if deleted.rows_affected == 0 {
             return Err(AppError::not_found("Registry route"));
         }
@@ -256,7 +264,7 @@ impl RegistryRouteService {
         .await?
         .is_some()
         {
-            return Err(AppError::bad_request("Registry route key already exists"));
+            return Err(AppError::conflict("Registry route key already exists"));
         }
         if let Some(prefix) = &input.path_prefix
             && without_current(
@@ -267,7 +275,7 @@ impl RegistryRouteService {
             .await?
             .is_some()
         {
-            return Err(AppError::bad_request(
+            return Err(AppError::conflict(
                 "Registry route path prefix already exists",
             ));
         }
@@ -279,12 +287,20 @@ impl RegistryRouteService {
             .await?
             .is_some()
         {
-            return Err(AppError::bad_request(
+            return Err(AppError::conflict(
                 "a default Registry route already exists",
             ));
         }
         Ok(())
     }
+}
+
+fn map_route_write_error(error: DbErr) -> AppError {
+    AppError::map_constraint(
+        error,
+        ROUTE_CONFIGURATION_CONFLICT,
+        "Registry route reference conflict",
+    )
 }
 
 struct NormalizedRouteInput {
@@ -455,6 +471,7 @@ async fn seed_builtin(db: &DatabaseConnection, route: registry_route::Model) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
 
     fn custom_input(key: &str, prefix: &str) -> RegistryRouteInput {
         RegistryRouteInput {
@@ -466,6 +483,25 @@ mod tests {
             is_default: false,
             enabled: true,
         }
+    }
+
+    fn assert_one_success_one_conflict<T>(left: ApiResult<T>, right: ApiResult<T>) {
+        let mut successes = 0;
+        let mut conflicts = 0;
+        for result in [left, right] {
+            match result {
+                Ok(_) => successes += 1,
+                Err(error) => {
+                    assert_eq!(error.status(), StatusCode::CONFLICT);
+                    let message = error.to_string().to_ascii_lowercase();
+                    assert!(!message.contains("sql"));
+                    assert!(!message.contains("constraint"));
+                    conflicts += 1;
+                }
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(conflicts, 1);
     }
 
     #[tokio::test]
@@ -546,5 +582,28 @@ mod tests {
         .unwrap();
         service.delete(created.id).await.unwrap();
         assert!(service.get(created.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_route_create_and_update_conflicts_are_stable() {
+        let db = db::connect("sqlite::memory:").await.unwrap();
+        let service = RegistryRouteService::new(db);
+
+        let (left, right) = tokio::join!(
+            service.create(custom_input("race", "race")),
+            service.create(custom_input("race", "race")),
+        );
+        assert_one_success_one_conflict(left, right);
+
+        let alpha = service
+            .create(custom_input("alpha", "alpha"))
+            .await
+            .unwrap();
+        let beta = service.create(custom_input("beta", "beta")).await.unwrap();
+        let (left, right) = tokio::join!(
+            service.update(alpha.id, custom_input("alpha", "shared")),
+            service.update(beta.id, custom_input("beta", "shared")),
+        );
+        assert_one_success_one_conflict(left, right);
     }
 }

@@ -72,8 +72,13 @@ impl Scheduler {
         request_path: &str,
         request_headers: &HeaderMap,
         expected_digest: Option<&str>,
-        registry_route_id: Uuid,
+        nodes: Vec<NodeView>,
     ) -> ApiResult<CachedObject> {
+        if nodes.is_empty() {
+            return Err(AppError::unavailable(
+                "resolved Registry route has no enabled nodes",
+            ));
+        }
         let authorization = request_headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
@@ -89,13 +94,7 @@ impl Scheduler {
         }
 
         let result = self
-            .fetch_uncached(
-                &key,
-                request_path,
-                request_headers,
-                expected_digest,
-                registry_route_id,
-            )
+            .fetch_uncached(&key, request_path, request_headers, expected_digest, &nodes)
             .await;
         drop(guard);
         result
@@ -107,21 +106,14 @@ impl Scheduler {
         request_path: &str,
         request_headers: &HeaderMap,
         expected_digest: Option<&str>,
-        registry_route_id: Uuid,
+        nodes: &[NodeView],
     ) -> ApiResult<CachedObject> {
-        let nodes = self.nodes.enabled_registry_nodes(registry_route_id).await?;
-        if nodes.is_empty() {
-            return Err(AppError::unavailable(
-                "resolved Registry route has no enabled nodes",
-            ));
-        }
-
         let capability_key = format!("{}:{}", nodes[0].node.url, request_path);
         let capabilities = if let Some(value) = self.capabilities.get(&capability_key).await {
             value
         } else {
             let detected = self
-                .detect_capabilities(&nodes, request_path, request_headers)
+                .detect_capabilities(nodes, request_path, request_headers)
                 .await?;
             self.capabilities
                 .insert(capability_key, detected.clone())
@@ -148,7 +140,7 @@ impl Scheduler {
             );
             if let Err(error) = self
                 .download_parallel(
-                    &nodes,
+                    nodes,
                     request_path,
                     request_headers,
                     capabilities.size,
@@ -163,11 +155,11 @@ impl Scheduler {
                     "parallel fetch failed; falling back to one upstream"
                 );
                 let _ = tokio::fs::remove_file(&merged).await;
-                self.download_whole(&nodes, request_path, request_headers, &merged)
+                self.download_whole(nodes, request_path, request_headers, &merged)
                     .await?;
             }
         } else {
-            self.download_whole(&nodes, request_path, request_headers, &merged)
+            self.download_whole(nodes, request_path, request_headers, &merged)
                 .await?;
         }
 
