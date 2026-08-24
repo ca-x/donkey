@@ -63,9 +63,16 @@ cp .env.example .env
 ```dotenv
 DONKEY_INITIAL_ADMIN_USERNAME=admin
 DONKEY_INITIAL_ADMIN_PASSWORD=replace-with-at-least-12-characters
-DONKEY_PROXY_AUTH=proxy:replace-this-password
 DONKEY_CREDENTIAL_KEY=<64-character-hex-key>
 ```
+
+Registry 客户端认证和 CONNECT 代理默认均未启用。只有明确需要时，才分别设置 `DONKEY_REGISTRY_AUTH` 或 `DONKEY_PROXY_AUTH`；未配置的 Registry 保持匿名访问，未配置认证的 CONNECT 则保持禁用，避免意外开放代理。
+
+| 入口 | 未配置认证 | 明确配置认证后 |
+| --- | --- | --- |
+| 管理界面 | 非 loopback 监听必须配置本地管理员、OIDC 或旧 API Basic 之一 | 浏览器使用 `/login` 的本地会话或 OIDC；旧 API Basic 仅接受客户端主动凭据，不发送浏览器 challenge |
+| Registry | 匿名访问，不返回 Basic challenge | 使用 `DONKEY_REGISTRY_AUTH`，按 Docker Registry 规范返回 Basic challenge |
+| CONNECT | 默认禁用，返回 403 且不返回代理 challenge | 使用独立的 `DONKEY_PROXY_AUTH`，无效凭据返回 407 |
 
 生成凭据加密主密钥：
 

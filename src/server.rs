@@ -134,12 +134,7 @@ async fn admin_auth(State(state): State<AppState>, mut request: Request, next: N
         Err(_) => state.auth.authenticate_legacy_basic(request.headers()),
     };
     let Some(principal) = principal else {
-        let mut response = crate::error::AppError::Unauthorized.into_response();
-        response.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Basic realm=\"Donkey API\", charset=\"UTF-8\""),
-        );
-        return response;
+        return crate::error::AppError::Unauthorized.into_response();
     };
     let is_write = !matches!(
         *request.method(),
@@ -212,6 +207,24 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
+    async fn registry_without_configured_auth_does_not_challenge_clients() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = registry_router(
+            AppState::new(Config::for_test(directory.path().to_owned()))
+                .await
+                .unwrap(),
+        );
+
+        let response = router
+            .oneshot(Request::builder().uri("/v2/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+    }
+
+    #[tokio::test]
     async fn registry_auth_uses_docker_compatible_basic_challenge() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = Config::for_test(directory.path().to_owned());
@@ -233,6 +246,24 @@ mod tests {
             "Basic realm=\"Donkey Registry\", charset=\"UTF-8\""
         );
 
+        let wrong = STANDARD.encode("docker-user:wrong-password");
+        let rejected = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/")
+                    .header(header::AUTHORIZATION, format!("Basic {wrong}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            rejected.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            "Basic realm=\"Donkey Registry\", charset=\"UTF-8\""
+        );
+
         let encoded = STANDARD.encode("docker-user:docker-password");
         let authenticated = router
             .oneshot(
@@ -248,6 +279,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_without_configured_auth_is_disabled_without_a_challenge() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.connect_remap.push(crate::config::ConnectRemap {
+            source: "registry.example:443".into(),
+            target: "127.0.0.1:9".into(),
+        });
+        let router = admin_router(AppState::new(config).await.unwrap());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::CONNECT)
+                    .uri("registry.example:443")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.headers().get(header::PROXY_AUTHENTICATE).is_none());
+    }
+
+    #[tokio::test]
     async fn connect_uses_proxy_auth_without_duplicate_admin_auth() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = Config::for_test(directory.path().to_owned());
@@ -258,6 +314,30 @@ mod tests {
             target: "127.0.0.1:9".into(),
         });
         let router = admin_router(AppState::new(config).await.unwrap());
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::CONNECT)
+                    .uri("registry.example:443")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unauthenticated.status(),
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        );
+        assert_eq!(
+            unauthenticated
+                .headers()
+                .get(header::PROXY_AUTHENTICATE)
+                .unwrap(),
+            "Basic realm=\"Donkey CONNECT\""
+        );
+
         let encoded = STANDARD.encode("proxy:password");
         let response = router
             .oneshot(
@@ -292,6 +372,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            unauthenticated
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .is_none(),
+            "admin session endpoints must not trigger a browser Basic auth dialog"
+        );
 
         let logged_in = router
             .clone()
@@ -357,6 +444,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_basic_is_opt_in_and_never_challenges_browsers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.admin_auth = Some(SecretString::from("legacy:password"));
+        let router = admin_router(AppState::new(config).await.unwrap());
+
+        for authorization in [None, Some(STANDARD.encode("legacy:wrong"))] {
+            let mut request = Request::builder().uri("/api/runtime");
+            if let Some(encoded) = authorization {
+                request = request.header(header::AUTHORIZATION, format!("Basic {encoded}"));
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+        }
+
+        let encoded = STANDARD.encode("legacy:password");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime")
+                    .header(header::AUTHORIZATION, format!("Basic {encoded}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
