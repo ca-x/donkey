@@ -593,6 +593,15 @@ impl ImageTools {
         node_id: Uuid,
     ) -> ApiResult<PreparedImage> {
         let node = self.nodes.registry_node(node_id).await?;
+        let logical_registry =
+            crate::registry_routes::normalize_registry_authority(logical.resolve_registry())?;
+        let route_registry =
+            crate::registry_routes::normalize_registry_authority(&node.route.canonical_registry)?;
+        if logical_registry != route_registry {
+            return Err(AppError::bad_request(
+                "selected image source does not match its Registry route",
+            ));
+        }
         let reference = logical
             .digest()
             .or_else(|| logical.tag())
@@ -2743,7 +2752,7 @@ mod tests {
             .create_job(
                 JobInput {
                     kind: "export".into(),
-                    source_ref: "localhost/library/test:latest".into(),
+                    source_ref: "docker.io/library/test:latest".into(),
                     source_node_id: Some(node.node.id),
                     source_credential_id: None,
                     destination_ref: None,
@@ -2771,6 +2780,61 @@ mod tests {
         manifest_mock.assert_async().await;
         config_mock.assert_async().await;
         layer_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn selected_source_node_rejects_registry_mismatch_before_network_access() {
+        let upstream = MockServer::start_async().await;
+        let any_request = upstream
+            .mock_async(|when, then| {
+                when.any_request();
+                then.status(500).body("must not be reached");
+            })
+            .await;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.registry_auth = Some(SecretString::from("client:password"));
+        config.credential_key = Some(SecretString::from("66".repeat(32)));
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let config = Arc::new(config);
+        let nodes = NodeService::new(config.clone(), db.clone()).unwrap();
+        let node = nodes
+            .create(crate::nodes::NodeInput {
+                name: "docker-only mirror".into(),
+                url: upstream.base_url(),
+                registry_route_id: crate::registry_routes::DOCKER_HUB_ROUTE_ID,
+                enabled: true,
+                priority: 1,
+                cf_preferred: false,
+                connect_ip: None,
+                auth_mode: "header".into(),
+                auth_username: None,
+                auth_header: Some("x-mirror-key".into()),
+                auth_secret: Some("must-not-be-used".into()),
+            })
+            .await
+            .unwrap();
+        let service = ImageTools::new(config, db, nodes).await.unwrap();
+        let mut job = test_job(JobStatus::Pending, None);
+        job.source_ref = "ghcr.io/library/test:latest".into();
+        job.source_node_id = Some(node.node.id);
+        let reference = job.source_ref.parse().unwrap();
+
+        let error = match service
+            .prepare_image_via_node(&job, &reference, node.node.id)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched source Registry unexpectedly reached the node"),
+        };
+
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.to_string(),
+            "selected image source does not match its Registry route"
+        );
+        any_request.assert_calls_async(0).await;
     }
 
     #[tokio::test]

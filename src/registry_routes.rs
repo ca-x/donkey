@@ -363,7 +363,7 @@ fn normalize_identifier(value: &str, label: &str) -> ApiResult<String> {
     Ok(normalized)
 }
 
-fn normalize_registry_authority(value: &str) -> ApiResult<String> {
+pub(crate) fn normalize_registry_authority(value: &str) -> ApiResult<String> {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty()
         || normalized.len() > 261
@@ -385,7 +385,10 @@ fn normalize_registry_authority(value: &str) -> ApiResult<String> {
             "canonical Registry must be a lowercase host[:port] with no scheme or path",
         ));
     }
-    Ok(normalized)
+    Ok(match normalized.as_str() {
+        "docker.io" | "index.docker.io" | "registry-1.docker.io" => "docker.io".to_owned(),
+        _ => normalized,
+    })
 }
 
 fn valid_registry_host(host: &str) -> bool {
@@ -524,6 +527,17 @@ mod tests {
         let mut invalid = custom_input("invalid", "invalid");
         invalid.canonical_registry = "https://registry.example/path".to_owned();
         assert!(service.create(invalid).await.is_err());
+    }
+
+    #[test]
+    fn normalizes_docker_registry_authority_aliases_centrally() {
+        for alias in ["docker.io", "INDEX.DOCKER.IO", "registry-1.docker.io"] {
+            assert_eq!(normalize_registry_authority(alias).unwrap(), "docker.io");
+        }
+        assert_eq!(
+            normalize_registry_authority(" Registry.Example:5000 ").unwrap(),
+            "registry.example:5000"
+        );
     }
 
     #[tokio::test]

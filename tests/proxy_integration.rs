@@ -16,9 +16,12 @@ mod proxy_integration {
         response::Response,
     };
     use donkey::{
-        AppState, Config, nodes::NodeInput, registry_routes::DOCKER_HUB_ROUTE_ID,
+        AppState, Config,
+        nodes::NodeInput,
+        registry_routes::{DOCKER_HUB_ROUTE_ID, GHCR_ROUTE_ID},
         server::registry_router,
     };
+    use secrecy::SecretString;
     use sha2::{Digest, Sha256};
     use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
     use tower::ServiceExt;
@@ -39,6 +42,8 @@ mod proxy_integration {
         head_count: AtomicUsize,
         get_count: AtomicUsize,
         ranges: Mutex<Vec<Option<String>>>,
+        uris: Mutex<Vec<String>>,
+        route_auth: Mutex<Vec<Option<String>>>,
     }
 
     #[derive(Clone)]
@@ -91,6 +96,14 @@ mod proxy_integration {
         async fn ranges(&self) -> Vec<Option<String>> {
             self.state.stats.ranges.lock().await.clone()
         }
+
+        async fn uris(&self) -> Vec<String> {
+            self.state.stats.uris.lock().await.clone()
+        }
+
+        async fn route_auth(&self) -> Vec<Option<String>> {
+            self.state.stats.route_auth.lock().await.clone()
+        }
     }
 
     impl Drop for Fixture {
@@ -100,6 +113,19 @@ mod proxy_integration {
     }
 
     async fn fixture_handler(State(state): State<FixtureState>, request: AxumRequest) -> Response {
+        state
+            .stats
+            .uris
+            .lock()
+            .await
+            .push(request.uri().to_string());
+        state.stats.route_auth.lock().await.push(
+            request
+                .headers()
+                .get("x-route-key")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+        );
         match *request.method() {
             Method::HEAD => {
                 state.stats.head_count.fetch_add(1, Ordering::Relaxed);
@@ -231,19 +257,29 @@ mod proxy_integration {
     }
 
     async fn proxy_state(fixtures: &[&Fixture]) -> (AppState, tempfile::TempDir) {
+        let fixtures = fixtures
+            .iter()
+            .map(|fixture| (*fixture, DOCKER_HUB_ROUTE_ID))
+            .collect::<Vec<_>>();
+        routed_proxy_state(&fixtures).await
+    }
+
+    async fn routed_proxy_state(
+        fixtures: &[(&Fixture, uuid::Uuid)],
+    ) -> (AppState, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
         let mut config = Config::for_test(directory.path().to_owned());
         config.chunk_size = 4;
         config.chunk_concurrency = 4;
         config.parallel_threshold = 1;
         let state = AppState::new(config).await.unwrap();
-        for (index, fixture) in fixtures.iter().enumerate() {
+        for (index, (fixture, route_id)) in fixtures.iter().enumerate() {
             state
                 .nodes
                 .create(NodeInput {
                     name: format!("fixture-{index}"),
                     url: fixture.url(),
-                    registry_route_id: DOCKER_HUB_ROUTE_ID,
+                    registry_route_id: *route_id,
                     enabled: true,
                     priority: index as i32,
                     cf_preferred: false,
@@ -252,6 +288,36 @@ mod proxy_integration {
                     auth_username: None,
                     auth_header: None,
                     auth_secret: None,
+                })
+                .await
+                .unwrap();
+        }
+        (state, directory)
+    }
+
+    async fn authenticated_routed_proxy_state(
+        fixtures: &[(&Fixture, uuid::Uuid, &str)],
+    ) -> (AppState, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.registry_auth = Some(SecretString::from("client:password"));
+        config.credential_key = Some(SecretString::from("88".repeat(32)));
+        let state = AppState::new(config).await.unwrap();
+        for (index, (fixture, route_id, secret)) in fixtures.iter().enumerate() {
+            state
+                .nodes
+                .create(NodeInput {
+                    name: format!("authenticated-fixture-{index}"),
+                    url: fixture.url(),
+                    registry_route_id: *route_id,
+                    enabled: true,
+                    priority: index as i32,
+                    cf_preferred: false,
+                    connect_ip: None,
+                    auth_mode: "header".into(),
+                    auth_username: None,
+                    auth_header: Some("x-route-key".into()),
+                    auth_secret: Some((*secret).to_owned()),
                 })
                 .await
                 .unwrap();
@@ -268,14 +334,26 @@ mod proxy_integration {
     }
 
     async fn request(router: Router, method: Method, uri: &str, range: Option<&str>) -> Response {
-        let mut builder = http::Request::builder().method(method).uri(uri);
+        let mut headers = HeaderMap::new();
         if let Some(range) = range {
-            builder = builder.header(header::RANGE, range);
+            headers.insert(header::RANGE, range.parse().unwrap());
         }
-        router
-            .oneshot(builder.body(Body::empty()).unwrap())
-            .await
-            .unwrap()
+        request_with_headers(router, method, uri, headers).await
+    }
+
+    async fn request_with_headers(
+        router: Router,
+        method: Method,
+        uri: &str,
+        headers: HeaderMap,
+    ) -> Response {
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        *request.headers_mut() = headers;
+        router.oneshot(request).await.unwrap()
     }
 
     mod fixture {
@@ -487,6 +565,198 @@ mod proxy_integration {
             );
             assert_eq!(fixture.head_count(), 1);
             assert_eq!(fixture.get_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn authorization_scopes_do_not_share_cache_admission_across_routes() {
+            let bytes = b"same-verified-blob".to_vec();
+            let docker = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
+            let ghcr = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
+            let (state, _directory) =
+                routed_proxy_state(&[(&docker, DOCKER_HUB_ROUTE_ID), (&ghcr, GHCR_ROUTE_ID)]).await;
+            let digest = digest(&bytes);
+            let docker_path = blob_path(&digest);
+            let ghcr_path = format!("/v2/ghcr/{REPOSITORY}/blobs/{digest}");
+            let router = registry_router(state.clone());
+
+            for (path, authorization) in [
+                (docker_path.as_str(), "Bearer docker-scope"),
+                (ghcr_path.as_str(), "Bearer ghcr-scope"),
+            ] {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::AUTHORIZATION, authorization.parse().unwrap());
+                let response =
+                    request_with_headers(router.clone(), Method::GET, path, headers.clone()).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    bytes
+                );
+
+                let cached = request_with_headers(router.clone(), Method::GET, path, headers).await;
+                assert_eq!(cached.status(), StatusCode::OK);
+            }
+
+            assert_eq!(state.cache.stats().await.unwrap().entries, 2);
+            assert_eq!(docker.head_count(), 1);
+            assert_eq!(docker.get_count(), 1);
+            assert_eq!(ghcr.head_count(), 1);
+            assert_eq!(ghcr.get_count(), 1);
+        }
+    }
+
+    mod routes {
+        use super::*;
+
+        const CLIENT_AUTH: &str = "Basic Y2xpZW50OnBhc3N3b3Jk";
+
+        fn authenticated_headers() -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, CLIENT_AUTH.parse().unwrap());
+            headers
+        }
+
+        #[tokio::test]
+        async fn same_repository_tag_is_isolated_by_route_with_query_head_range_and_node_auth() {
+            let docker_bytes = b"docker-manifest".to_vec();
+            let ghcr_bytes = b"ghcr-manifest".to_vec();
+            let docker = Fixture::start(FixtureBehavior::ValidRange, docker_bytes.clone()).await;
+            let ghcr = Fixture::start(FixtureBehavior::ValidRange, ghcr_bytes.clone()).await;
+            let (state, _directory) = authenticated_routed_proxy_state(&[
+                (&docker, DOCKER_HUB_ROUTE_ID, "docker-route-secret"),
+                (&ghcr, GHCR_ROUTE_ID, "ghcr-route-secret"),
+            ])
+            .await;
+            let router = registry_router(state);
+
+            let docker_response = request_with_headers(
+                router.clone(),
+                Method::GET,
+                "/v2/team/widget/manifests/latest?channel=docker",
+                authenticated_headers(),
+            )
+            .await;
+            assert_eq!(docker_response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(docker_response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                docker_bytes
+            );
+
+            let ghcr_response = request_with_headers(
+                router.clone(),
+                Method::GET,
+                "/v2/ghcr/team/widget/manifests/latest?channel=ghcr",
+                authenticated_headers(),
+            )
+            .await;
+            assert_eq!(ghcr_response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(ghcr_response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                ghcr_bytes
+            );
+
+            let head = request_with_headers(
+                router.clone(),
+                Method::HEAD,
+                "/v2/ghcr/team/widget/manifests/latest?head=1",
+                authenticated_headers(),
+            )
+            .await;
+            assert_eq!(head.status(), StatusCode::OK);
+            assert_eq!(head.headers()[header::CONTENT_LENGTH], "13");
+
+            let mut range_headers = authenticated_headers();
+            range_headers.insert(header::RANGE, "bytes=0-5".parse().unwrap());
+            let range = request_with_headers(
+                router,
+                Method::GET,
+                "/v2/team/widget/manifests/latest?range=1",
+                range_headers,
+            )
+            .await;
+            assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(range.headers()[header::CONTENT_RANGE], "bytes 0-5/15");
+            assert_eq!(
+                to_bytes(range.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"docker"
+            );
+
+            assert_eq!(
+                docker.uris().await,
+                vec![
+                    "/v2/team/widget/manifests/latest?channel=docker",
+                    "/v2/team/widget/manifests/latest?range=1",
+                ]
+            );
+            assert_eq!(
+                ghcr.uris().await,
+                vec![
+                    "/v2/team/widget/manifests/latest?channel=ghcr",
+                    "/v2/team/widget/manifests/latest?head=1",
+                ]
+            );
+            assert_eq!(
+                docker.route_auth().await,
+                vec![
+                    Some("docker-route-secret".into()),
+                    Some("docker-route-secret".into()),
+                ]
+            );
+            assert_eq!(
+                ghcr.route_auth().await,
+                vec![
+                    Some("ghcr-route-secret".into()),
+                    Some("ghcr-route-secret".into()),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn retryable_failure_never_crosses_registry_routes() {
+            let docker_bytes = b"docker-only".to_vec();
+            let failing =
+                Fixture::start(FixtureBehavior::RetryableFailure, docker_bytes.clone()).await;
+            let healthy = Fixture::start(FixtureBehavior::ValidRange, docker_bytes.clone()).await;
+            let ghcr = Fixture::start(FixtureBehavior::ValidRange, b"ghcr-only".to_vec()).await;
+            let (state, _directory) = routed_proxy_state(&[
+                (&failing, DOCKER_HUB_ROUTE_ID),
+                (&healthy, DOCKER_HUB_ROUTE_ID),
+                (&ghcr, GHCR_ROUTE_ID),
+            ])
+            .await;
+
+            let response = request(
+                registry_router(state),
+                Method::GET,
+                "/v2/team/widget/manifests/latest",
+                None,
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                docker_bytes
+            );
+            assert_eq!(failing.get_count(), 1);
+            assert_eq!(healthy.get_count(), 1);
+            assert_eq!(ghcr.head_count(), 0);
+            assert_eq!(ghcr.get_count(), 0);
         }
     }
 }
