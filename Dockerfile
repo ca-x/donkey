@@ -13,6 +13,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY src ./src
+COPY scripts ./scripts
 COPY --from=frontend /build/frontend/dist ./frontend/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
