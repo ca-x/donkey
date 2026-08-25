@@ -152,6 +152,9 @@ async fn registry_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
+    if crate::helpers::is_helper_path(request.uri().path()) {
+        return next.run(request).await;
+    }
     let Some(expected) = state.config.registry_auth_value() else {
         return next.run(request).await;
     };
@@ -222,6 +225,57 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+    }
+
+    #[tokio::test]
+    async fn generated_helpers_are_public_even_when_registry_auth_is_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.registry_auth = Some(SecretString::from("client:password"));
+        config.registry_external_tls = true;
+        let router = registry_router(AppState::new(config).await.unwrap());
+
+        for (path, marker) in [
+            (
+                "/helper",
+                "DONKEY_URL=\"${DONKEY_URL:-https://registry.example}\"",
+            ),
+            ("/helper.win", "[string]$Url = 'https://registry.example',"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::HOST, "registry.example")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store, max-age=0"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert!(String::from_utf8(body.to_vec()).unwrap().contains(marker));
+        }
+
+        let rejected = router
+            .oneshot(
+                Request::builder()
+                    .uri("/helper")
+                    .header(header::HOST, "registry.example;malicious-command")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -532,12 +532,13 @@ a,
   margin-top: 10px;
 }
 
-.code-block code {
+.code-block pre {
   padding: 13px 48px 13px 13px;
   border: 1px solid var(--border);
   background: var(--surface-muted);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .code-copy {

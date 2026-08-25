@@ -24,6 +24,9 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Response
 }
 
 async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> {
+    if crate::helpers::is_helper_path(request.uri().path()) {
+        return crate::helpers::serve(&state, request).await;
+    }
     if !request.uri().path().starts_with("/v2") {
         return match crate::domainfold::proxy_if_mapping(&state, request).await? {
             Ok(response) => Ok(response),

@@ -233,6 +233,7 @@ struct RuntimeConfig {
     export_ttl_seconds: u64,
     admin_external_tls: bool,
     admin_external_loopback: bool,
+    registry_external_tls: bool,
 }
 
 async fn runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeConfig>> {
@@ -257,5 +258,6 @@ async fn runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeConfig>
         export_ttl_seconds: state.config.export_ttl.as_secs(),
         admin_external_tls: state.config.admin_external_tls,
         admin_external_loopback: state.config.admin_external_loopback,
+        registry_external_tls: state.config.registry_external_tls,
     }))
 }

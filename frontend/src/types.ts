@@ -146,6 +146,7 @@ export interface RuntimeConfig {
   export_ttl_seconds: number
   admin_external_tls: boolean
   admin_external_loopback: boolean
+  registry_external_tls: boolean
 }
 
 export interface ConvertOutput {

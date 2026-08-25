@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod db;
 pub mod domainfold;
 pub mod error;
+pub mod helpers;
 pub mod image_tools;
 pub mod nodes;
 pub mod registry;

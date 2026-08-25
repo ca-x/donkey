@@ -187,6 +187,20 @@ curl -b cookie.txt -H 'Content-Type: application/json' \
 
 ### 一键切换
 
+Donkey 会按当前访问域名动态生成脚本：
+
+```bash
+curl -fsSL https://donkey.example.com/helper | sudo sh -s -- configure
+```
+
+```powershell
+irm https://donkey.example.com/helper.win | iex
+```
+
+管理界面的「设置与部署」会显示替换成实际域名后的 Linux、macOS、Windows 和临时拉取命令。动态脚本不包含用户名、密码或 Token。
+
+也可以直接使用 GitHub 上的通用脚本并显式传入地址：
+
 Linux：
 
 ```bash
