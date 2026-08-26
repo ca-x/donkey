@@ -839,6 +839,13 @@ pub async fn delete_cache_entry(db: &DatabaseConnection, key: &str) -> Result<u6
         .rows_affected)
 }
 
+pub async fn clear_cache_entries(db: &DatabaseConnection) -> Result<u64, DbErr> {
+    Ok(cache_entry::Entity::delete_many()
+        .exec(db)
+        .await?
+        .rows_affected)
+}
+
 pub async fn list_mappings(db: &DatabaseConnection) -> Result<Vec<domain_mapping::Model>, DbErr> {
     domain_mapping::Entity::find()
         .order_by_asc(domain_mapping::Column::SourceHost)

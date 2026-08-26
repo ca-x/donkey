@@ -59,7 +59,7 @@ pub struct RegistryRouteInput {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryRouteView {
     pub id: Uuid,
     pub key: String,

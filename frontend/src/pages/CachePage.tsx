@@ -1,6 +1,7 @@
 import {
   ActionIcon,
   Box,
+  Button,
   Group,
   Paper,
   Progress,
@@ -28,6 +29,7 @@ export function CachePage() {
   const canWrite = useAuth().role === 'admin'
   const client = useQueryClient()
   const [pendingDelete, setPendingDelete] = useState<CacheEntry | null>(null)
+  const [clearRequested, setClearRequested] = useState(false)
   const cache = useQuery({ queryKey: ['cache'], queryFn: () => api.cache(500) })
   const runtime = useQuery({ queryKey: ['runtime'], queryFn: api.runtime })
   const remove = useMutation({
@@ -40,6 +42,7 @@ export function CachePage() {
     },
     onError: (error: Error) => notifications.show({ color: 'red', title: t('cache.removeFailed'), message: error.message }),
   })
+  const clear = useMutation({ mutationFn: api.clearCache, onSuccess: () => { setClearRequested(false); void client.invalidateQueries({ queryKey: ['cache'] }); void client.invalidateQueries({ queryKey: ['dashboard'] }); notifications.show({ color: 'green', message: t('cache.cleared') }) }, onError: (error: Error) => notifications.show({ color: 'red', title: t('cache.removeFailed'), message: error.message }) })
   if (cache.isLoading || runtime.isLoading) return <LoadingState />
   if (cache.error || runtime.error) return <ErrorState error={(cache.error ?? runtime.error)!} retry={() => { void cache.refetch(); void runtime.refetch() }} />
 
@@ -52,7 +55,7 @@ export function CachePage() {
 
   return (
     <Stack gap={24}>
-      <PageHeader title={t('cache.title')} description={t('cache.description')} />
+      <PageHeader title={t('cache.title')} description={t('cache.description')} action={canWrite ? <Button color="red" variant="light" leftSection={<IconTrash size={17} />} onClick={() => setClearRequested(true)}>{t('cache.clearAll')}</Button> : undefined} />
       <SimpleGrid cols={{ base: 1, xs: 2, lg: 4 }}>
         <MetricCard label={t('cache.used')} value={formatBytes(used)} detail={`${percent.toFixed(1)}%`} icon={<IconDatabase size={18} />} />
         <MetricCard label={t('cache.capacity')} value={formatBytes(config.max_cache_bytes)} detail={`${config.cache_entries} ${t('cache.objects')}`} icon={<IconDatabase size={18} />} />
@@ -87,6 +90,7 @@ export function CachePage() {
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => pendingDelete && remove.mutate(pendingDelete.key)}
       />
+      <NamedConfirmDialog opened={clearRequested} title={t('cache.clearAllTitle')} name={t('cache.clearAllName')} consequence={t('cache.clearAllMessage')} confirmLabel={t('cache.clearAll')} loading={clear.isPending} onCancel={() => setClearRequested(false)} onConfirm={() => clear.mutate()} />
     </Stack>
   )
 }

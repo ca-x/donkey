@@ -233,6 +233,21 @@ impl CacheStore {
         self.remove_locked(key).await
     }
 
+    pub async fn clear_all(&self) -> ApiResult<u64> {
+        let _capacity_guard = self.capacity_lock.lock().await;
+        let entries = db::all_cache_entries(&self.db).await?;
+        let mut freed = 0_u64;
+        for entry in &entries {
+            match tokio::fs::remove_file(&entry.path).await {
+                Ok(()) => freed = freed.saturating_add(entry.size_bytes.max(0) as u64),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        db::clear_cache_entries(&self.db).await?;
+        Ok(freed)
+    }
+
     async fn remove_locked(&self, key: &str) -> ApiResult<()> {
         let path = self.object_path(key);
         match tokio::fs::remove_file(path).await {

@@ -9,6 +9,7 @@ import type {
   RegistryRoute,
   RegistryRouteInput,
   RuntimeConfig,
+  RuntimeSettingsExport,
   RegistryCredential,
   ImageJob,
   ImageJobInput,
@@ -72,6 +73,7 @@ export const api = {
   me: () => request<AuthUser>('/auth/me'),
   login: (username: string, password: string) => request<AuthUser>('/auth/login', { method: 'POST', body: json({ username, password }) }),
   logout: () => request<void>('/auth/logout', { method: 'POST' }),
+  updateProfile: (input: { display_name: string; username?: string; current_password?: string; new_password?: string }) => request<AuthUser>('/auth/profile', { method: 'PUT', body: json(input) }),
   dashboard: () => request<DashboardData>('/dashboard'),
   nodes: () => request<NodeView[]>('/nodes'),
   createNode: (input: NodeInput) =>
@@ -88,6 +90,7 @@ export const api = {
   deleteRegistryRoute: (id: string) => request<void>(`/registry-routes/${id}`, { method: 'DELETE' }),
   cache: (limit = 250) => request<CacheEntry[]>(`/cache?limit=${limit}`),
   deleteCache: (key: string) => request<void>(`/cache/${key}`, { method: 'DELETE' }),
+  clearCache: () => request<{ freed_bytes: number }>('/cache/clear', { method: 'DELETE' }),
   mappings: () => request<Mapping[]>('/mappings'),
   createMapping: (input: MappingInput) =>
     request<Mapping>('/mappings', { method: 'POST', body: json(input) }),
@@ -98,6 +101,8 @@ export const api = {
     request<ConvertOutput>('/domainfold/convert', { method: 'POST', body: json({ url }) }),
   runtime: () => request<RuntimeConfig>('/runtime'),
   updateRuntime: (input: Omit<RuntimeConfig, 'admin_addr' | 'registry_addr' | 'tls_enabled' | 'private_upstreams' | 'cache_used_bytes' | 'cache_entries' | 'max_export_bytes' | 'export_ttl_seconds' | 'admin_external_tls' | 'admin_external_loopback' | 'registry_external_tls' | 'registry_auth_enabled'>) => request<RuntimeConfig>('/runtime', { method: 'PUT', body: json(input) }),
+  exportRuntime: () => request<RuntimeSettingsExport>('/runtime/export'),
+  importRuntime: (input: RuntimeSettingsExport) => request<RuntimeConfig>('/runtime/import', { method: 'POST', body: json(input) }),
   imageCredentials: () => request<RegistryCredential[]>('/image-tools/credentials'),
   createImageCredential: (input: { name: string; registry: string; auth_mode: string; username: string | null; secret: string }) => request<RegistryCredential>('/image-tools/credentials', { method: 'POST', body: json(input) }),
   updateImageCredential: (id: string, input: { name: string; registry: string; auth_mode: string; username: string | null; secret: string }) => request<RegistryCredential>(`/image-tools/credentials/${id}`, { method: 'PUT', body: json(input) }),

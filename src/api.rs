@@ -5,6 +5,7 @@ use axum::{
     routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::{
@@ -33,11 +34,14 @@ pub fn router() -> Router<AppState> {
             put(update_registry_route).delete(delete_registry_route),
         )
         .route("/cache", get(list_cache))
+        .route("/cache/clear", axum::routing::delete(clear_cache))
         .route("/cache/{key}", axum::routing::delete(delete_cache))
         .route("/mappings", get(list_mappings).post(create_mapping))
         .route("/mappings/{id}", put(update_mapping).delete(delete_mapping))
         .route("/domainfold/convert", post(convert_url))
         .route("/runtime", get(runtime).put(update_runtime))
+        .route("/runtime/export", get(export_runtime))
+        .route("/runtime/import", axum::routing::post(import_runtime))
 }
 
 #[derive(Serialize)]
@@ -178,6 +182,11 @@ async fn delete_cache(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn clear_cache(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let freed = state.cache.clear_all().await?;
+    Ok(Json(serde_json::json!({ "freed_bytes": freed })))
+}
+
 async fn list_mappings(
     State(state): State<AppState>,
 ) -> ApiResult<Json<Vec<domain_mapping::Model>>> {
@@ -255,7 +264,7 @@ async fn runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeConfig>
     )))
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct RuntimeSettingsInput {
     chunk_size: u64,
     chunk_concurrency: usize,
@@ -273,10 +282,180 @@ struct RuntimeSettingsInput {
     health_interval_seconds: u64,
 }
 
+#[derive(Serialize, Deserialize)]
+struct RuntimeSettingsExport {
+    format: String,
+    version: u32,
+    settings: RuntimeSettingsInput,
+    #[serde(default)]
+    registry_routes: Vec<crate::registry_routes::RegistryRouteView>,
+    #[serde(default)]
+    nodes: Vec<ExportNode>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ExportNode {
+    name: String,
+    url: String,
+    registry_route: String,
+    enabled: bool,
+    priority: i32,
+    max_concurrency: u16,
+    cf_preferred: bool,
+    connect_ip: Option<String>,
+    auth_mode: String,
+    auth_username: Option<String>,
+    auth_header: Option<String>,
+}
+
 async fn update_runtime(
     State(state): State<AppState>,
     Json(input): Json<RuntimeSettingsInput>,
 ) -> ApiResult<Json<RuntimeConfig>> {
+    persist_runtime(&state, &input).await?;
+    let cache = state.cache.stats().await?;
+    Ok(Json(runtime_config(
+        &effective_config(&state).await?,
+        cache,
+    )))
+}
+
+async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeSettingsExport>> {
+    let config = effective_config(&state).await?;
+    let nodes = state
+        .nodes
+        .list()
+        .await?
+        .into_iter()
+        .map(|node| ExportNode {
+            name: node.node.name,
+            url: node.node.url,
+            registry_route: node.route.key,
+            enabled: node.node.enabled,
+            priority: node.node.priority,
+            max_concurrency: node.max_concurrency,
+            cf_preferred: node.node.cf_preferred,
+            connect_ip: node.node.connect_ip,
+            auth_mode: node.node.auth_mode,
+            auth_username: node.node.auth_username,
+            auth_header: node.node.auth_header,
+        })
+        .collect();
+    Ok(Json(RuntimeSettingsExport {
+        format: "donkey-runtime-settings".into(),
+        version: 1,
+        settings: RuntimeSettingsInput {
+            chunk_size: config.chunk_size,
+            chunk_concurrency: config.chunk_concurrency,
+            parallel_threshold: config.parallel_threshold,
+            resumable_threshold: config.resumable_threshold,
+            scheduler_policy: config.scheduler_policy.to_string(),
+            upstream_timeout_seconds: config.upstream_timeout.as_secs(),
+            stream_fallback_timeout_seconds: config.stream_fallback_timeout.as_secs(),
+            partial_ttl_seconds: config.partial_ttl.as_secs(),
+            max_cache_bytes: config.max_cache_bytes,
+            cache_policy: config.cache_policy.to_string(),
+            cache_high_watermark: config.cache_high_watermark,
+            cache_low_watermark: config.cache_low_watermark,
+            cache_ttl_seconds: config.cache_ttl.map(|value| value.as_secs()),
+            health_interval_seconds: config.health_interval.as_secs(),
+        },
+        registry_routes: state.registry_routes.list().await?.into_iter().collect(),
+        nodes,
+    }))
+}
+
+async fn import_runtime(
+    State(state): State<AppState>,
+    Json(export): Json<RuntimeSettingsExport>,
+) -> ApiResult<Json<RuntimeConfig>> {
+    if export.format != "donkey-runtime-settings" || export.version != 1 {
+        return Err(crate::error::AppError::bad_request(
+            "unsupported settings export format",
+        ));
+    }
+    let mut route_ids = HashMap::new();
+    for route in export.registry_routes {
+        let input = crate::registry_routes::RegistryRouteInput {
+            key: route.key.clone(),
+            name: route.name,
+            canonical_registry: route.canonical_registry,
+            path_prefix: route.path_prefix,
+            repository_mode: route.repository_mode,
+            is_default: route.is_default,
+            enabled: route.enabled,
+        };
+        let result = if let Some(existing) = state
+            .registry_routes
+            .list()
+            .await?
+            .into_iter()
+            .find(|item| item.key == route.key)
+        {
+            state.registry_routes.update(existing.id, input).await?
+        } else {
+            state.registry_routes.create(input).await?
+        };
+        route_ids.insert(result.key, result.id);
+    }
+    let available_routes = state.registry_routes.list().await?;
+    for node in export.nodes {
+        if node.auth_mode != "none" {
+            return Err(crate::error::AppError::bad_request(format!(
+                "node '{}' requires credentials after import",
+                node.name
+            )));
+        }
+        let route_id = route_ids
+            .get(&node.registry_route)
+            .copied()
+            .or_else(|| {
+                available_routes
+                    .iter()
+                    .find(|route| route.key == node.registry_route)
+                    .map(|route| route.id)
+            })
+            .ok_or_else(|| {
+                crate::error::AppError::bad_request(format!(
+                    "unknown Registry route '{}'",
+                    node.registry_route
+                ))
+            })?;
+        let input = NodeInput {
+            name: node.name.clone(),
+            url: node.url.clone(),
+            registry_route_id: route_id,
+            enabled: node.enabled,
+            priority: node.priority,
+            max_concurrency: node.max_concurrency,
+            cf_preferred: node.cf_preferred,
+            connect_ip: node.connect_ip,
+            auth_mode: "none".into(),
+            auth_username: None,
+            auth_header: None,
+            auth_secret: None,
+        };
+        let existing = state
+            .nodes
+            .list()
+            .await?
+            .into_iter()
+            .find(|item| item.node.url == node.url && item.node.registry_route_id == route_id);
+        if let Some(existing) = existing {
+            state.nodes.update(existing.node.id, input).await?;
+        } else {
+            state.nodes.create(input).await?;
+        }
+    }
+    persist_runtime(&state, &export.settings).await?;
+    let cache = state.cache.stats().await?;
+    Ok(Json(runtime_config(
+        &effective_config(&state).await?,
+        cache,
+    )))
+}
+
+async fn persist_runtime(state: &AppState, input: &RuntimeSettingsInput) -> ApiResult<()> {
     if !(256 * 1024..=32 * 1024 * 1024).contains(&input.chunk_size)
         || !(1..=64).contains(&input.chunk_concurrency)
         || !(1024 * 1024..=u64::MAX).contains(&input.parallel_threshold)
@@ -306,7 +485,7 @@ async fn update_runtime(
         ("chunk_concurrency", input.chunk_concurrency.to_string()),
         ("parallel_threshold", input.parallel_threshold.to_string()),
         ("resumable_threshold", input.resumable_threshold.to_string()),
-        ("scheduler_policy", input.scheduler_policy),
+        ("scheduler_policy", input.scheduler_policy.clone()),
         (
             "upstream_timeout_seconds",
             input.upstream_timeout_seconds.to_string(),
@@ -317,7 +496,7 @@ async fn update_runtime(
         ),
         ("partial_ttl_seconds", input.partial_ttl_seconds.to_string()),
         ("max_cache_bytes", input.max_cache_bytes.to_string()),
-        ("cache_policy", input.cache_policy),
+        ("cache_policy", input.cache_policy.clone()),
         (
             "cache_high_watermark",
             input.cache_high_watermark.to_string(),
@@ -337,11 +516,7 @@ async fn update_runtime(
         .map(|(key, value)| (key.to_owned(), value))
         .collect::<Vec<_>>();
     db::replace_runtime_settings(&state.db, &values).await?;
-    let cache = state.cache.stats().await?;
-    Ok(Json(runtime_config(
-        &effective_config(&state).await?,
-        cache,
-    )))
+    Ok(())
 }
 
 async fn effective_config(

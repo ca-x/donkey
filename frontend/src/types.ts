@@ -164,6 +164,28 @@ export interface RuntimeConfig {
   registry_auth_enabled: boolean
 }
 
+export type RuntimeSettingsInput = Pick<RuntimeConfig, 'chunk_size' | 'chunk_concurrency' | 'parallel_threshold' | 'resumable_threshold' | 'scheduler_policy' | 'upstream_timeout_seconds' | 'stream_fallback_timeout_seconds' | 'partial_ttl_seconds' | 'max_cache_bytes' | 'cache_policy' | 'cache_high_watermark' | 'cache_low_watermark' | 'cache_ttl_seconds' | 'health_interval_seconds'>
+
+export interface RuntimeSettingsExport {
+  format: 'donkey-runtime-settings'
+  version: 1
+  settings: RuntimeSettingsInput
+  registry_routes: RegistryRoute[]
+  nodes: Array<{
+    name: string
+    url: string
+    registry_route: string
+    enabled: boolean
+    priority: number
+    max_concurrency: number
+    cf_preferred: boolean
+    connect_ip: string | null
+    auth_mode: AuthMode
+    auth_username: string | null
+    auth_header: string | null
+  }>
+}
+
 export interface ConvertOutput {
   original_url: string
   accelerated_url: string

@@ -16,7 +16,7 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -176,6 +176,7 @@ impl AuthService {
             .route("/login", post(login))
             .route("/logout", post(logout))
             .route("/me", get(me))
+            .route("/profile", put(update_profile))
             .route("/oidc/start", get(oidc_start))
             .route("/oidc/callback", get(oidc_callback))
             .layer(SetResponseHeaderLayer::overriding(
@@ -581,6 +582,71 @@ async fn logout(State(service): State<AuthService>, headers: HeaderMap) -> ApiRe
 
 async fn me(Extension(principal): Extension<AuthPrincipal>) -> Json<AuthPrincipal> {
     Json(principal)
+}
+
+#[derive(Deserialize)]
+struct ProfileInput {
+    display_name: String,
+    username: Option<String>,
+    current_password: Option<String>,
+    new_password: Option<String>,
+}
+
+async fn update_profile(
+    State(service): State<AuthService>,
+    Extension(current_user): Extension<AuthPrincipal>,
+    Json(input): Json<ProfileInput>,
+) -> ApiResult<Json<AuthPrincipal>> {
+    let id = current_user.id.ok_or(AppError::Unauthorized)?;
+    if input.display_name.trim().is_empty() || input.display_name.chars().count() > 80 {
+        return Err(AppError::bad_request(
+            "display name must be 1-80 characters",
+        ));
+    }
+    let mut account = user::Entity::find_by_id(id)
+        .one(&service.db)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let changing_credentials = input.username.is_some() || input.new_password.is_some();
+    if changing_credentials {
+        let Some(hash) = account.password_hash.clone() else {
+            return Err(AppError::bad_request(
+                "OIDC accounts manage login credentials with the identity provider",
+            ));
+        };
+        let current = input
+            .current_password
+            .as_deref()
+            .ok_or(AppError::Unauthorized)?;
+        if !verify_password(hash, SecretString::from(current.to_owned())).await? {
+            return Err(AppError::Unauthorized);
+        }
+    }
+    if let Some(username) = input.username.as_deref() {
+        validate_username(username)?;
+        if user::Entity::find()
+            .filter(user::Column::Username.eq(username))
+            .filter(user::Column::Id.ne(id))
+            .one(&service.db)
+            .await?
+            .is_some()
+        {
+            return Err(AppError::conflict("username is already in use"));
+        }
+        account.username = Some(username.to_owned());
+    }
+    if let Some(password) = input.new_password {
+        validate_password(&password)?;
+        account.password_hash = Some(hash_password(SecretString::from(password)).await?);
+    }
+    account.display_name = input.display_name.trim().to_owned();
+    account.updated_at = Utc::now();
+    let updated = account
+        .clone()
+        .into_active_model()
+        .update(&service.db)
+        .await?;
+    Ok(Json(principal(updated)))
 }
 
 async fn oidc_start(
