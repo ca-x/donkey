@@ -300,13 +300,19 @@ http://proxy-user:proxy-password@donkey-host:5003
 | `DONKEY_CHUNK_SIZE` | `2097152` | 上游 Range 分片大小 |
 | `DONKEY_CHUNK_CONCURRENCY` | `8` | 单个 Blob 最大并发分片数 |
 | `DONKEY_PARALLEL_THRESHOLD` | `8388608` | 大于该值才启用分片 |
+| `DONKEY_RESUMABLE_THRESHOLD` | `8388608` | 大于该值且上游支持 Range 时启用断点续传 |
 | `DONKEY_SCHEDULER_POLICY` | `balanced` | `balanced` 或 `speed-first` |
+| `DONKEY_UPSTREAM_TIMEOUT` | `30s` | 单个上游请求超时 |
+| `DONKEY_STREAM_FALLBACK_TIMEOUT` | `10s` | 完整缓存下载超过该时间后切换流式响应 |
+| `DONKEY_PARTIAL_TTL` | `1h` | 断点临时文件最长保留时间 |
 | `DONKEY_MAX_EXPORT_BYTES` | `21474836480` | 镜像工具产物和共享 Blob 总配额 20 GiB |
 | `DONKEY_EXPORT_TTL` | `7d` | 已完成镜像任务产物保留时间 |
 
 `speed-first` 使用实际 Blob 分片吞吐的指数移动平均值。选择节点时会除以该节点当前活跃分片数，因此快节点会接收更多任务，但不会独占所有分片。未知节点保留最低探索权重，仍会获得少量请求用于建立速度样本。
 
 匿名公共 Blob 按 digest 去重。带上游 Authorization 的请求会加入不可逆授权作用域，避免私有内容跨凭据命中。
+
+缓存、调度和续传参数也可以在管理界面的“运行时参数”中修改，保存到 SQLite，并在服务重启后恢复；环境变量仅作为首次启动默认值。
 
 ## 本地开发
 

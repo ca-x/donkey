@@ -124,6 +124,8 @@ export interface DashboardData {
   cache_bytes: number
   cache_hits: number
   healthy_nodes: number
+  registry_requests: number
+  registry_bytes: number
 }
 
 export interface RuntimeConfig {
@@ -134,6 +136,11 @@ export interface RuntimeConfig {
   chunk_size: number
   chunk_concurrency: number
   parallel_threshold: number
+  resumable_threshold: number
+  upstream_timeout_seconds: number
+  stream_fallback_timeout_seconds: number
+  partial_ttl_seconds: number
+  health_interval_seconds: number
   scheduler_policy: 'balanced' | 'speed-first'
   max_cache_bytes: number
   cache_used_bytes: number

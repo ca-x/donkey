@@ -499,7 +499,54 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_nodes_registry_route_enabled_priority ON nodes(registry_route_id, enabled, priority)",
         ]),
     },
+    Migration {
+        version: 3,
+        name: "persisted runtime settings",
+        action: MigrationAction::Statements(&[
+            "CREATE TABLE IF NOT EXISTS runtime_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        ]),
+    },
 ];
+
+#[derive(Debug, Clone)]
+pub struct RuntimeSetting {
+    pub key: String,
+    pub value: String,
+}
+
+pub async fn load_runtime_settings(db: &DatabaseConnection) -> Result<Vec<RuntimeSetting>, DbErr> {
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT key, value FROM runtime_settings".to_owned(),
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(RuntimeSetting {
+                key: row.try_get("", "key")?,
+                value: row.try_get("", "value")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn replace_runtime_settings(
+    db: &DatabaseConnection,
+    settings: &[(String, String)],
+) -> Result<(), DbErr> {
+    let transaction = db.begin().await?;
+    for (key, value) in settings {
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO runtime_settings(key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+                [key.clone().into(), value.clone().into()],
+            ))
+            .await?;
+    }
+    transaction.commit().await
+}
 
 async fn run_migrations(db: &DatabaseConnection) -> Result<(), DbErr> {
     apply_migrations(db, MIGRATIONS).await
@@ -959,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_database_has_expected_indexes() {
         let db = connect("sqlite::memory:").await.unwrap();
-        assert_eq!(migration_versions(&db).await, vec![(1, 1), (2, 1)]);
+        assert_eq!(migration_versions(&db).await, vec![(1, 1), (2, 1), (3, 1)]);
         assert_expected_indexes(&db).await;
         let routes = registry_route::Entity::find().all(&db).await.unwrap();
         assert_eq!(routes.len(), 2);
@@ -971,9 +1018,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_settings_round_trip() {
+        let db = connect("sqlite::memory:").await.unwrap();
+        replace_runtime_settings(&db, &[("resumable_threshold".into(), "4194304".into())])
+            .await
+            .unwrap();
+        let settings = load_runtime_settings(&db).await.unwrap();
+        assert_eq!(settings[0].key, "resumable_threshold");
+        assert_eq!(settings[0].value, "4194304");
+    }
+
+    #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_version() {
         const FAILING_MIGRATION: &[Migration] = &[Migration {
-            version: 3,
+            version: 4,
             name: "rollback test",
             action: MigrationAction::Statements(&[
                 "CREATE TABLE migration_rollback_marker (id INTEGER PRIMARY KEY)",
@@ -992,7 +1050,7 @@ mod tests {
             .await
             .unwrap();
         assert!(marker.is_empty());
-        assert_eq!(migration_versions(&db).await, vec![(1, 1), (2, 1)]);
+        assert_eq!(migration_versions(&db).await, vec![(1, 1), (2, 1), (3, 1)]);
     }
 
     #[tokio::test]

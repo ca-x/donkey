@@ -4,6 +4,7 @@ import {
   IconBolt,
   IconCloudCheck,
   IconDatabase,
+  IconActivityHeartbeat,
   IconRoute,
 } from '@tabler/icons-react'
 import {
@@ -52,6 +53,8 @@ export function DashboardPage() {
         <MetricCard index={1} label={t('dashboard.cacheSize')} value={formatBytes(data.cache_bytes)} detail={t('dashboard.objects', { count: data.cache_entries })} icon={<IconDatabase size={18} />} />
         <MetricCard index={2} label={t('dashboard.hits')} value={data.cache_hits.toLocaleString()} detail={t('dashboard.hitsDetail')} icon={<IconBolt size={18} />} />
         <MetricCard index={3} label={t('dashboard.mode')} value={t(enabledNodes.length > 1 ? 'dashboard.concurrent' : 'dashboard.fallback')} detail={t('dashboard.integrity')} icon={<IconRoute size={18} />} />
+        <MetricCard index={4} label={t('dashboard.registryRequests')} value={data.registry_requests.toLocaleString()} detail={t('dashboard.registryRequestsDetail')} icon={<IconActivityHeartbeat size={18} />} />
+        <MetricCard index={5} label={t('dashboard.registryBytes')} value={formatBytes(data.registry_bytes)} detail={t('dashboard.registryBytesDetail')} icon={<IconDatabase size={18} />} />
       </SimpleGrid>
 
       <div className="dashboard-grid">

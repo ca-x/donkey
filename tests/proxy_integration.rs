@@ -35,6 +35,7 @@ mod proxy_integration {
         RetryableFailure,
         WrongContentRange,
         CorruptChunk,
+        DropAfterPrefix,
     }
 
     #[derive(Default)]
@@ -138,6 +139,7 @@ mod proxy_integration {
                             | FixtureBehavior::RetryableFailure
                             | FixtureBehavior::WrongContentRange
                             | FixtureBehavior::CorruptChunk
+                            | FixtureBehavior::DropAfterPrefix
                     ),
                     None,
                 )
@@ -174,6 +176,40 @@ mod proxy_integration {
                             *first ^= 0xff;
                         }
                         ranged_or_whole(&corrupt, requested_range, false)
+                    }
+                    FixtureBehavior::DropAfterPrefix => {
+                        let (start, end) = requested_range
+                            .as_deref()
+                            .and_then(parse_range)
+                            .unwrap_or((0, state.bytes.len().saturating_sub(1) as u64));
+                        let end = end.min(state.bytes.len().saturating_sub(1) as u64);
+                        let prefix_end = (start + 3).min(end);
+                        let prefix = state.bytes[start as usize..=prefix_end as usize].to_vec();
+                        let body = futures_util::stream::iter([
+                            Ok::<_, std::io::Error>(bytes::Bytes::from(prefix)),
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "fixture drop",
+                            )),
+                        ]);
+                        let mut response = Response::new(Body::from_stream(body));
+                        response.headers_mut().insert(
+                            header::CONTENT_LENGTH,
+                            (end - start + 1).to_string().parse().unwrap(),
+                        );
+                        if requested_range.is_some() {
+                            response.headers_mut().insert(
+                                header::CONTENT_RANGE,
+                                format!("bytes {start}-{end}/{}", state.bytes.len())
+                                    .parse()
+                                    .unwrap(),
+                            );
+                            response
+                                .headers_mut()
+                                .insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+                            *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+                        }
+                        response
                     }
                 }
             }
@@ -605,6 +641,62 @@ mod proxy_integration {
             assert_eq!(docker.get_count(), 1);
             assert_eq!(ghcr.head_count(), 1);
             assert_eq!(ghcr.get_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn resumes_partial_blob_from_another_node() {
+            let bytes = vec![b'x'; 8 * 1024 * 1024 + 4];
+            let failing = Fixture::start(FixtureBehavior::DropAfterPrefix, bytes.clone()).await;
+            let healthy = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.parallel_threshold = bytes.len() as u64 + 1;
+            let state = AppState::new(config).await.unwrap();
+            for (index, fixture) in [&failing, &healthy].into_iter().enumerate() {
+                state
+                    .nodes
+                    .create(NodeInput {
+                        name: format!("fixture-{index}"),
+                        url: fixture.url(),
+                        registry_route_id: DOCKER_HUB_ROUTE_ID,
+                        enabled: true,
+                        priority: index as i32,
+                        cf_preferred: false,
+                        connect_ip: None,
+                        auth_mode: "none".into(),
+                        auth_username: None,
+                        auth_header: None,
+                        auth_secret: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let digest = digest(&bytes);
+            let path = blob_path(&digest);
+            let key =
+                donkey::cache::CacheStore::key(&format!("/v2/{REPOSITORY}/blobs/{digest}"), None);
+            let partial_dir = directory.path().join("cache/tmp").join(&key);
+            tokio::fs::create_dir_all(&partial_dir).await.unwrap();
+            tokio::fs::write(partial_dir.join("object.partial"), &bytes[..8])
+                .await
+                .unwrap();
+            let router = registry_router(state.clone());
+            let second = request(router, Method::GET, &path, None).await;
+            assert_eq!(second.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(second.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            let healthy_ranges = healthy.ranges().await;
+            assert!(healthy_ranges.iter().any(|range| {
+                range
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("bytes=8-"))
+            }));
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
         }
     }
 

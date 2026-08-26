@@ -1,5 +1,6 @@
-import { Box, Code, CopyButton, Group, Paper, SimpleGrid, Stack, Text, Title, Tooltip, ActionIcon } from '@mantine/core'
-import { useQuery } from '@tanstack/react-query'
+import { Box, Button, Code, CopyButton, Group, NumberInput, Paper, SimpleGrid, Stack, Text, Title, Tooltip, ActionIcon } from '@mantine/core'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useForm } from '@mantine/form'
 import { IconArchive, IconCheck, IconCopy, IconLock, IconRoute, IconSettings, IconShieldCheck, IconTerminal2 } from '@tabler/icons-react'
 import { useTranslation } from 'react-i18next'
 import { api, formatBytes } from '../api'
@@ -21,10 +22,11 @@ export function SettingsPage() {
     <PageHeader title={t('settings.title')} description={t('settings.description')} />
     <SimpleGrid cols={{ base: 1, lg: 2 }}>
       <SettingsPanel icon={<IconRoute size={19} />} title={t('settings.endpoints')}><Setting label={t('settings.admin')} value={config.admin_addr} /><Setting label={t('settings.registry')} value={config.registry_addr} /><Setting label={t('settings.tls')} value={t(config.tls_enabled ? 'settings.enabled' : 'settings.disabled')} tone={config.tls_enabled ? 'green' : 'orange'} /></SettingsPanel>
-      <SettingsPanel icon={<IconSettings size={19} />} title={t('settings.scheduler')}><Setting label={t('settings.schedulerPolicy')} value={t(config.scheduler_policy === 'speed-first' ? 'settings.speedFirstPolicy' : 'settings.balancedPolicy')} /><Setting label={t('settings.chunk')} value={formatBytes(config.chunk_size)} /><Setting label={t('settings.concurrency')} value={`${config.chunk_concurrency}`} /><Setting label={t('settings.threshold')} value={formatBytes(config.parallel_threshold)} /></SettingsPanel>
+      <SettingsPanel icon={<IconSettings size={19} />} title={t('settings.scheduler')}><Setting label={t('settings.schedulerPolicy')} value={t(config.scheduler_policy === 'speed-first' ? 'settings.speedFirstPolicy' : 'settings.balancedPolicy')} /><Setting label={t('settings.chunk')} value={formatBytes(config.chunk_size)} /><Setting label={t('settings.concurrency')} value={`${config.chunk_concurrency}`} /><Setting label={t('settings.threshold')} value={formatBytes(config.parallel_threshold)} /><Setting label={t('settings.resumableThreshold')} value={formatBytes(config.resumable_threshold)} /><Setting label={t('settings.upstreamTimeout')} value={`${config.upstream_timeout_seconds}s`} /><Setting label={t('settings.streamFallbackTimeout')} value={`${config.stream_fallback_timeout_seconds}s`} /></SettingsPanel>
       <SettingsPanel icon={<IconShieldCheck size={19} />} title={t('settings.cache')}><Setting label={t('cache.capacity')} value={formatBytes(config.max_cache_bytes)} /><Setting label={t('cache.policy')} value={t(`cache.${config.cache_policy}`)} /><Setting label={t('cache.watermarks')} value={`${Math.round(config.cache_high_watermark * 100)}% → ${Math.round(config.cache_low_watermark * 100)}%`} /><Setting label={t('settings.private')} value={t(config.private_upstreams ? 'settings.allowed' : 'settings.denied')} tone={config.private_upstreams ? 'orange' : 'green'} /></SettingsPanel>
       <SettingsPanel icon={<IconArchive size={19} />} title={t('imageTools.title')}><Setting label={t('cache.capacity')} value={formatBytes(config.max_export_bytes)} /><Setting label={t('cache.ttl')} value={`${Math.round(config.export_ttl_seconds / 86400)}d`} /><Setting label={t('settings.adminTransport')} value={t(config.admin_external_tls ? 'settings.transportTls' : config.admin_external_loopback ? 'settings.transportLoopback' : 'settings.transportInsecure')} tone={config.admin_external_tls || config.admin_external_loopback ? 'green' : 'orange'} /></SettingsPanel>
       <SettingsPanel icon={<IconLock size={19} />} title={t('settings.dockerConfig')}><Text size="sm" c="dimmed">{t(config.registry_auth_enabled ? 'settings.composeHint' : 'settings.loginNotRequired')}</Text><CodeBlock value={daemon} />{config.registry_auth_enabled && <><Text size="xs" c="dimmed" mt="sm">{t('settings.command')}</Text><CodeBlock value={`docker login ${registryHost}`} /></>}</SettingsPanel>
+      <RuntimeSettingsEditor config={config} />
     </SimpleGrid>
     <SettingsPanel icon={<IconRoute size={19} />} title={t('settings.registryUsageTitle')}>
       <Text size="sm" c="dimmed">{t('settings.registryUsageDescription')}</Text>
@@ -44,6 +46,34 @@ export function SettingsPage() {
       </SimpleGrid>
     </SettingsPanel>
   </Stack>
+}
+
+function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeConfig }) {
+  const { t } = useTranslation()
+  const client = useQueryClient()
+  const form = useForm({ initialValues: {
+    chunk_size: config.chunk_size, chunk_concurrency: config.chunk_concurrency,
+    parallel_threshold: config.parallel_threshold, resumable_threshold: config.resumable_threshold,
+    scheduler_policy: config.scheduler_policy, upstream_timeout_seconds: config.upstream_timeout_seconds,
+    stream_fallback_timeout_seconds: config.stream_fallback_timeout_seconds, max_cache_bytes: config.max_cache_bytes,
+    partial_ttl_seconds: config.partial_ttl_seconds,
+    cache_policy: config.cache_policy, cache_high_watermark: config.cache_high_watermark,
+    cache_low_watermark: config.cache_low_watermark, cache_ttl_seconds: config.cache_ttl_seconds,
+    health_interval_seconds: config.health_interval_seconds,
+  } })
+  const save = useMutation({ mutationFn: () => api.updateRuntime(form.values), onSuccess: () => { void client.invalidateQueries({ queryKey: ['runtime'] }) } })
+  return <SettingsPanel icon={<IconSettings size={19} />} title={t('settings.runtimeTitle')}>
+    <Text size="sm" c="dimmed">{t('settings.runtimeDescription')}</Text>
+    <SimpleGrid cols={{ base: 1, md: 2 }}>
+      <NumberInput label={t('settings.resumableThreshold')} min={1048576} {...form.getInputProps('resumable_threshold')} />
+      <NumberInput label={t('settings.upstreamTimeout')} min={1} max={3600} suffix=" s" {...form.getInputProps('upstream_timeout_seconds')} />
+      <NumberInput label={t('settings.streamFallbackTimeout')} min={1} max={3600} suffix=" s" {...form.getInputProps('stream_fallback_timeout_seconds')} />
+      <NumberInput label={t('cache.ttl')} min={60} max={604800} suffix=" s" {...form.getInputProps('partial_ttl_seconds')} />
+      <NumberInput label={t('settings.healthInterval')} min={1} max={86400} suffix=" s" {...form.getInputProps('health_interval_seconds')} />
+    </SimpleGrid>
+    <Group justify="flex-end"><Button onClick={() => save.mutate()} loading={save.isPending}>{t('common.save')}</Button></Group>
+    {save.isSuccess && <Text size="xs" c="green">{t('settings.runtimeSaved')}</Text>}
+  </SettingsPanel>
 }
 
 function publicRegistryUrl(config: import('../types').RuntimeConfig): string {

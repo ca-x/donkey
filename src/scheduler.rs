@@ -121,11 +121,9 @@ impl Scheduler {
             detected
         };
 
-        let temp = tempfile::Builder::new()
-            .prefix("donkey-")
-            .tempdir_in(self.cache.temp_dir())
-            .map_err(AppError::from)?;
-        let merged = temp.path().join("object.partial");
+        let partial_dir = self.cache.temp_dir().join(key);
+        tokio::fs::create_dir_all(&partial_dir).await?;
+        let merged = partial_dir.join("object.partial");
         let can_parallel = capabilities.supports_range
             && capabilities.size >= self.config.parallel_threshold
             && nodes.len() > 1;
@@ -144,7 +142,7 @@ impl Scheduler {
                     request_path,
                     request_headers,
                     capabilities.size,
-                    temp.path(),
+                    &partial_dir,
                     &merged,
                 )
                 .await
@@ -158,6 +156,20 @@ impl Scheduler {
                 self.download_whole(nodes, request_path, request_headers, &merged)
                     .await?;
             }
+        } else if capabilities.supports_range
+            && capabilities.size >= self.config.resumable_threshold
+            && tokio::fs::metadata(&merged)
+                .await
+                .is_ok_and(|metadata| metadata.len() > 0 && metadata.len() < capabilities.size)
+        {
+            self.download_resume(
+                nodes,
+                request_path,
+                request_headers,
+                capabilities.size,
+                &merged,
+            )
+            .await?;
         } else {
             self.download_whole(nodes, request_path, request_headers, &merged)
                 .await?;
@@ -171,14 +183,76 @@ impl Scheduler {
             verify_file(&merged, digest).await?;
         }
 
-        self.cache
+        let result = self
+            .cache
             .admit(
                 key,
                 &merged,
                 &capabilities.media_type,
                 expected_digest.map(str::to_owned),
             )
-            .await
+            .await;
+        if result.is_ok() {
+            let _ = tokio::fs::remove_dir_all(&partial_dir).await;
+        }
+        result
+    }
+
+    async fn download_resume(
+        &self,
+        nodes: &[NodeView],
+        request_path: &str,
+        request_headers: &HeaderMap,
+        total_size: u64,
+        destination: &Path,
+    ) -> ApiResult<()> {
+        let mut last_error = None;
+        for node in self.ordered_nodes(nodes, 0) {
+            let offset = tokio::fs::metadata(destination).await?.len();
+            if offset >= total_size {
+                return Ok(());
+            }
+            let lease = self.acquire(node.node.id);
+            let started = Instant::now();
+            let result = async {
+                let response = self
+                    .upstream
+                    .send(
+                        node,
+                        http::Method::GET,
+                        request_path,
+                        request_headers,
+                        RangeMode::Exact(offset, total_size - 1),
+                    )
+                    .await?;
+                if response.status() != StatusCode::PARTIAL_CONTENT
+                    || !content_range_matches(
+                        response.headers(),
+                        offset,
+                        total_size - 1,
+                        total_size,
+                    )
+                {
+                    return Err(AppError::Integrity);
+                }
+                append_response_to_file(response, destination, total_size - offset).await
+            }
+            .await;
+            let bytes = tokio::fs::metadata(destination)
+                .await
+                .map(|m| m.len().saturating_sub(offset))
+                .unwrap_or(0);
+            self.observe_speed(node.node.id, bytes, started.elapsed(), result.is_ok());
+            drop(lease);
+            self.nodes
+                .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
+                .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed resume".into())))
     }
 
     async fn detect_capabilities(
@@ -255,6 +329,12 @@ impl Scheduler {
                 let request_headers = request_headers.clone();
                 let part_path = temp_dir.join(format!("{:08}.part", chunk.index));
                 async move {
+                    if tokio::fs::metadata(&part_path)
+                        .await
+                        .is_ok_and(|metadata| metadata.len() == chunk.end - chunk.start + 1)
+                    {
+                        return Ok((chunk.index, part_path));
+                    }
                     scheduler
                         .download_chunk(&nodes, &request_path, &request_headers, &chunk, &part_path)
                         .await
@@ -293,6 +373,19 @@ impl Scheduler {
             let lease = self.acquire(node.node.id);
             let started = Instant::now();
             let result = async {
+                let existing = tokio::fs::metadata(destination)
+                    .await
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                let chunk_size = chunk.end - chunk.start + 1;
+                if existing > chunk_size {
+                    let _ = tokio::fs::remove_file(destination).await;
+                    return Err(AppError::Integrity);
+                }
+                let start = chunk.start + existing;
+                if start > chunk.end {
+                    return Ok(());
+                }
                 let response = self
                     .upstream
                     .send(
@@ -300,7 +393,7 @@ impl Scheduler {
                         http::Method::GET,
                         request_path,
                         request_headers,
-                        RangeMode::Exact(chunk.start, chunk.end),
+                        RangeMode::Exact(start, chunk.end),
                     )
                     .await?;
                 if response.status() != StatusCode::PARTIAL_CONTENT {
@@ -310,19 +403,18 @@ impl Scheduler {
                         response.status()
                     )));
                 }
-                let expected = chunk.end - chunk.start + 1;
+                let expected = chunk.end - start + 1;
                 if response.content_length() != Some(expected) {
                     return Err(AppError::Integrity);
                 }
-                if !content_range_matches(
-                    response.headers(),
-                    chunk.start,
-                    chunk.end,
-                    chunk.total_size,
-                ) {
+                if !content_range_matches(response.headers(), start, chunk.end, chunk.total_size) {
                     return Err(AppError::Integrity);
                 }
-                stream_response_to_file(response, destination, Some(expected)).await
+                if existing > 0 {
+                    append_response_to_file(response, destination, expected).await
+                } else {
+                    stream_response_to_file(response, destination, Some(expected)).await
+                }
             }
             .await;
             self.observe_speed(
@@ -393,7 +485,12 @@ impl Scheduler {
             match result {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    let _ = tokio::fs::remove_file(destination).await;
+                    // Keep a transport-truncated file for a future request to
+                    // resume. Integrity failures are unsafe to resume and
+                    // must start from a clean file.
+                    if matches!(&error, AppError::Integrity) {
+                        let _ = tokio::fs::remove_file(destination).await;
+                    }
                     last_error = Some(error);
                 }
             }
@@ -589,6 +686,32 @@ async fn stream_response_to_file(
     }
     file.flush().await?;
     if expected.is_some_and(|value| value != received) {
+        return Err(AppError::Integrity);
+    }
+    Ok(())
+}
+
+async fn append_response_to_file(
+    response: reqwest::Response,
+    destination: &Path,
+    expected: u64,
+) -> ApiResult<()> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(destination)
+        .await?;
+    let mut received = 0_u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| AppError::Upstream(error.to_string()))?;
+        received = received.saturating_add(chunk.len() as u64);
+        if received > expected {
+            return Err(AppError::Integrity);
+        }
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    if received != expected {
         return Err(AppError::Integrity);
     }
     Ok(())

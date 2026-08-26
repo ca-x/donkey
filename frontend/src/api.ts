@@ -95,6 +95,7 @@ export const api = {
   convert: (url: string) =>
     request<ConvertOutput>('/domainfold/convert', { method: 'POST', body: json({ url }) }),
   runtime: () => request<RuntimeConfig>('/runtime'),
+  updateRuntime: (input: Omit<RuntimeConfig, 'admin_addr' | 'registry_addr' | 'tls_enabled' | 'private_upstreams' | 'cache_used_bytes' | 'cache_entries' | 'max_export_bytes' | 'export_ttl_seconds' | 'admin_external_tls' | 'admin_external_loopback' | 'registry_external_tls' | 'registry_auth_enabled'>) => request<RuntimeConfig>('/runtime', { method: 'PUT', body: json(input) }),
   imageCredentials: () => request<RegistryCredential[]>('/image-tools/credentials'),
   createImageCredential: (input: { name: string; registry: string; auth_mode: string; username: string | null; secret: string }) => request<RegistryCredential>('/image-tools/credentials', { method: 'POST', body: json(input) }),
   updateImageCredential: (id: string, input: { name: string; registry: string; auth_mode: string; username: string | null; secret: string }) => request<RegistryCredential>(`/image-tools/credentials/${id}`, { method: 'PUT', body: json(input) }),

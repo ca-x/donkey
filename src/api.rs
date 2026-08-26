@@ -37,7 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/mappings", get(list_mappings).post(create_mapping))
         .route("/mappings/{id}", put(update_mapping).delete(delete_mapping))
         .route("/domainfold/convert", post(convert_url))
-        .route("/runtime", get(runtime))
+        .route("/runtime", get(runtime).put(update_runtime))
 }
 
 #[derive(Serialize)]
@@ -60,11 +60,14 @@ struct Dashboard {
     cache_bytes: u64,
     cache_hits: u64,
     healthy_nodes: usize,
+    registry_requests: u64,
+    registry_bytes: u64,
 }
 
 async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> {
     let nodes = state.nodes.list().await?;
     let cache = state.cache.stats().await?;
+    let (registry_requests, registry_bytes) = state.traffic.snapshot();
     Ok(Json(Dashboard {
         healthy_nodes: nodes
             .iter()
@@ -74,6 +77,8 @@ async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> 
         cache_bytes: cache.bytes,
         cache_hits: cache.hits,
         nodes,
+        registry_requests,
+        registry_bytes,
     }))
 }
 
@@ -221,6 +226,11 @@ struct RuntimeConfig {
     chunk_size: u64,
     chunk_concurrency: usize,
     parallel_threshold: u64,
+    resumable_threshold: u64,
+    upstream_timeout_seconds: u64,
+    stream_fallback_timeout_seconds: u64,
+    partial_ttl_seconds: u64,
+    health_interval_seconds: u64,
     scheduler_policy: String,
     max_cache_bytes: u64,
     cache_used_bytes: u64,
@@ -239,27 +249,142 @@ struct RuntimeConfig {
 
 async fn runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeConfig>> {
     let cache = state.cache.stats().await?;
-    Ok(Json(RuntimeConfig {
-        admin_addr: state.config.admin_addr.to_string(),
-        registry_addr: state.config.registry_addr.to_string(),
-        tls_enabled: state.config.tls_cert.is_some(),
-        private_upstreams: state.config.allow_private_upstreams,
-        chunk_size: state.config.chunk_size,
-        chunk_concurrency: state.config.chunk_concurrency,
-        parallel_threshold: state.config.parallel_threshold,
-        scheduler_policy: state.config.scheduler_policy.to_string(),
-        max_cache_bytes: state.config.max_cache_bytes,
+    Ok(Json(runtime_config(
+        &effective_config(&state).await?,
+        cache,
+    )))
+}
+
+#[derive(Deserialize)]
+struct RuntimeSettingsInput {
+    chunk_size: u64,
+    chunk_concurrency: usize,
+    parallel_threshold: u64,
+    resumable_threshold: u64,
+    scheduler_policy: String,
+    upstream_timeout_seconds: u64,
+    stream_fallback_timeout_seconds: u64,
+    partial_ttl_seconds: u64,
+    max_cache_bytes: u64,
+    cache_policy: String,
+    cache_high_watermark: f64,
+    cache_low_watermark: f64,
+    cache_ttl_seconds: Option<u64>,
+    health_interval_seconds: u64,
+}
+
+async fn update_runtime(
+    State(state): State<AppState>,
+    Json(input): Json<RuntimeSettingsInput>,
+) -> ApiResult<Json<RuntimeConfig>> {
+    if !(256 * 1024..=32 * 1024 * 1024).contains(&input.chunk_size)
+        || !(1..=64).contains(&input.chunk_concurrency)
+        || !(1024 * 1024..=u64::MAX).contains(&input.parallel_threshold)
+        || !(1024 * 1024..=u64::MAX).contains(&input.resumable_threshold)
+        || !(1..=3600).contains(&input.upstream_timeout_seconds)
+        || !(1..=3600).contains(&input.stream_fallback_timeout_seconds)
+        || !(60..=7 * 24 * 3600).contains(&input.partial_ttl_seconds)
+        || !(64 * 1024 * 1024..=u64::MAX).contains(&input.max_cache_bytes)
+        || !(0.5..=1.0).contains(&input.cache_high_watermark)
+        || !(0.1..=0.99).contains(&input.cache_low_watermark)
+        || input.cache_low_watermark >= input.cache_high_watermark
+        || !(1..=86400).contains(&input.health_interval_seconds)
+    {
+        return Err(crate::error::AppError::bad_request(
+            "runtime settings are out of range",
+        ));
+    }
+    if !matches!(input.scheduler_policy.as_str(), "balanced" | "speed-first")
+        || !matches!(input.cache_policy.as_str(), "balanced" | "lru" | "lfu")
+    {
+        return Err(crate::error::AppError::bad_request(
+            "runtime settings contain an invalid policy",
+        ));
+    }
+    let values = vec![
+        ("chunk_size", input.chunk_size.to_string()),
+        ("chunk_concurrency", input.chunk_concurrency.to_string()),
+        ("parallel_threshold", input.parallel_threshold.to_string()),
+        ("resumable_threshold", input.resumable_threshold.to_string()),
+        ("scheduler_policy", input.scheduler_policy),
+        (
+            "upstream_timeout_seconds",
+            input.upstream_timeout_seconds.to_string(),
+        ),
+        (
+            "stream_fallback_timeout_seconds",
+            input.stream_fallback_timeout_seconds.to_string(),
+        ),
+        ("partial_ttl_seconds", input.partial_ttl_seconds.to_string()),
+        ("max_cache_bytes", input.max_cache_bytes.to_string()),
+        ("cache_policy", input.cache_policy),
+        (
+            "cache_high_watermark",
+            input.cache_high_watermark.to_string(),
+        ),
+        ("cache_low_watermark", input.cache_low_watermark.to_string()),
+        (
+            "cache_ttl_seconds",
+            input.cache_ttl_seconds.unwrap_or(0).to_string(),
+        ),
+        (
+            "health_interval_seconds",
+            input.health_interval_seconds.to_string(),
+        ),
+    ];
+    let values = values
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect::<Vec<_>>();
+    db::replace_runtime_settings(&state.db, &values).await?;
+    let cache = state.cache.stats().await?;
+    Ok(Json(runtime_config(
+        &effective_config(&state).await?,
+        cache,
+    )))
+}
+
+async fn effective_config(
+    state: &AppState,
+) -> Result<crate::config::Config, crate::error::AppError> {
+    let mut config = (*state.config).clone();
+    let persisted = db::load_runtime_settings(&state.db).await?;
+    config
+        .apply_runtime_overrides(&persisted)
+        .map_err(crate::error::AppError::Internal)?;
+    Ok(config)
+}
+
+fn runtime_config(
+    config: &crate::config::Config,
+    cache: crate::cache::CacheStats,
+) -> RuntimeConfig {
+    RuntimeConfig {
+        admin_addr: config.admin_addr.to_string(),
+        registry_addr: config.registry_addr.to_string(),
+        tls_enabled: config.tls_cert.is_some(),
+        private_upstreams: config.allow_private_upstreams,
+        chunk_size: config.chunk_size,
+        chunk_concurrency: config.chunk_concurrency,
+        parallel_threshold: config.parallel_threshold,
+        resumable_threshold: config.resumable_threshold,
+        upstream_timeout_seconds: config.upstream_timeout.as_secs(),
+        stream_fallback_timeout_seconds: config.stream_fallback_timeout.as_secs(),
+        partial_ttl_seconds: config.partial_ttl.as_secs(),
+        health_interval_seconds: config.health_interval.as_secs(),
+        scheduler_policy: config.scheduler_policy.to_string(),
+        max_cache_bytes: config.max_cache_bytes,
         cache_used_bytes: cache.bytes,
         cache_entries: cache.entries,
-        cache_policy: state.config.cache_policy.to_string(),
-        cache_high_watermark: state.config.cache_high_watermark,
-        cache_low_watermark: state.config.cache_low_watermark,
-        cache_ttl_seconds: state.config.cache_ttl.map(|value| value.as_secs()),
-        max_export_bytes: state.config.max_export_bytes,
-        export_ttl_seconds: state.config.export_ttl.as_secs(),
-        admin_external_tls: state.config.admin_external_tls,
-        admin_external_loopback: state.config.admin_external_loopback,
-        registry_external_tls: state.config.registry_external_tls,
-        registry_auth_enabled: state.config.registry_auth.is_some(),
-    }))
+        cache_policy: config.cache_policy.to_string(),
+        cache_high_watermark: config.cache_high_watermark,
+        cache_low_watermark: config.cache_low_watermark,
+        cache_ttl_seconds: config.cache_ttl.map(|value| value.as_secs()),
+        max_export_bytes: config.max_export_bytes,
+        export_ttl_seconds: config.export_ttl.as_secs(),
+        admin_external_tls: config.admin_external_tls,
+        admin_external_loopback: config.admin_external_loopback,
+        registry_external_tls: config.registry_external_tls,
+        registry_auth_enabled: config.registry_auth.is_some(),
+    }
 }

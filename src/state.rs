@@ -18,12 +18,20 @@ pub struct AppState {
     pub upstream: crate::upstream::UpstreamService,
     pub scheduler: Scheduler,
     pub image_tools: crate::image_tools::ImageTools,
+    pub traffic: crate::traffic::TrafficMetrics,
 }
 
 impl AppState {
     pub async fn new(config: Config) -> Result<Self, AppError> {
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let db = crate::db::connect(&config.database_url).await?;
+        let mut config = config;
+        let persisted = crate::db::load_runtime_settings(&db)
+            .await
+            .map_err(AppError::from)?;
+        config
+            .apply_runtime_overrides(&persisted)
+            .map_err(AppError::Internal)?;
         let config = Arc::new(config);
         if config.registry_auth_value().is_none() && crate::db::has_authenticated_nodes(&db).await?
         {
@@ -44,6 +52,7 @@ impl AppState {
         );
         let image_tools =
             crate::image_tools::ImageTools::new(config.clone(), db.clone(), nodes.clone()).await?;
+        let traffic = crate::traffic::TrafficMetrics::default();
         Ok(Self {
             config,
             db,
@@ -54,6 +63,7 @@ impl AppState {
             upstream,
             scheduler,
             image_tools,
+            traffic,
         })
     }
 }

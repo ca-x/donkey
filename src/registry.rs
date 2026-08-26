@@ -4,7 +4,10 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
@@ -17,10 +20,19 @@ use crate::{
 };
 
 pub async fn handle(State(state): State<AppState>, request: Request) -> Response {
-    match handle_inner(state, request).await {
+    let count_traffic = request.uri().path().starts_with("/v2");
+    let traffic = state.traffic.clone();
+    if count_traffic {
+        traffic.record_request();
+    }
+    let response = match handle_inner(state, request).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
+    };
+    if count_traffic {
+        traffic.record_response(&response);
     }
+    response
 }
 
 async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> {
@@ -32,6 +44,18 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
             Ok(response) => Ok(response),
             Err(_) => Err(AppError::not_found("route")),
         };
+    }
+    // Docker Engine probes this endpoint before using a registry mirror.  It
+    // is a local capability check and must not depend on an upstream node;
+    // otherwise a slow/unavailable source makes Docker fall back to a direct
+    // Docker Hub connection.
+    if matches!(request.uri().path(), "/v2" | "/v2/") {
+        let mut response = StatusCode::OK.into_response();
+        response.headers_mut().insert(
+            "docker-distribution-api-version",
+            header::HeaderValue::from_static("registry/2.0"),
+        );
+        return Ok(response);
     }
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
         return Ok((
@@ -74,16 +98,145 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
                 return serve_cached(&state.cache, object, request).await;
             }
         } else {
-            let object = state
-                .scheduler
-                .fetch_blob(&upstream_path, request.headers(), digest, nodes)
-                .await?;
-            return serve_cached(&state.cache, object, request).await;
+            // Keep the verified/cache-aware path for normal-sized blobs. If
+            // it cannot produce a response promptly (large/slow layers),
+            // switch to a streaming retry so Docker receives headers quickly.
+            match tokio::time::timeout(
+                state.config.stream_fallback_timeout,
+                state.scheduler.fetch_blob(
+                    &upstream_path,
+                    request.headers(),
+                    digest,
+                    nodes.clone(),
+                ),
+            )
+            .await
+            {
+                Ok(result) => {
+                    let object = result?;
+                    return serve_cached(&state.cache, object, request).await;
+                }
+                Err(_) => {
+                    return stream_blob(
+                        &state,
+                        &upstream_path,
+                        request.headers().clone(),
+                        digest,
+                        nodes,
+                    )
+                    .await;
+                }
+            }
         }
     }
     let method = request.method().clone();
     let headers = request.headers().clone();
     proxy_passthrough(&state, method, upstream_path, headers, nodes).await
+}
+
+async fn stream_blob(
+    state: &AppState,
+    path: &str,
+    headers: HeaderMap,
+    expected_digest: Option<&str>,
+    nodes: Vec<crate::nodes::NodeView>,
+) -> ApiResult<Response> {
+    let mut last_error = None;
+    for node in nodes {
+        let upstream = match state
+            .upstream
+            .send(
+                &node,
+                Method::GET,
+                path,
+                &headers,
+                crate::upstream::RangeMode::ForwardClient,
+            )
+            .await
+        {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                last_error = Some(AppError::Upstream(format!(
+                    "{} returned {}",
+                    node.node.name,
+                    response.status()
+                )));
+                continue;
+            }
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+
+        let response_headers = upstream.headers().clone();
+        let media_type = response_headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let cache = state.cache.clone();
+        let key = CacheStore::key(
+            path,
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+        );
+        let expected = expected_digest.map(str::to_owned);
+        let temp_dir = cache.temp_dir();
+        tokio::spawn(async move {
+            let temp = match tempfile::Builder::new()
+                .prefix("donkey-stream-")
+                .tempdir_in(temp_dir)
+            {
+                Ok(temp) => temp,
+                Err(_) => return,
+            };
+            let partial = temp.path().join("object.partial");
+            let mut file = match tokio::fs::File::create(&partial).await {
+                Ok(file) => file,
+                Err(_) => return,
+            };
+            let mut hasher = Sha256::new();
+            let mut body = upstream.bytes_stream();
+            while let Some(chunk) = body.next().await {
+                let Ok(chunk) = chunk else { return };
+                hasher.update(&chunk);
+                if file.write_all(&chunk).await.is_err() || tx.send(chunk).await.is_err() {
+                    return;
+                }
+            }
+            if let Some(expected) = expected.as_deref() {
+                let actual = format!("sha256:{:x}", hasher.finalize());
+                if actual != expected {
+                    return;
+                }
+            }
+            let _ = file.flush().await;
+            if cache
+                .admit(&key, &partial, &media_type, expected)
+                .await
+                .is_ok()
+            {
+                let _ = tokio::fs::remove_dir_all(cache.temp_dir().join(&key)).await;
+            }
+        });
+
+        let body = futures_util::stream::unfold(rx, |mut rx| async {
+            rx.recv()
+                .await
+                .map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), rx))
+        });
+        let mut response = Response::new(Body::from_stream(body));
+        copy_response_headers(&response_headers, response.headers_mut());
+        response.headers_mut().insert(
+            "docker-distribution-api-version",
+            header::HeaderValue::from_static("registry/2.0"),
+        );
+        return Ok(response);
+    }
+    Err(last_error.unwrap_or_else(|| AppError::unavailable("all upstream nodes failed")))
 }
 
 async fn serve_cached(
@@ -180,7 +333,7 @@ async fn proxy_passthrough(
                     crate::upstream::RangeMode::ForwardClient,
                 )
                 .await?;
-            if upstream_response.status().is_server_error() {
+            if retryable_upstream_status(upstream_response.status()) {
                 return Err(AppError::Upstream(format!(
                     "{} returned {}",
                     node.node.name,
@@ -196,6 +349,17 @@ async fn proxy_passthrough(
         }
     }
     Err(last_error.unwrap_or_else(|| AppError::unavailable("Registry route is unavailable")))
+}
+
+/// Statuses that indicate a transient upstream failure and should trigger a
+/// retry on the next configured node. Client errors such as 401/403/404 are
+/// returned as-is because another mirror is unlikely to change authorization
+/// or repository existence.
+fn retryable_upstream_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+    ) || status.is_server_error()
 }
 
 #[derive(Debug)]

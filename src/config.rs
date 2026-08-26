@@ -34,8 +34,11 @@ pub struct Config {
     pub chunk_size: u64,
     pub chunk_concurrency: usize,
     pub parallel_threshold: u64,
+    pub resumable_threshold: u64,
     pub scheduler_policy: SchedulerPolicy,
     pub upstream_timeout: Duration,
+    pub stream_fallback_timeout: Duration,
+    pub partial_ttl: Duration,
     pub health_interval: Duration,
     pub max_cache_bytes: u64,
     pub cache_policy: CachePolicy,
@@ -174,8 +177,16 @@ impl Config {
                 1024 * 1024,
                 1024 * 1024 * 1024,
             )?,
+            resumable_threshold: u64_env(
+                "DONKEY_RESUMABLE_THRESHOLD",
+                8 * 1024 * 1024,
+                1024 * 1024,
+                u64::MAX,
+            )?,
             scheduler_policy: scheduler_policy_env()?,
             upstream_timeout: duration_env("DONKEY_UPSTREAM_TIMEOUT", "30s")?,
+            stream_fallback_timeout: duration_env("DONKEY_STREAM_FALLBACK_TIMEOUT", "10s")?,
+            partial_ttl: duration_env("DONKEY_PARTIAL_TTL", "1h")?,
             health_interval: duration_env("DONKEY_HEALTH_INTERVAL", "60s")?,
             max_cache_bytes: u64_env(
                 "DONKEY_MAX_CACHE_BYTES",
@@ -240,8 +251,11 @@ impl Config {
             chunk_size: 512 * 1024,
             chunk_concurrency: 4,
             parallel_threshold: 1024 * 1024,
+            resumable_threshold: 8 * 1024 * 1024,
             scheduler_policy: SchedulerPolicy::Balanced,
             upstream_timeout: Duration::from_secs(5),
+            stream_fallback_timeout: Duration::from_secs(10),
+            partial_ttl: Duration::from_secs(3600),
             health_interval: Duration::from_secs(60),
             max_cache_bytes: 1024 * 1024 * 1024,
             cache_policy: CachePolicy::Balanced,
@@ -251,6 +265,61 @@ impl Config {
             max_export_bytes: 1024 * 1024 * 1024,
             export_ttl: Duration::from_secs(7 * 24 * 60 * 60),
         }
+    }
+
+    /// Apply values persisted by the admin settings API. Environment values
+    /// remain the initial defaults; persisted values win on subsequent starts.
+    pub fn apply_runtime_overrides(
+        &mut self,
+        settings: &[crate::db::RuntimeSetting],
+    ) -> anyhow::Result<()> {
+        for setting in settings {
+            match setting.key.as_str() {
+                "chunk_size" => self.chunk_size = setting.value.parse()?,
+                "chunk_concurrency" => self.chunk_concurrency = setting.value.parse()?,
+                "parallel_threshold" => self.parallel_threshold = setting.value.parse()?,
+                "resumable_threshold" => self.resumable_threshold = setting.value.parse()?,
+                "scheduler_policy" => {
+                    self.scheduler_policy = match setting.value.as_str() {
+                        "balanced" => SchedulerPolicy::Balanced,
+                        "speed-first" => SchedulerPolicy::SpeedFirst,
+                        _ => anyhow::bail!("invalid persisted scheduler_policy"),
+                    }
+                }
+                "upstream_timeout_seconds" => {
+                    self.upstream_timeout = Duration::from_secs(setting.value.parse()?)
+                }
+                "stream_fallback_timeout_seconds" => {
+                    self.stream_fallback_timeout = Duration::from_secs(setting.value.parse()?)
+                }
+                "partial_ttl_seconds" => {
+                    self.partial_ttl = Duration::from_secs(setting.value.parse()?)
+                }
+                "max_cache_bytes" => self.max_cache_bytes = setting.value.parse()?,
+                "cache_policy" => {
+                    self.cache_policy = match setting.value.as_str() {
+                        "balanced" => CachePolicy::Balanced,
+                        "lru" => CachePolicy::Lru,
+                        "lfu" => CachePolicy::Lfu,
+                        _ => anyhow::bail!("invalid persisted cache_policy"),
+                    }
+                }
+                "cache_high_watermark" => self.cache_high_watermark = setting.value.parse()?,
+                "cache_low_watermark" => self.cache_low_watermark = setting.value.parse()?,
+                "cache_ttl_seconds" => {
+                    let seconds: u64 = setting.value.parse()?;
+                    self.cache_ttl = (seconds > 0).then(|| Duration::from_secs(seconds));
+                }
+                "health_interval_seconds" => {
+                    self.health_interval = Duration::from_secs(setting.value.parse()?)
+                }
+                _ => {}
+            }
+        }
+        if self.cache_low_watermark >= self.cache_high_watermark {
+            anyhow::bail!("persisted cache watermarks are invalid")
+        }
+        Ok(())
     }
 
     pub fn admin_auth_value(&self) -> Option<&str> {
@@ -447,7 +516,8 @@ fn parse_remaps(raw: &str) -> anyhow::Result<Vec<ConnectRemap>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_remaps;
+    use super::{Config, parse_remaps};
+    use std::path::PathBuf;
 
     #[test]
     fn parses_connect_remaps() {
@@ -459,5 +529,24 @@ mod tests {
     #[test]
     fn rejects_ambiguous_remaps() {
         assert!(parse_remaps("registry.example").is_err());
+    }
+
+    #[test]
+    fn persisted_runtime_settings_override_environment_defaults() {
+        let mut config = Config::for_test(PathBuf::from("./target/config-test"));
+        config
+            .apply_runtime_overrides(&[
+                crate::db::RuntimeSetting {
+                    key: "resumable_threshold".into(),
+                    value: "4194304".into(),
+                },
+                crate::db::RuntimeSetting {
+                    key: "stream_fallback_timeout_seconds".into(),
+                    value: "22".into(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(config.resumable_threshold, 4 * 1024 * 1024);
+        assert_eq!(config.stream_fallback_timeout.as_secs(), 22);
     }
 }

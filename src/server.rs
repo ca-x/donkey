@@ -223,7 +223,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
     }
 
@@ -329,7 +329,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(authenticated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(authenticated.status(), StatusCode::OK);
     }
 
     #[tokio::test]

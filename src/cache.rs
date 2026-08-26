@@ -81,6 +81,7 @@ impl CacheStore {
         let root = config.data_dir.join("cache");
         tokio::fs::create_dir_all(root.join("objects")).await?;
         tokio::fs::create_dir_all(root.join("tmp")).await?;
+        cleanup_partial_files(&root.join("tmp"), config.partial_ttl).await;
         Ok(Self {
             root: Arc::new(root),
             db,
@@ -309,6 +310,30 @@ impl CacheStore {
             ));
         }
         Ok(())
+    }
+}
+
+async fn cleanup_partial_files(root: &std::path::Path, ttl: std::time::Duration) {
+    let Ok(mut entries) = tokio::fs::read_dir(root).await else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(ttl)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        if metadata.is_dir() {
+            let stale = metadata
+                .modified()
+                .ok()
+                .is_some_and(|modified| modified < cutoff);
+            if stale {
+                let _ = tokio::fs::remove_dir_all(path).await;
+            }
+        }
     }
 }
 
