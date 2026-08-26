@@ -29,7 +29,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
     stream_fallback_timeout_seconds: config.stream_fallback_timeout_seconds, max_cache_bytes: config.max_cache_bytes,
     partial_ttl_seconds: config.partial_ttl_seconds,
     cache_policy: config.cache_policy, cache_high_watermark: config.cache_high_watermark,
-    cache_low_watermark: config.cache_low_watermark, cache_ttl_seconds: config.cache_ttl_seconds,
+    cache_low_watermark: config.cache_low_watermark, cache_ttl_seconds: config.cache_ttl_seconds ?? 0,
     health_interval_seconds: config.health_interval_seconds,
   } })
   const save = useMutation({ mutationFn: () => api.updateRuntime(form.values), onSuccess: () => { void client.invalidateQueries({ queryKey: ['runtime'] }) } })
@@ -39,11 +39,11 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
       <UnitInput label={t('settings.chunk')} value={form.values.chunk_size} onChange={(value) => form.setFieldValue('chunk_size', value)} />
       <NumberInput label={t('settings.concurrency')} min={1} max={64} {...form.getInputProps('chunk_concurrency')} />
       <UnitInput label={t('settings.threshold')} value={form.values.parallel_threshold} onChange={(value) => form.setFieldValue('parallel_threshold', value)} />
-      <NumberInput label={t('settings.resumableThreshold')} min={1048576} {...form.getInputProps('resumable_threshold')} />
+      <UnitInput label={t('settings.resumableThreshold')} value={form.values.resumable_threshold} onChange={(value) => form.setFieldValue('resumable_threshold', value)} />
       <Select label={t('settings.schedulerPolicy')} data={[{ value: 'balanced', label: t('settings.balancedPolicy') }, { value: 'speed-first', label: t('settings.speedFirstPolicy') }]} {...form.getInputProps('scheduler_policy')} />
       <NumberInput label={t('settings.upstreamTimeout')} min={1} max={3600} suffix=" s" {...form.getInputProps('upstream_timeout_seconds')} />
       <NumberInput label={t('settings.streamFallbackTimeout')} min={1} max={3600} suffix=" s" {...form.getInputProps('stream_fallback_timeout_seconds')} />
-      <NumberInput label={t('cache.ttl')} min={60} max={604800} suffix=" s" {...form.getInputProps('partial_ttl_seconds')} />
+      <NumberInput label={t('settings.partialTtl')} min={60} max={604800} suffix=" s" {...form.getInputProps('partial_ttl_seconds')} />
       <NumberInput label={t('settings.healthInterval')} min={1} max={86400} suffix=" s" {...form.getInputProps('health_interval_seconds')} />
       <UnitInput label={t('cache.capacity')} value={form.values.max_cache_bytes} onChange={(value) => form.setFieldValue('max_cache_bytes', value)} />
       <Select label={t('cache.policy')} data={[{ value: 'balanced', label: t('cache.balanced') }, { value: 'lru', label: t('cache.lru') }, { value: 'lfu', label: t('cache.lfu') }]} {...form.getInputProps('cache_policy')} />
