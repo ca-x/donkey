@@ -58,7 +58,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
 
 function UnitInput({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {
   const units = [{ label: 'KB', multiplier: 1024 }, { label: 'MB', multiplier: 1024 ** 2 }, { label: 'GB', multiplier: 1024 ** 3 }]
-  const selected = units.reduce((best, unit) => Math.abs(value / unit.multiplier - 1) < Math.abs(value / best.multiplier - 1) ? unit : best, units[0]!)
+  const selected = [...units].reverse().find((unit) => value >= unit.multiplier) ?? units[0]!
   return <Group align="flex-end" gap="xs" wrap="nowrap"><NumberInput label={label} min={1} value={Math.max(1, Math.round(value / selected!.multiplier))} onChange={(next) => { const numeric = typeof next === 'number' ? next : Number(next); if (Number.isFinite(numeric)) onChange(Math.round(numeric * selected!.multiplier)) }} style={{ flex: 1 }} /><Select aria-label={`${label} unit`} data={units.map((unit) => unit.label)} value={selected!.label} onChange={(next) => { const unit = units.find((item) => item.label === next) ?? selected!; onChange(Math.round((value / selected!.multiplier) * unit.multiplier)) }} w={84} /></Group>
 }
 
