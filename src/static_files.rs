@@ -44,7 +44,7 @@ pub async fn serve(request: Request) -> Response {
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static(if served_index {
-            "no-cache"
+            "no-store, no-cache, max-age=0, must-revalidate"
         } else {
             "public, max-age=31536000, immutable"
         }),
@@ -81,7 +81,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-cache"
+            "no-store, no-cache, max-age=0, must-revalidate"
         );
     }
 }
