@@ -199,6 +199,12 @@ irm https://donkey.example.com/helper.win | iex
 
 管理界面的「设置与部署」会显示替换成实际域名后的 Linux、macOS、Windows 和临时拉取命令。动态脚本不包含用户名、密码或 Token。
 
+一键脚本只配置 Docker Hub 的 `registry-mirrors`，不会把 `ghcr.io`、Quay 等任意 Registry 地址自动改写，也不会安装 Docker 或保存 Registry 凭据。Linux 需要 root，macOS / Windows 需要 Docker Desktop。非 Docker Hub 镜像请使用 Donkey 命名空间：
+
+```bash
+docker pull donkey.example.com/ghcr/owner/image:tag
+```
+
 也可以直接使用 GitHub 上的通用脚本并显式传入地址：
 
 Linux：

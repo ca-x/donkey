@@ -147,6 +147,7 @@ export interface RuntimeConfig {
   admin_external_tls: boolean
   admin_external_loopback: boolean
   registry_external_tls: boolean
+  registry_auth_enabled: boolean
 }
 
 export interface ConvertOutput {

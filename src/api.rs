@@ -234,6 +234,7 @@ struct RuntimeConfig {
     admin_external_tls: bool,
     admin_external_loopback: bool,
     registry_external_tls: bool,
+    registry_auth_enabled: bool,
 }
 
 async fn runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeConfig>> {
@@ -259,5 +260,6 @@ async fn runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeConfig>
         admin_external_tls: state.config.admin_external_tls,
         admin_external_loopback: state.config.admin_external_loopback,
         registry_external_tls: state.config.registry_external_tls,
+        registry_auth_enabled: state.config.registry_auth.is_some(),
     }))
 }

@@ -24,10 +24,18 @@ export function SettingsPage() {
       <SettingsPanel icon={<IconSettings size={19} />} title={t('settings.scheduler')}><Setting label={t('settings.schedulerPolicy')} value={t(config.scheduler_policy === 'speed-first' ? 'settings.speedFirstPolicy' : 'settings.balancedPolicy')} /><Setting label={t('settings.chunk')} value={formatBytes(config.chunk_size)} /><Setting label={t('settings.concurrency')} value={`${config.chunk_concurrency}`} /><Setting label={t('settings.threshold')} value={formatBytes(config.parallel_threshold)} /></SettingsPanel>
       <SettingsPanel icon={<IconShieldCheck size={19} />} title={t('settings.cache')}><Setting label={t('cache.capacity')} value={formatBytes(config.max_cache_bytes)} /><Setting label={t('cache.policy')} value={t(`cache.${config.cache_policy}`)} /><Setting label={t('cache.watermarks')} value={`${Math.round(config.cache_high_watermark * 100)}% → ${Math.round(config.cache_low_watermark * 100)}%`} /><Setting label={t('settings.private')} value={t(config.private_upstreams ? 'settings.allowed' : 'settings.denied')} tone={config.private_upstreams ? 'orange' : 'green'} /></SettingsPanel>
       <SettingsPanel icon={<IconArchive size={19} />} title={t('imageTools.title')}><Setting label={t('cache.capacity')} value={formatBytes(config.max_export_bytes)} /><Setting label={t('cache.ttl')} value={`${Math.round(config.export_ttl_seconds / 86400)}d`} /><Setting label={t('settings.adminTransport')} value={t(config.admin_external_tls ? 'settings.transportTls' : config.admin_external_loopback ? 'settings.transportLoopback' : 'settings.transportInsecure')} tone={config.admin_external_tls || config.admin_external_loopback ? 'green' : 'orange'} /></SettingsPanel>
-      <SettingsPanel icon={<IconLock size={19} />} title={t('settings.dockerConfig')}><Text size="sm" c="dimmed">{t('settings.composeHint')}</Text><CodeBlock value={daemon} /><Text size="xs" c="dimmed" mt="sm">{t('settings.command')}</Text><CodeBlock value={`docker login ${registryHost}`} /></SettingsPanel>
+      <SettingsPanel icon={<IconLock size={19} />} title={t('settings.dockerConfig')}><Text size="sm" c="dimmed">{t(config.registry_auth_enabled ? 'settings.composeHint' : 'settings.loginNotRequired')}</Text><CodeBlock value={daemon} />{config.registry_auth_enabled && <><Text size="xs" c="dimmed" mt="sm">{t('settings.command')}</Text><CodeBlock value={`docker login ${registryHost}`} /></>}</SettingsPanel>
     </SimpleGrid>
+    <SettingsPanel icon={<IconRoute size={19} />} title={t('settings.registryUsageTitle')}>
+      <Text size="sm" c="dimmed">{t('settings.registryUsageDescription')}</Text>
+      <SimpleGrid cols={{ base: 1, md: 2 }}>
+        <Command label="Docker Hub" value={`docker pull ${registryHost}/library/alpine:latest`} />
+        <Command label="GitHub Container Registry" value={`docker pull ${registryHost}/ghcr/owner/image:tag`} />
+      </SimpleGrid>
+    </SettingsPanel>
     <SettingsPanel icon={<IconTerminal2 size={19} />} title={t('settings.helperTitle')}>
       <Text size="sm" c="dimmed">{t('settings.helperDescription')}</Text>
+      <Text size="sm" c="dimmed">{t('settings.helperLimitations')}</Text>
       <SimpleGrid cols={{ base: 1, md: 2 }}>
         <Command label="Linux" value={`curl -fsSL ${helperUrl} | sudo sh -s -- configure`} />
         <Command label="macOS" value={`curl -fsSL ${helperUrl} | sh -s -- configure`} />
