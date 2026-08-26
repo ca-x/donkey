@@ -15,6 +15,7 @@ const SettingsPage = lazy(() => import('./pages/SettingsPage').then((module) => 
 const ImageToolsPage = lazy(() => import('./pages/ImageToolsPage').then((module) => ({ default: module.ImageToolsPage })))
 const LoginPage = lazy(() => import('./pages/LoginPage').then((module) => ({ default: module.LoginPage })))
 const AboutPage = lazy(() => import('./pages/AboutPage').then((module) => ({ default: module.AboutPage })))
+const DeploymentPage = lazy(() => import('./pages/DeploymentPage').then((module) => ({ default: module.DeploymentPage })))
 
 export function App() {
   const location = useLocation()
@@ -30,6 +31,7 @@ export function App() {
       '/settings': 'settings.title',
       '/login': 'login.title',
       '/about': 'about.title',
+      '/deployment': 'deployment.title',
     }
     document.title = `Donkey · ${t(titleKey[location.pathname] ?? 'dashboard.title')}`
   }, [i18n.resolvedLanguage, location.pathname, t])
@@ -54,6 +56,7 @@ export function App() {
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/image-tools" element={<ImageToolsPage />} />
             <Route path="/about" element={<AboutPage />} />
+            <Route path="/deployment" element={<DeploymentPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Suspense>
