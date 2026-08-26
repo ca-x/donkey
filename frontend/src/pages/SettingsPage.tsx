@@ -1,4 +1,4 @@
-import { Box, Button, Checkbox, Collapse, FileInput, Group, Modal, NumberInput, Paper, PasswordInput, Select, SimpleGrid, Stack, Switch, Text, TextInput, Title } from '@mantine/core'
+import { Box, Button, Checkbox, Collapse, FileInput, Group, Modal, NumberInput, Paper, PasswordInput, Select, SimpleGrid, Stack, Switch, Tabs, Text, TextInput, Title } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useForm } from '@mantine/form'
 import { IconAdjustments, IconDownload, IconRotateClockwise, IconSettings, IconUpload } from '@tabler/icons-react'
@@ -12,14 +12,14 @@ import { useAuth } from '../useAuth'
 
 export function SettingsPage() {
   const { t } = useTranslation()
+  const [tab, setTab] = useState<string | null>('runtime')
   const runtime = useQuery({ queryKey: ['runtime'], queryFn: api.runtime })
   if (runtime.isLoading) return <LoadingState />
   if (runtime.error) return <ErrorState error={runtime.error} retry={() => void runtime.refetch()} />
   const config = runtime.data!
   return <Stack gap={24}>
     <PageHeader title={t('settings.title')} description={t('settings.description')} />
-    <AccountSettings />
-    <RuntimeSettingsEditor config={config} />
+    <Tabs value={tab} onChange={setTab} variant="default"><Tabs.List><Tabs.Tab value="runtime">{t('settings.runtimeTitle')}</Tabs.Tab><Tabs.Tab value="account">{t('settings.profileTitle')}</Tabs.Tab></Tabs.List><Tabs.Panel value="runtime" pt="lg"><RuntimeSettingsEditor config={config} /></Tabs.Panel><Tabs.Panel value="account" pt="lg"><AccountSettings /></Tabs.Panel></Tabs>
   </Stack>
 }
 
