@@ -212,6 +212,9 @@ impl Scheduler {
             if offset >= total_size {
                 return Ok(());
             }
+            if self.at_capacity(node.node.id, node.max_concurrency) {
+                continue;
+            }
             let lease = self.acquire(node.node.id, node.max_concurrency).await;
             let started = Instant::now();
             let result = async {
@@ -320,7 +323,16 @@ impl Scheduler {
         merged: &Path,
     ) -> ApiResult<()> {
         let chunks = chunks(total_size, self.config.chunk_size);
-        let concurrency = self.config.chunk_concurrency.min(chunks.len()).max(1);
+        let node_capacity = nodes
+            .iter()
+            .map(|node| usize::from(node.max_concurrency))
+            .sum::<usize>();
+        let concurrency = self
+            .config
+            .chunk_concurrency
+            .min(node_capacity.max(1))
+            .min(chunks.len())
+            .max(1);
         let results = stream::iter(chunks.clone())
             .map(|chunk| {
                 let scheduler = self.clone();
@@ -370,6 +382,9 @@ impl Scheduler {
     ) -> ApiResult<()> {
         let mut last_error = None;
         for node in self.ordered_nodes(nodes, chunk.index) {
+            if self.at_capacity(node.node.id, node.max_concurrency) {
+                continue;
+            }
             let lease = self.acquire(node.node.id, node.max_concurrency).await;
             let started = Instant::now();
             let result = async {
@@ -449,6 +464,9 @@ impl Scheduler {
     ) -> ApiResult<()> {
         let mut last_error = None;
         for node in self.ordered_nodes(nodes, 0) {
+            if self.at_capacity(node.node.id, node.max_concurrency) {
+                continue;
+            }
             let lease = self.acquire(node.node.id, node.max_concurrency).await;
             let started = Instant::now();
             let result = async {
@@ -543,6 +561,12 @@ impl Scheduler {
             drop(available);
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    fn at_capacity(&self, node_id: Uuid, max_concurrency: u16) -> bool {
+        self.active_chunks
+            .get(&node_id)
+            .is_some_and(|value| *value >= usize::from(max_concurrency))
     }
 
     fn observe_speed(
