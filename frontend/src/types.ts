@@ -49,6 +49,7 @@ export interface NodeView {
   score: number
   auth_configured: boolean
   route: RegistryRouteSummary
+  max_concurrency: number
 }
 
 export interface NodeInput {
@@ -57,6 +58,7 @@ export interface NodeInput {
   registry_route_id: string
   enabled: boolean
   priority: number
+  max_concurrency: number
   cf_preferred: boolean
   connect_ip: string | null
   auth_mode: AuthMode

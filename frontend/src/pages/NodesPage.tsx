@@ -53,6 +53,7 @@ function nodeInitialValues(registryRouteId: string): NodeInput {
     registry_route_id: registryRouteId,
     enabled: true,
     priority: 100,
+    max_concurrency: 4,
     cf_preferred: false,
     connect_ip: null,
     auth_mode: 'none',
@@ -159,6 +160,7 @@ function NodeCard({ item, canWrite, edit }: { item: NodeView; canWrite: boolean;
         <Metric label={t('nodes.measuredRate')} value={formatRate(item.metric.speed_bps)} />
         <Metric label={t('nodes.latency')} value={`${item.metric.latency_ms} ms`} />
         <Metric label={t('nodes.downloaded')} value={formatBytes(item.metric.total_bytes)} />
+        <Metric label={t('nodes.maxConcurrency')} value={`${item.max_concurrency}`} />
       </div>
       <Group justify="space-between" mt="md" gap="sm">
         <Text size="xs" c={item.metric.last_error ? 'red.3' : 'dimmed'} lineClamp={1}>
@@ -187,6 +189,7 @@ function NodeDialog({ opened, value, initialRouteId, routes, close }: { opened: 
       registry_route_id: editing.node.registry_route_id,
       enabled: editing.node.enabled,
       priority: editing.node.priority,
+      max_concurrency: editing.max_concurrency,
       cf_preferred: editing.node.cf_preferred,
       connect_ip: editing.node.connect_ip,
       auth_mode: editing.node.auth_mode,
@@ -247,6 +250,7 @@ function NodeDialog({ opened, value, initialRouteId, routes, close }: { opened: 
             <TextInput label={t('nodes.upstream')} description={t('nodes.upstreamDesc')} required {...form.getInputProps('url')} />
             <SimpleGrid cols={{ base: 1, sm: 2 }}>
               <NumberInput label={t('nodes.priority')} min={0} max={1000} {...form.getInputProps('priority')} />
+              <NumberInput label={t('nodes.maxConcurrency')} min={1} max={64} {...form.getInputProps('max_concurrency')} />
               <TextInput label={t('nodes.connectIp')} {...form.getInputProps('connect_ip')} />
             </SimpleGrid>
             <Group gap="xl">

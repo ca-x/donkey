@@ -506,6 +506,13 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE TABLE IF NOT EXISTS runtime_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)",
         ]),
     },
+    Migration {
+        version: 4,
+        name: "per-node concurrency limits",
+        action: MigrationAction::Statements(&[
+            "CREATE TABLE IF NOT EXISTS node_limits (node_id TEXT PRIMARY KEY NOT NULL, max_concurrency INTEGER NOT NULL DEFAULT 4)",
+        ]),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -672,6 +679,34 @@ pub async fn insert_node(
     model.into_active_model().insert(db).await
 }
 
+pub async fn get_node_max_concurrency(db: &DatabaseConnection, id: Uuid) -> Result<u16, DbErr> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT max_concurrency FROM node_limits WHERE node_id = ?",
+            [id.to_string().into()],
+        ))
+        .await?;
+    Ok(row
+        .and_then(|row| row.try_get::<i64>("", "max_concurrency").ok())
+        .unwrap_or(4)
+        .clamp(1, u16::MAX as i64) as u16)
+}
+
+pub async fn set_node_max_concurrency(
+    db: &DatabaseConnection,
+    id: Uuid,
+    max_concurrency: u16,
+) -> Result<(), DbErr> {
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO node_limits(node_id, max_concurrency) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET max_concurrency = excluded.max_concurrency",
+        [id.to_string().into(), (max_concurrency as i64).into()],
+    ))
+    .await?;
+    Ok(())
+}
+
 pub async fn save_node(db: &DatabaseConnection, model: node::Model) -> Result<node::Model, DbErr> {
     let active = node::ActiveModel {
         id: ActiveValue::Unchanged(model.id),
@@ -693,7 +728,14 @@ pub async fn save_node(db: &DatabaseConnection, model: node::Model) -> Result<no
 }
 
 pub async fn delete_node(db: &DatabaseConnection, id: Uuid) -> Result<u64, DbErr> {
-    Ok(node::Entity::delete_by_id(id).exec(db).await?.rows_affected)
+    let deleted = node::Entity::delete_by_id(id).exec(db).await?.rows_affected;
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM node_limits WHERE node_id = ?",
+        [id.to_string().into()],
+    ))
+    .await?;
+    Ok(deleted)
 }
 
 pub async fn metric_for(
@@ -1006,7 +1048,10 @@ mod tests {
     #[tokio::test]
     async fn fresh_database_has_expected_indexes() {
         let db = connect("sqlite::memory:").await.unwrap();
-        assert_eq!(migration_versions(&db).await, vec![(1, 1), (2, 1), (3, 1)]);
+        assert_eq!(
+            migration_versions(&db).await,
+            vec![(1, 1), (2, 1), (3, 1), (4, 1)]
+        );
         assert_expected_indexes(&db).await;
         let routes = registry_route::Entity::find().all(&db).await.unwrap();
         assert_eq!(routes.len(), 2);
@@ -1031,7 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_version() {
         const FAILING_MIGRATION: &[Migration] = &[Migration {
-            version: 4,
+            version: 5,
             name: "rollback test",
             action: MigrationAction::Statements(&[
                 "CREATE TABLE migration_rollback_marker (id INTEGER PRIMARY KEY)",
@@ -1050,7 +1095,10 @@ mod tests {
             .await
             .unwrap();
         assert!(marker.is_empty());
-        assert_eq!(migration_versions(&db).await, vec![(1, 1), (2, 1), (3, 1)]);
+        assert_eq!(
+            migration_versions(&db).await,
+            vec![(1, 1), (2, 1), (3, 1), (4, 1)]
+        );
     }
 
     #[tokio::test]
