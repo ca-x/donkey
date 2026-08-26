@@ -128,6 +128,11 @@ export interface DashboardData {
   registry_bytes: number
 }
 
+export interface HealthData {
+  status: string
+  version: string
+}
+
 export interface RuntimeConfig {
   admin_addr: string
   registry_addr: string

@@ -207,12 +207,12 @@ function RegistryRouteEditor({ opened, value, routes, close, complete, setSaving
           <fieldset className="pending-form" disabled={save.isPending}>
             <Stack gap="md">
             <SimpleGrid cols={{ base: 1, sm: 2 }}>
-              <TextInput label={t('nodes.routeKey')} description={t('nodes.routeKeyDesc')} readOnly={builtIn} required {...form.getInputProps('key')} />
+              <TextInput label={t('nodes.routeKey')} readOnly={builtIn} required {...form.getInputProps('key')} />
               <TextInput label={t('nodes.routeName')} required {...form.getInputProps('name')} />
             </SimpleGrid>
-            <TextInput label={t('nodes.canonicalRegistry')} description={t('nodes.canonicalRegistryDesc')} placeholder="registry.example.com:5000" required {...form.getInputProps('canonical_registry')} />
-            <TextInput label={t('nodes.pathPrefix')} description={form.values.is_default ? t('nodes.defaultPrefixDesc') : t('nodes.pathPrefixDesc')} placeholder="team" required={!form.values.is_default} {...form.getInputProps('path_prefix')} />
-            <Select label={t('nodes.repositoryMode')} description={t('nodes.repositoryModeDesc')} data={[{ value: 'passthrough', label: t('nodes.mode.passthrough') }, { value: 'docker_hub_library', label: t('nodes.mode.docker_hub_library') }]} required {...form.getInputProps('repository_mode')} />
+            <TextInput label={t('nodes.canonicalRegistry')} required {...form.getInputProps('canonical_registry')} />
+            <TextInput label={t('nodes.pathPrefix')} description={form.values.is_default ? t('nodes.defaultPrefixDesc') : t('nodes.pathPrefixDesc')} required={!form.values.is_default} {...form.getInputProps('path_prefix')} />
+            <Select label={t('nodes.repositoryMode')} data={[{ value: 'passthrough', label: t('nodes.mode.passthrough') }, { value: 'docker_hub_library', label: t('nodes.mode.docker_hub_library') }]} required {...form.getInputProps('repository_mode')} />
             <Group gap="xl">
               <Switch label={t('nodes.defaultRoute')} description={t('nodes.defaultRouteDesc')} {...form.getInputProps('is_default', { type: 'checkbox' })} />
               <Switch label={t('nodes.enableRoute')} {...form.getInputProps('enabled', { type: 'checkbox' })} />

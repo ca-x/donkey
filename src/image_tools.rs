@@ -347,6 +347,7 @@ impl ImageTools {
             )
             .route("/jobs", get(list_jobs).post(create_job))
             .route("/jobs/{id}", get(get_job).delete(cancel_job))
+            .route("/jobs/{id}/purge", axum::routing::delete(purge_job))
             .route("/jobs/{id}/retry", post(retry_job))
             .route("/jobs/{id}/artifact", get(download_artifact))
             .route("/jobs/{id}/files", get(list_files))
@@ -1553,6 +1554,28 @@ async fn cancel_job(
     let status = JobStatus::parse(&model.status)
         .ok_or_else(|| AppError::bad_request("image job has an unknown status"))?;
     cancel_job_from_status(&service, id, status).await
+}
+
+async fn purge_job(
+    State(service): State<ImageTools>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> ApiResult<StatusCode> {
+    let job = image_job::Entity::find_by_id(id)
+        .one(&service.db)
+        .await?
+        .ok_or_else(|| AppError::not_found("image job"))?;
+    let status = JobStatus::parse(&job.status)
+        .ok_or_else(|| AppError::bad_request("image job has an unknown status"))?;
+    if matches!(status, JobStatus::Pending | JobStatus::Running) {
+        return Err(AppError::bad_request(
+            "running image jobs must be cancelled first",
+        ));
+    }
+    service.remove_job_storage(id).await?;
+    image_job::Entity::delete_by_id(id)
+        .exec(&service.db)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn cancel_job_from_status(

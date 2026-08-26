@@ -49,7 +49,7 @@ function defaultRouteId(routes: RegistryRoute[]) {
 function nodeInitialValues(registryRouteId: string): NodeInput {
   return {
     name: '',
-    url: 'https://',
+    url: '',
     registry_route_id: registryRouteId,
     enabled: true,
     priority: 100,
@@ -67,14 +67,14 @@ export function NodesPage() {
   const canWrite = useAuth().role === 'admin'
   const [tab, setTab] = useState<string | null>('all')
   const [routesOpened, setRoutesOpened] = useState(false)
-  const [dialog, setDialog] = useState<{ opened: boolean; value: NodeView | null; revision: number }>({ opened: false, value: null, revision: 0 })
+  const [dialog, setDialog] = useState<{ opened: boolean; value: NodeView | null; routeId?: string; revision: number }>({ opened: false, value: null, revision: 0 })
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: api.nodes, refetchInterval: 20_000 })
   const routes = useQuery({ queryKey: ['registry-routes'], queryFn: api.registryRoutes })
   const routeList = routes.data ?? []
   const filtered = (nodes.data ?? []).filter((item) => tab === 'all' || item.node.registry_route_id === tab)
   const loading = nodes.isLoading || routes.isLoading
   const loadError = nodes.error ?? routes.error
-  const openDialog = (value: NodeView | null) => setDialog((current) => ({ opened: true, value, revision: current.revision + 1 }))
+  const openDialog = (value: NodeView | null, routeId?: string) => setDialog((current) => ({ opened: true, value, routeId, revision: current.revision + 1 }))
   const closeDialog = () => setDialog((current) => ({ ...current, opened: false }))
   const retry = () => {
     void nodes.refetch()
@@ -89,7 +89,7 @@ export function NodesPage() {
         action={canWrite ? (
           <Group gap="sm">
             <Button variant="default" leftSection={<IconRoute size={18} />} onClick={() => setRoutesOpened(true)}>{t('nodes.manageRoutes')}</Button>
-            <Button leftSection={<IconPlus size={18} />} onClick={() => openDialog(null)} disabled={routeList.length === 0} className="pressable">{t('nodes.add')}</Button>
+            <Button leftSection={<IconPlus size={18} />} onClick={() => openDialog(null, tab !== 'all' ? tab ?? undefined : undefined)} disabled={routeList.length === 0} className="pressable">{t('nodes.add')}</Button>
           </Group>
         ) : undefined}
       />
@@ -104,12 +104,12 @@ export function NodesPage() {
       {loading ? <LoadingState label={t('nodes.reading')} /> : null}
       {loadError ? <ErrorState error={loadError} retry={retry} /> : null}
       {!loading && !loadError && filtered.length === 0 ? (
-        <EmptyState title={t('nodes.emptyTitle')} description={t('nodes.emptyDesc')} action={canWrite ? <Button variant="light" onClick={() => openDialog(null)}>{t('nodes.add')}</Button> : undefined} />
+        <EmptyState title={t('nodes.emptyTitle')} description={t('nodes.emptyDesc')} action={canWrite ? <Button variant="light" onClick={() => openDialog(null, tab !== 'all' ? tab ?? undefined : undefined)}>{t('nodes.add')}</Button> : undefined} />
       ) : null}
       <SimpleGrid cols={{ base: 1, xl: 2 }} spacing="md">
         {filtered.map((item) => <NodeCard key={item.node.id} item={item} canWrite={canWrite} edit={() => openDialog(item)} />)}
       </SimpleGrid>
-      {canWrite && routeList.length > 0 ? <NodeDialog key={dialog.revision} opened={dialog.opened} value={dialog.value} routes={routeList} close={closeDialog} /> : null}
+      {canWrite && routeList.length > 0 ? <NodeDialog key={dialog.revision} opened={dialog.opened} value={dialog.value} initialRouteId={dialog.routeId} routes={routeList} close={closeDialog} /> : null}
       {canWrite ? <RegistryRoutesDialog opened={routesOpened} routes={routeList} close={() => setRoutesOpened(false)} /> : null}
     </Stack>
   )
@@ -174,7 +174,7 @@ function Metric({ label, value }: { label: string; value: string }) {
   return <Box><Text size="xs" c="dimmed">{label}</Text><Text fw={650} mt={3}>{value}</Text></Box>
 }
 
-function NodeDialog({ opened, value, routes, close }: { opened: boolean; value: NodeView | null; routes: RegistryRoute[]; close: () => void }) {
+function NodeDialog({ opened, value, initialRouteId, routes, close }: { opened: boolean; value: NodeView | null; initialRouteId?: string; routes: RegistryRoute[]; close: () => void }) {
   const { t } = useTranslation()
   const client = useQueryClient()
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -193,7 +193,7 @@ function NodeDialog({ opened, value, routes, close }: { opened: boolean; value: 
       auth_username: editing.node.auth_username,
       auth_header: editing.node.auth_header,
       auth_secret: null,
-    } : nodeInitialValues(defaultRouteId(routes)),
+    } : nodeInitialValues(initialRouteId ?? defaultRouteId(routes)),
     validate: {
       name: (v) => v.trim().length === 0 || v.length > 80 ? t('nodes.validationName') : null,
       url: (v) => /^https?:\/\//.test(v) ? null : t('nodes.validationUrl'),
@@ -241,13 +241,13 @@ function NodeDialog({ opened, value, routes, close }: { opened: boolean; value: 
           <fieldset className="pending-form" disabled={save.isPending}>
             <Stack gap="md">
             <SimpleGrid cols={{ base: 1, sm: 2 }}>
-              <TextInput label={t('nodes.name')} placeholder={t('nodes.namePlaceholder')} required {...form.getInputProps('name')} />
-              <Select label={t('nodes.registryNamespace')} description={t('nodes.registryNamespaceDesc')} data={routeOptions} searchable required {...form.getInputProps('registry_route_id')} />
+              <TextInput label={t('nodes.name')} required {...form.getInputProps('name')} />
+              <Select label={t('nodes.registryNamespace')} data={routeOptions} searchable required {...form.getInputProps('registry_route_id')} />
             </SimpleGrid>
-            <TextInput label={t('nodes.upstream')} description={t('nodes.upstreamDesc')} placeholder="https://docker.1ms.run" required {...form.getInputProps('url')} />
+            <TextInput label={t('nodes.upstream')} description={t('nodes.upstreamDesc')} required {...form.getInputProps('url')} />
             <SimpleGrid cols={{ base: 1, sm: 2 }}>
-              <NumberInput label={t('nodes.priority')} description={t('nodes.priorityDesc')} min={0} max={1000} {...form.getInputProps('priority')} />
-              <TextInput label={t('nodes.connectIp')} description={t('nodes.connectIpDesc')} placeholder={t('nodes.optional')} {...form.getInputProps('connect_ip')} />
+              <NumberInput label={t('nodes.priority')} min={0} max={1000} {...form.getInputProps('priority')} />
+              <TextInput label={t('nodes.connectIp')} {...form.getInputProps('connect_ip')} />
             </SimpleGrid>
             <Group gap="xl">
               <Switch label={t('nodes.enableNode')} {...form.getInputProps('enabled', { type: 'checkbox' })} />
@@ -265,7 +265,7 @@ function NodeDialog({ opened, value, routes, close }: { opened: boolean; value: 
               }}
             />
             {form.values.auth_mode === 'basic' && <TextInput label={t('nodes.username')} description={form.values.url.includes('1ms.run') ? t('nodes.oneMsUser') : undefined} {...form.getInputProps('auth_username')} />}
-            {form.values.auth_mode === 'header' && <TextInput label={t('nodes.headerName')} placeholder="X-Registry-Token" {...form.getInputProps('auth_header')} />}
+            {form.values.auth_mode === 'header' && <TextInput label={t('nodes.headerName')} {...form.getInputProps('auth_header')} />}
             {form.values.auth_mode !== 'none' && <PasswordInput label={t(editing?.auth_configured ? 'nodes.newSecret' : 'nodes.secret')} description={t('nodes.secretDesc')} autoComplete="new-password" {...form.getInputProps('auth_secret')} />}
             <Group justify="space-between" mt="sm">
               {editing ? <Button type="button" color="red" variant="subtle" leftSection={<IconTrash size={17} />} onClick={() => setConfirmDelete(true)}>{t('common.delete')}</Button> : <span />}

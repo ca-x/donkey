@@ -16,6 +16,7 @@ import type {
   ImageFileEntry,
   AuthConfig,
   AuthUser,
+  HealthData,
 } from './types'
 import { adminUrl } from './basePath'
 
@@ -66,6 +67,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 const json = (value: unknown) => JSON.stringify(value)
 
 export const api = {
+  health: () => request<HealthData>('/health'),
   authConfig: () => request<AuthConfig>('/auth/config'),
   me: () => request<AuthUser>('/auth/me'),
   login: (username: string, password: string) => request<AuthUser>('/auth/login', { method: 'POST', body: json({ username, password }) }),
@@ -103,6 +105,7 @@ export const api = {
   imageJobs: () => request<ImageJob[]>('/image-tools/jobs?limit=200'),
   createImageJob: (input: ImageJobInput, idempotencyKey?: string) => request<ImageJob>('/image-tools/jobs', { method: 'POST', headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined, body: json(input) }),
   cancelImageJob: (id: string) => request<void>(`/image-tools/jobs/${id}`, { method: 'DELETE' }),
+  purgeImageJob: (id: string) => request<void>(`/image-tools/jobs/${id}/purge`, { method: 'DELETE' }),
   retryImageJob: (id: string) => request<ImageJob>(`/image-tools/jobs/${id}/retry`, { method: 'POST' }),
   imageFiles: (id: string, path = '') => request<ImageFileEntry[]>(`/image-tools/jobs/${id}/files?path=${encodeURIComponent(path)}`),
   imageRules: () => request<ImageSyncRule[]>('/image-tools/sync-rules'),

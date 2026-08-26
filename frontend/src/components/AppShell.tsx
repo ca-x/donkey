@@ -23,6 +23,7 @@ import {
   IconSun,
   IconTool,
   IconLogout,
+  IconInfoCircle,
 } from '@tabler/icons-react'
 import { NavLink as RouterNavLink, useLocation, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
@@ -37,6 +38,7 @@ const navigation = [
   { path: '/domainfold', label: 'nav.domain', short: 'nav.domainShort', icon: IconArrowsShuffle },
   { path: '/image-tools', label: 'nav.imageTools', short: 'nav.imageToolsShort', icon: IconTool },
   { path: '/settings', label: 'nav.settings', short: 'nav.settingsShort', icon: IconSettings },
+  { path: '/about', label: 'nav.about', short: 'nav.about', icon: IconInfoCircle },
 ]
 
 export function AppShell({ children }: { children: ReactNode }) {

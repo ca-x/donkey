@@ -14,6 +14,7 @@ const DomainFoldPage = lazy(() => import('./pages/DomainFoldPage').then((module)
 const SettingsPage = lazy(() => import('./pages/SettingsPage').then((module) => ({ default: module.SettingsPage })))
 const ImageToolsPage = lazy(() => import('./pages/ImageToolsPage').then((module) => ({ default: module.ImageToolsPage })))
 const LoginPage = lazy(() => import('./pages/LoginPage').then((module) => ({ default: module.LoginPage })))
+const AboutPage = lazy(() => import('./pages/AboutPage').then((module) => ({ default: module.AboutPage })))
 
 export function App() {
   const location = useLocation()
@@ -28,6 +29,7 @@ export function App() {
       '/image-tools': 'imageTools.title',
       '/settings': 'settings.title',
       '/login': 'login.title',
+      '/about': 'about.title',
     }
     document.title = `Donkey · ${t(titleKey[location.pathname] ?? 'dashboard.title')}`
   }, [i18n.resolvedLanguage, location.pathname, t])
@@ -51,6 +53,7 @@ export function App() {
             <Route path="/domainfold" element={<DomainFoldPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/image-tools" element={<ImageToolsPage />} />
+            <Route path="/about" element={<AboutPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Suspense>
