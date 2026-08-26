@@ -212,7 +212,7 @@ impl Scheduler {
             if offset >= total_size {
                 return Ok(());
             }
-            let lease = self.acquire(node.node.id);
+            let lease = self.acquire(node.node.id, node.max_concurrency).await;
             let started = Instant::now();
             let result = async {
                 let response = self
@@ -370,7 +370,7 @@ impl Scheduler {
     ) -> ApiResult<()> {
         let mut last_error = None;
         for node in self.ordered_nodes(nodes, chunk.index) {
-            let lease = self.acquire(node.node.id);
+            let lease = self.acquire(node.node.id, node.max_concurrency).await;
             let started = Instant::now();
             let result = async {
                 let existing = tokio::fs::metadata(destination)
@@ -449,7 +449,7 @@ impl Scheduler {
     ) -> ApiResult<()> {
         let mut last_error = None;
         for node in self.ordered_nodes(nodes, 0) {
-            let lease = self.acquire(node.node.id);
+            let lease = self.acquire(node.node.id, node.max_concurrency).await;
             let started = Instant::now();
             let result = async {
                 let response = self
@@ -529,14 +529,19 @@ impl Scheduler {
         speed_first_capacity(measured, node.metric.success_rate, active)
     }
 
-    fn acquire(&self, node_id: Uuid) -> ActiveChunkLease {
-        self.active_chunks
-            .entry(node_id)
-            .and_modify(|value| *value += 1)
-            .or_insert(1);
-        ActiveChunkLease {
-            node_id,
-            active_chunks: self.active_chunks.clone(),
+    async fn acquire(&self, node_id: Uuid, max_concurrency: u16) -> ActiveChunkLease {
+        loop {
+            let mut available = self.active_chunks.entry(node_id).or_insert(0);
+            if *available < usize::from(max_concurrency) {
+                *available += 1;
+                drop(available);
+                return ActiveChunkLease {
+                    node_id,
+                    active_chunks: self.active_chunks.clone(),
+                };
+            }
+            drop(available);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 

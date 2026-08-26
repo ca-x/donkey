@@ -38,6 +38,8 @@ pub struct NodeInput {
     pub enabled: bool,
     #[serde(default = "default_priority")]
     pub priority: i32,
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: u16,
     #[serde(default)]
     pub cf_preferred: bool,
     pub connect_ip: Option<String>,
@@ -55,6 +57,7 @@ pub struct NodeView {
     pub score: f64,
     pub auth_configured: bool,
     pub route: RegistryRouteSummary,
+    pub max_concurrency: u16,
 }
 
 #[derive(Serialize)]
@@ -63,6 +66,7 @@ struct NodeViewWire<'a> {
     metric: &'a node_metric::Model,
     score: f64,
     auth_configured: bool,
+    max_concurrency: u16,
     route: &'a RegistryRouteSummary,
 }
 
@@ -107,6 +111,7 @@ impl Serialize for NodeView {
             metric: &self.metric,
             score: self.score,
             auth_configured: self.auth_configured,
+            max_concurrency: self.max_concurrency,
             route: &self.route,
         }
         .serialize(serializer)
@@ -119,6 +124,10 @@ fn default_true() -> bool {
 
 fn default_priority() -> i32 {
     100
+}
+
+fn default_max_concurrency() -> u16 {
+    4
 }
 
 impl NodeService {
@@ -191,6 +200,7 @@ impl NodeService {
         let node = db::insert_node(&self.db, node)
             .await
             .map_err(map_node_write_error)?;
+        db::set_node_max_concurrency(&self.db, node.id, input.max_concurrency).await?;
         let metric = empty_metric(node.id);
         db::upsert_metric(&self.db, metric.clone()).await?;
         self.view_with(node, metric, route).await
@@ -233,6 +243,7 @@ impl NodeService {
         let node = db::save_node(&self.db, node)
             .await
             .map_err(map_node_write_error)?;
+        db::set_node_max_concurrency(&self.db, id, input.max_concurrency).await?;
         let metric = db::metric_for(&self.db, id)
             .await?
             .unwrap_or_else(|| empty_metric(id));
@@ -317,12 +328,14 @@ impl NodeService {
     ) -> ApiResult<NodeView> {
         let score = score(&node, &metric, self.config.scheduler_policy);
         let auth_configured = node.auth_secret_enc.is_some();
+        let max_concurrency = db::get_node_max_concurrency(&self.db, node.id).await?;
         Ok(NodeView {
             node,
             metric,
             score,
             auth_configured,
             route: (&route).into(),
+            max_concurrency,
         })
     }
 
@@ -544,6 +557,11 @@ fn validate_input(input: &NodeInput) -> ApiResult<()> {
     if !(0..=1000).contains(&input.priority) {
         return Err(AppError::bad_request("priority must be between 0 and 1000"));
     }
+    if !(1..=64).contains(&input.max_concurrency) {
+        return Err(AppError::bad_request(
+            "max_concurrency must be between 1 and 64",
+        ));
+    }
     let mode = normalized_auth_mode(&input.auth_mode)?;
     if mode == "basic" && input.auth_username.as_deref().is_none_or(str::is_empty) {
         return Err(AppError::bad_request(
@@ -616,6 +634,7 @@ mod tests {
             registry_route_id,
             enabled: true,
             priority: 10,
+            max_concurrency: 4,
             cf_preferred: false,
             connect_ip: None,
             auth_mode: "none".into(),
@@ -694,6 +713,7 @@ mod tests {
                 registry_route_id: DOCKER_HUB_ROUTE_ID,
                 enabled: true,
                 priority: 10,
+                max_concurrency: 4,
                 cf_preferred: false,
                 connect_ip: None,
                 auth_mode: "basic".into(),
