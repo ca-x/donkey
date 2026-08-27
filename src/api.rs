@@ -288,7 +288,7 @@ struct RuntimeSettingsInput {
 struct RuntimeSettingsExport {
     format: String,
     version: u32,
-    settings: RuntimeSettingsInput,
+    settings: Option<RuntimeSettingsInput>,
     #[serde(default)]
     registry_routes: Vec<crate::registry_routes::RegistryRouteView>,
     #[serde(default)]
@@ -346,7 +346,7 @@ async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<Runtime
     Ok(Json(RuntimeSettingsExport {
         format: "donkey-runtime-settings".into(),
         version: 1,
-        settings: RuntimeSettingsInput {
+        settings: Some(RuntimeSettingsInput {
             chunk_size: config.chunk_size,
             chunk_concurrency: config.chunk_concurrency,
             parallel_threshold: config.parallel_threshold,
@@ -363,7 +363,7 @@ async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<Runtime
             health_interval_seconds: config.health_interval.as_secs(),
             max_export_bytes: config.max_export_bytes,
             export_ttl_seconds: config.export_ttl.as_secs(),
-        },
+        }),
         registry_routes: state.registry_routes.list().await?.into_iter().collect(),
         nodes,
     }))
@@ -451,7 +451,9 @@ async fn import_runtime(
             state.nodes.create(input).await?;
         }
     }
-    persist_runtime(&state, &export.settings).await?;
+    if let Some(settings) = export.settings.as_ref() {
+        persist_runtime(&state, settings).await?;
+    }
     let cache = state.cache.stats().await?;
     Ok(Json(runtime_config(
         &effective_config(&state).await?,

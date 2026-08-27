@@ -169,7 +169,7 @@ export type RuntimeSettingsInput = Pick<RuntimeConfig, 'chunk_size' | 'chunk_con
 export interface RuntimeSettingsExport {
   format: 'donkey-runtime-settings'
   version: 1
-  settings: RuntimeSettingsInput
+  settings: RuntimeSettingsInput | null
   registry_routes: RegistryRoute[]
   nodes: Array<{
     name: string
