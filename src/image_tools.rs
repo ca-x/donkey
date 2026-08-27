@@ -28,7 +28,8 @@ use oci_client::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, IntoActiveModel,
-    QueryFilter, QueryOrder, QuerySelect, Set, UpdateMany,
+    QueryFilter, QueryOrder, QuerySelect, Set, SqliteTransactionMode, TransactionOptions,
+    TransactionTrait, UpdateMany,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -529,7 +530,6 @@ impl ImageTools {
         )
         .await?;
         if finished {
-            db::clear_image_job_owner(&self.db, id).await?;
             return Ok(());
         }
 
@@ -1118,22 +1118,6 @@ impl ImageTools {
             .push_manifest(destination, &OciManifest::Image(image.manifest.clone()))
             .await
             .map_err(oci_error)?;
-        image_sync_rule::Entity::update_many()
-            .col_expr(
-                image_sync_rule::Column::LastDigest,
-                sea_orm::sea_query::Expr::value(Some(image.manifest_digest.clone())),
-            )
-            .col_expr(
-                image_sync_rule::Column::LastRunAt,
-                sea_orm::sea_query::Expr::value(Some(Utc::now())),
-            )
-            .filter(image_sync_rule::Column::SourceRef.eq(job.source_ref.clone()))
-            .filter(
-                image_sync_rule::Column::DestinationRef
-                    .eq(job.destination_ref.clone().unwrap_or_default()),
-            )
-            .exec(&self.db)
-            .await?;
         Ok(())
     }
 
@@ -1358,31 +1342,87 @@ impl ImageTools {
             .all(&self.db)
             .await?;
         for rule in rules {
-            let key = format!(
-                "sync-rule:{}:{}",
-                rule.id,
-                rule.next_run_at.unwrap_or(now).timestamp()
-            );
-            let input = JobInput {
-                kind: "copy".into(),
-                source_ref: rule.source_ref.clone(),
-                source_node_id: rule.source_node_id,
-                source_credential_id: rule.source_credential_id,
-                destination_ref: Some(rule.destination_ref.clone()),
-                destination_credential_id: Some(rule.destination_credential_id),
-                platform_os: rule.platform_os.clone(),
-                platform_arch: rule.platform_arch.clone(),
-                output_format: None,
-            };
-            let _ = self.create_job(input, Some(key)).await?;
-            let next = next_run(&rule.cron, &rule.timezone)?;
-            let mut active = rule.into_active_model();
-            active.last_run_at = Set(Some(now));
-            active.next_run_at = Set(Some(next));
-            active.updated_at = Set(now);
-            active.update(&self.db).await?;
+            let _ = self
+                .create_rule_job(rule.id, rule.next_run_at.or(Some(now)), "schedule")
+                .await?;
         }
         Ok(())
+    }
+
+    async fn create_rule_job(
+        &self,
+        rule_id: Uuid,
+        scheduled_for: Option<DateTime<Utc>>,
+        trigger: &'static str,
+    ) -> ApiResult<Option<image_job::Model>> {
+        let transaction = self
+            .db
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..Default::default()
+            })
+            .await?;
+        let rule = image_sync_rule::Entity::find_by_id(rule_id)
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| AppError::not_found("sync rule"))?;
+        let now = Utc::now();
+        if trigger == "schedule"
+            && (!rule.enabled
+                || rule.next_run_at != scheduled_for
+                || rule.next_run_at.is_none_or(|next| next > now))
+        {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        let input = JobInput {
+            kind: "copy".into(),
+            source_ref: rule.source_ref.clone(),
+            source_node_id: rule.source_node_id,
+            source_credential_id: rule.source_credential_id,
+            destination_ref: Some(rule.destination_ref.clone()),
+            destination_credential_id: Some(rule.destination_credential_id),
+            platform_os: rule.platform_os.clone(),
+            platform_arch: rule.platform_arch.clone(),
+            output_format: None,
+        };
+        validate_job(&input)?;
+        let idempotency_key = (trigger == "schedule").then(|| {
+            format!(
+                "sync-rule:{}:{}",
+                rule.id,
+                scheduled_for.unwrap_or(now).timestamp_millis()
+            )
+        });
+        let existing = if let Some(key) = idempotency_key.as_deref() {
+            image_job::Entity::find()
+                .filter(image_job::Column::IdempotencyKey.eq(key))
+                .one(&transaction)
+                .await?
+        } else {
+            None
+        };
+        let job = if let Some(existing) = existing {
+            existing
+        } else {
+            let job = pending_job(input, JobKind::Copy, idempotency_key, now)
+                .into_active_model()
+                .insert(&transaction)
+                .await?;
+            db::insert_image_job_lineage(&transaction, job.id, rule.id, scheduled_for, trigger)
+                .await?;
+            job
+        };
+        if trigger == "schedule" {
+            let next = next_run(&rule.cron, &rule.timezone)?;
+            let mut active = rule.into_active_model();
+            active.next_run_at = Set(Some(next));
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        }
+        transaction.commit().await?;
+        self.wake.notify_one();
+        Ok(Some(job))
     }
 
     async fn create_job(
@@ -1402,34 +1442,7 @@ impl ImageTools {
             return Ok(existing);
         }
         let now = Utc::now();
-        let model = image_job::Model {
-            id: Uuid::new_v4(),
-            kind: kind.as_str().into(),
-            status: JobStatus::Pending.as_str().into(),
-            source_ref: input.source_ref,
-            source_node_id: input.source_node_id,
-            source_credential_id: input.source_credential_id,
-            destination_ref: input.destination_ref,
-            destination_credential_id: input.destination_credential_id,
-            platform_os: input.platform_os,
-            platform_arch: input.platform_arch,
-            output_format: input.output_format,
-            resolved_digest: None,
-            index_digest: None,
-            stage: "queued".into(),
-            progress_bytes: 0,
-            total_bytes: 0,
-            artifact_path: None,
-            artifact_name: None,
-            error: None,
-            idempotency_key: idempotency_key.clone(),
-            cancel_requested: false,
-            lease_until: None,
-            created_at: now,
-            updated_at: now,
-            started_at: None,
-            finished_at: None,
-        };
+        let model = pending_job(input, kind, idempotency_key.clone(), now);
         let model = match model.into_active_model().insert(&self.db).await {
             Ok(model) => model,
             Err(error) if idempotency_key.is_some() => {
@@ -1978,25 +1991,11 @@ async fn run_rule(
     State(service): State<ImageTools>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> ApiResult<(StatusCode, Json<image_job::Model>)> {
-    let rule = image_sync_rule::Entity::find_by_id(id)
-        .one(&service.db)
+    let job = service
+        .create_rule_job(id, None, "manual")
         .await?
         .ok_or_else(|| AppError::not_found("sync rule"))?;
-    let input = JobInput {
-        kind: "copy".into(),
-        source_ref: rule.source_ref,
-        source_node_id: rule.source_node_id,
-        source_credential_id: rule.source_credential_id,
-        destination_ref: Some(rule.destination_ref),
-        destination_credential_id: Some(rule.destination_credential_id),
-        platform_os: rule.platform_os,
-        platform_arch: rule.platform_arch,
-        output_format: None,
-    };
-    Ok((
-        StatusCode::CREATED,
-        Json(service.create_job(input, None).await?),
-    ))
+    Ok((StatusCode::CREATED, Json(job)))
 }
 
 impl ImageTools {
@@ -2180,6 +2179,42 @@ fn validate_job(input: &JobInput) -> ApiResult<()> {
         return Err(AppError::bad_request("unsupported image platform"));
     }
     Ok(())
+}
+
+fn pending_job(
+    input: JobInput,
+    kind: JobKind,
+    idempotency_key: Option<String>,
+    now: DateTime<Utc>,
+) -> image_job::Model {
+    image_job::Model {
+        id: Uuid::new_v4(),
+        kind: kind.as_str().into(),
+        status: JobStatus::Pending.as_str().into(),
+        source_ref: input.source_ref,
+        source_node_id: input.source_node_id,
+        source_credential_id: input.source_credential_id,
+        destination_ref: input.destination_ref,
+        destination_credential_id: input.destination_credential_id,
+        platform_os: input.platform_os,
+        platform_arch: input.platform_arch,
+        output_format: input.output_format,
+        resolved_digest: None,
+        index_digest: None,
+        stage: "queued".into(),
+        progress_bytes: 0,
+        total_bytes: 0,
+        artifact_path: None,
+        artifact_name: None,
+        error: None,
+        idempotency_key,
+        cancel_requested: false,
+        lease_until: None,
+        created_at: now,
+        updated_at: now,
+        started_at: None,
+        finished_at: None,
+    }
 }
 
 fn validate_rule(input: SyncRuleInput) -> ApiResult<SyncRuleInput> {
@@ -2495,6 +2530,36 @@ mod tests {
         job.into_active_model().insert(db).await.unwrap()
     }
 
+    async fn insert_test_rule(
+        db: &DatabaseConnection,
+        next_run_at: DateTime<Utc>,
+    ) -> image_sync_rule::Model {
+        let now = Utc::now();
+        image_sync_rule::Model {
+            id: Uuid::new_v4(),
+            name: "scheduled copy".into(),
+            enabled: true,
+            source_ref: "docker.io/library/alpine:latest".into(),
+            source_node_id: None,
+            source_credential_id: None,
+            destination_ref: "registry.example/alpine:latest".into(),
+            destination_credential_id: Uuid::new_v4(),
+            platform_os: "linux".into(),
+            platform_arch: "amd64".into(),
+            cron: "0 * * * * *".into(),
+            timezone: "UTC".into(),
+            last_digest: None,
+            last_run_at: None,
+            next_run_at: Some(next_run_at),
+            created_at: now,
+            updated_at: now,
+        }
+        .into_active_model()
+        .insert(db)
+        .await
+        .unwrap()
+    }
+
     #[test]
     fn job_status_transition_matrix_is_explicit_and_strings_are_stable() {
         for from in JobStatus::ALL {
@@ -2781,6 +2846,127 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.stage, "resolving");
+    }
+
+    #[tokio::test]
+    async fn concurrent_schedule_enqueues_once_and_advances_rule_atomically() {
+        let (_directory, service) = test_service().await;
+        let scheduled_for = Utc::now() - chrono::Duration::seconds(1);
+        let rule = insert_test_rule(&service.db, scheduled_for).await;
+        let first = service.clone();
+        let second = service.clone();
+        let (left, right) = tokio::join!(
+            first.create_rule_job(rule.id, Some(scheduled_for), "schedule"),
+            second.create_rule_job(rule.id, Some(scheduled_for), "schedule")
+        );
+        assert!(left.unwrap().is_some() ^ right.unwrap().is_some());
+
+        let jobs = image_job::Entity::find().all(&service.db).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            db::image_job_sync_rule(&service.db, jobs[0].id)
+                .await
+                .unwrap(),
+            Some(rule.id)
+        );
+        let stored = image_sync_rule::Entity::find_by_id(rule.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.next_run_at.is_some_and(|next| next > Utc::now()));
+        assert!(stored.last_run_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_rule_job_keeps_schedule_and_records_lineage() {
+        let (_directory, service) = test_service().await;
+        let scheduled_for = Utc::now() + chrono::Duration::hours(1);
+        let rule = insert_test_rule(&service.db, scheduled_for).await;
+        let job = service
+            .create_rule_job(rule.id, None, "manual")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = image_sync_rule::Entity::find_by_id(rule.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.next_run_at, Some(scheduled_for));
+        assert_eq!(
+            db::image_job_sync_rule(&service.db, job.id).await.unwrap(),
+            Some(rule.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_job_updates_only_its_lineage_rule() {
+        let (_directory, service) = test_service().await;
+        let next = Utc::now() + chrono::Duration::hours(1);
+        let first = insert_test_rule(&service.db, next).await;
+        let second = insert_test_rule(&service.db, next).await;
+        let job = service
+            .create_rule_job(first.id, None, "manual")
+            .await
+            .unwrap()
+            .unwrap();
+        let now = Utc::now();
+        let attempt = db::claim_image_job(
+            &service.db,
+            job.id,
+            service.worker_id,
+            now,
+            now + chrono::Duration::minutes(JOB_LEASE_MINUTES),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        image_job::Entity::update_many()
+            .col_expr(
+                image_job::Column::ResolvedDigest,
+                sea_orm::sea_query::Expr::value(Some("sha256:lineage")),
+            )
+            .filter(image_job::Column::Id.eq(job.id))
+            .exec(&service.db)
+            .await
+            .unwrap();
+        assert!(
+            db::finish_image_job_owned(
+                &service.db,
+                db::ImageJobFinish {
+                    job_id: job.id,
+                    worker_id: service.worker_id,
+                    attempt,
+                    status: "completed",
+                    error: None,
+                    now: Utc::now(),
+                    cancel_requested: false,
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            db::image_job_owner(&service.db, job.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let first = image_sync_rule::Entity::find_by_id(first.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = image_sync_rule::Entity::find_by_id(second.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.last_digest.as_deref(), Some("sha256:lineage"));
+        assert!(first.last_run_at.is_some());
+        assert!(second.last_digest.is_none());
+        assert!(second.last_run_at.is_none());
     }
 
     #[tokio::test]

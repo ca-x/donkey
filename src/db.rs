@@ -563,6 +563,14 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_pull_events_route_repository ON pull_events(registry_route_id, repository, created_at)",
         ]),
     },
+    Migration {
+        version: 8,
+        name: "image job scheduling lineage",
+        action: MigrationAction::Statements(&[
+            "CREATE TABLE IF NOT EXISTS image_job_lineage (job_id BLOB PRIMARY KEY NOT NULL REFERENCES image_jobs(id) ON DELETE CASCADE, sync_rule_id BLOB NOT NULL REFERENCES image_sync_rules(id) ON DELETE CASCADE, scheduled_for TEXT, trigger TEXT NOT NULL CHECK(trigger IN ('schedule', 'manual')))",
+            "CREATE INDEX IF NOT EXISTS idx_image_job_lineage_rule ON image_job_lineage(sync_rule_id, scheduled_for)",
+        ]),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -1065,6 +1073,42 @@ pub async fn clear_image_job_owner(db: &DatabaseConnection, job_id: Uuid) -> Res
     Ok(())
 }
 
+pub async fn insert_image_job_lineage(
+    transaction: &DatabaseTransaction,
+    job_id: Uuid,
+    sync_rule_id: Uuid,
+    scheduled_for: Option<DateTime<Utc>>,
+    trigger: &str,
+) -> Result<(), DbErr> {
+    transaction
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO image_job_lineage(job_id, sync_rule_id, scheduled_for, trigger) VALUES (?, ?, ?, ?)",
+            [
+                job_id.into(),
+                sync_rule_id.into(),
+                scheduled_for.into(),
+                trigger.into(),
+            ],
+        ))
+        .await?;
+    Ok(())
+}
+
+pub async fn image_job_sync_rule(
+    db: &DatabaseConnection,
+    job_id: Uuid,
+) -> Result<Option<Uuid>, DbErr> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT sync_rule_id FROM image_job_lineage WHERE job_id = ?",
+            [job_id.into()],
+        ))
+        .await?;
+    row.map(|row| row.try_get("", "sync_rule_id")).transpose()
+}
+
 pub struct ImageJobFinish<'a> {
     pub job_id: Uuid,
     pub worker_id: Uuid,
@@ -1079,7 +1123,8 @@ pub async fn finish_image_job_owned(
     db: &DatabaseConnection,
     finish: ImageJobFinish<'_>,
 ) -> Result<bool, DbErr> {
-    let result = db
+    let transaction = db.begin().await?;
+    let result = transaction
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE image_jobs SET status = ?, error = ?, lease_until = NULL, finished_at = ?, updated_at = ? WHERE id = ? AND status = 'running' AND cancel_requested = ? AND EXISTS (SELECT 1 FROM image_job_owners WHERE job_id = ? AND worker_id = ? AND attempt = ?)",
@@ -1096,7 +1141,36 @@ pub async fn finish_image_job_owned(
             ],
         ))
         .await?;
-    Ok(result.rows_affected() == 1)
+    let finished = result.rows_affected() == 1;
+    if finished {
+        if finish.status == "completed" {
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE image_sync_rules SET last_digest = (SELECT resolved_digest FROM image_jobs WHERE id = ?), last_run_at = ?, updated_at = ? WHERE id = (SELECT sync_rule_id FROM image_job_lineage WHERE job_id = ?)",
+                    [
+                        finish.job_id.into(),
+                        finish.now.into(),
+                        finish.now.into(),
+                        finish.job_id.into(),
+                    ],
+                ))
+                .await?;
+        }
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM image_job_owners WHERE job_id = ? AND worker_id = ? AND attempt = ?",
+                [
+                    finish.job_id.to_string().into(),
+                    finish.worker_id.to_string().into(),
+                    finish.attempt.into(),
+                ],
+            ))
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(finished)
 }
 
 pub async fn renew_image_job(
@@ -1302,6 +1376,7 @@ mod tests {
         ("oidc_login_states", "idx_oidc_login_states_expires"),
         ("pull_events", "idx_pull_events_created_at"),
         ("pull_events", "idx_pull_events_route_repository"),
+        ("image_job_lineage", "idx_image_job_lineage_rule"),
     ];
 
     async fn create_v0_database(url: &str) {
@@ -1460,7 +1535,16 @@ mod tests {
         let db = connect("sqlite::memory:").await.unwrap();
         assert_eq!(
             migration_versions(&db).await,
-            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1)]
+            vec![
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (4, 1),
+                (5, 1),
+                (6, 1),
+                (7, 1),
+                (8, 1),
+            ]
         );
         assert_expected_indexes(&db).await;
         let routes = registry_route::Entity::find().all(&db).await.unwrap();
@@ -1496,7 +1580,7 @@ mod tests {
     #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_version() {
         const FAILING_MIGRATION: &[Migration] = &[Migration {
-            version: 8,
+            version: 9,
             name: "rollback test",
             action: MigrationAction::Statements(&[
                 "CREATE TABLE migration_rollback_marker (id INTEGER PRIMARY KEY)",
@@ -1517,7 +1601,16 @@ mod tests {
         assert!(marker.is_empty());
         assert_eq!(
             migration_versions(&db).await,
-            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1)]
+            vec![
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (4, 1),
+                (5, 1),
+                (6, 1),
+                (7, 1),
+                (8, 1),
+            ]
         );
     }
 
