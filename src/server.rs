@@ -29,9 +29,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let health_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(health_state.config.health_interval);
         loop {
-            interval.tick().await;
             health_state.nodes.probe_all().await;
             if let Err(error) = health_state.cache.cleanup_expired().await {
                 tracing::warn!(?error, "cache TTL cleanup failed");
@@ -39,6 +37,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             if let Err(error) = health_state.auth.cleanup_expired().await {
                 tracing::warn!(?error, "expired admin session cleanup failed");
             }
+            tokio::time::sleep(health_state.nodes.health_interval().await).await;
         }
     });
 

@@ -34,6 +34,7 @@ pub struct NodeService {
 struct NodeRuntimeConfig {
     scheduler_policy: SchedulerPolicy,
     upstream_timeout: std::time::Duration,
+    health_interval: std::time::Duration,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -145,6 +146,7 @@ impl NodeService {
             runtime: Arc::new(RwLock::new(NodeRuntimeConfig {
                 scheduler_policy: config.scheduler_policy,
                 upstream_timeout: config.upstream_timeout,
+                health_interval: config.health_interval,
             })),
             config,
             db,
@@ -156,6 +158,11 @@ impl NodeService {
         let mut runtime = self.runtime.write().await;
         runtime.scheduler_policy = config.scheduler_policy;
         runtime.upstream_timeout = config.upstream_timeout;
+        runtime.health_interval = config.health_interval;
+    }
+
+    pub async fn health_interval(&self) -> std::time::Duration {
+        self.runtime.read().await.health_interval
     }
 
     pub async fn list(&self) -> ApiResult<Vec<NodeView>> {
