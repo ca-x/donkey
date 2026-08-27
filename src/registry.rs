@@ -85,7 +85,10 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
         let digest = upstream_path
             .rsplit_once("/blobs/")
             .map(|(_, digest)| digest)
-            .filter(|digest| digest.starts_with("sha256:"));
+            .ok_or_else(|| AppError::bad_request("invalid Blob path"))?;
+        if !valid_sha256_digest(digest) {
+            return Err(AppError::bad_request("invalid Blob digest"));
+        }
         if request.method() == Method::HEAD {
             let key = CacheStore::key(
                 &upstream_path,
@@ -106,7 +109,7 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
                 state.scheduler.fetch_blob(
                     &upstream_path,
                     request.headers(),
-                    digest,
+                    Some(digest),
                     nodes.clone(),
                 ),
             )
@@ -121,7 +124,7 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
                         &state,
                         &upstream_path,
                         request.headers().clone(),
-                        digest,
+                        Some(digest),
                         nodes,
                     )
                     .await;
@@ -311,6 +314,12 @@ fn etag_matches(value: Option<&header::HeaderValue>, digest: &str) -> bool {
                 candidate == "*" || candidate.trim_matches('"') == digest
             })
         })
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 async fn proxy_passthrough(
