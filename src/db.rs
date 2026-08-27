@@ -520,6 +520,17 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE TABLE IF NOT EXISTS image_job_owners (job_id TEXT PRIMARY KEY NOT NULL, worker_id TEXT NOT NULL, attempt INTEGER NOT NULL, claimed_at TEXT NOT NULL)",
         ]),
     },
+    Migration {
+        version: 6,
+        name: "operational query indexes",
+        action: MigrationAction::Statements(&[
+            "CREATE INDEX IF NOT EXISTS idx_image_sync_rules_enabled_next_run ON image_sync_rules(enabled, next_run_at)",
+            "CREATE INDEX IF NOT EXISTS idx_image_jobs_status_created ON image_jobs(status, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_image_jobs_status_finished ON image_jobs(status, finished_at)",
+            "CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at)",
+            "CREATE INDEX IF NOT EXISTS idx_oidc_login_states_expires ON oidc_login_states(expires_at)",
+        ]),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -594,6 +605,21 @@ async fn apply_pending_migrations(
         .into_iter()
         .map(|row| row.try_get::<i64>("", "version"))
         .collect::<Result<Vec<_>, _>>()?;
+
+    let latest_known = migrations
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or(0);
+    if let Some(unknown) = applied_versions
+        .iter()
+        .copied()
+        .find(|version| *version > latest_known)
+    {
+        return Err(DbErr::Custom(format!(
+            "database schema version {unknown} is newer than this binary supports"
+        )));
+    }
 
     for migration in migrations {
         if applied_versions.contains(&migration.version) {
@@ -1045,6 +1071,11 @@ mod tests {
         ("registry_routes", "idx_registry_routes_one_default"),
         ("nodes", "idx_nodes_registry_route_url"),
         ("nodes", "idx_nodes_registry_route_enabled_priority"),
+        ("image_jobs", "idx_image_jobs_status_created"),
+        ("image_jobs", "idx_image_jobs_status_finished"),
+        ("image_sync_rules", "idx_image_sync_rules_enabled_next_run"),
+        ("admin_sessions", "idx_admin_sessions_expires"),
+        ("oidc_login_states", "idx_oidc_login_states_expires"),
     ];
 
     async fn create_v0_database(url: &str) {
@@ -1203,7 +1234,7 @@ mod tests {
         let db = connect("sqlite::memory:").await.unwrap();
         assert_eq!(
             migration_versions(&db).await,
-            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
         );
         assert_expected_indexes(&db).await;
         let routes = registry_route::Entity::find().all(&db).await.unwrap();
@@ -1229,7 +1260,7 @@ mod tests {
     #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_version() {
         const FAILING_MIGRATION: &[Migration] = &[Migration {
-            version: 6,
+            version: 7,
             name: "rollback test",
             action: MigrationAction::Statements(&[
                 "CREATE TABLE migration_rollback_marker (id INTEGER PRIMARY KEY)",
@@ -1250,7 +1281,7 @@ mod tests {
         assert!(marker.is_empty());
         assert_eq!(
             migration_versions(&db).await,
-            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
         );
     }
 

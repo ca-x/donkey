@@ -319,6 +319,18 @@ impl Config {
         if self.cache_low_watermark >= self.cache_high_watermark {
             anyhow::bail!("persisted cache watermarks are invalid")
         }
+        if !settings.is_empty()
+            && (!(256 * 1024..=32 * 1024 * 1024).contains(&self.chunk_size)
+                || !(1..=64).contains(&self.chunk_concurrency)
+                || !(1024 * 1024..=u64::MAX).contains(&self.parallel_threshold)
+                || !(1024 * 1024..=u64::MAX).contains(&self.resumable_threshold)
+                || self.upstream_timeout.is_zero()
+                || self.stream_fallback_timeout.is_zero()
+                || self.partial_ttl.is_zero()
+                || self.max_cache_bytes < 64 * 1024 * 1024)
+        {
+            anyhow::bail!("persisted runtime settings are out of range")
+        }
         Ok(())
     }
 
