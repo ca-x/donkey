@@ -216,6 +216,7 @@ impl CacheStore {
     ) -> ApiResult<CachedObject> {
         let incoming = tokio::fs::metadata(temporary).await?.len();
         let _object_write_guard = self.objects.lock_writer().await?;
+        let _capacity_file_guard = self.objects.lock_capacity().await?;
         let _capacity_guard = self.capacity_lock.lock().await;
         self.reserve_capacity_locked(incoming, key).await?;
         let size = self.objects.commit(key, temporary).await?;
@@ -291,6 +292,7 @@ impl CacheStore {
         let Some(_maintenance_guard) = self.objects.try_lock_maintenance().await? else {
             return Ok(0);
         };
+        let _capacity_file_guard = self.objects.lock_capacity().await?;
         let _capacity_guard = self.capacity_lock.lock().await;
         let entries = self.repository.all().await?;
         let mut freed = 0_u64;
@@ -342,6 +344,8 @@ impl CacheStore {
     }
 
     pub async fn cleanup_expired(&self) -> ApiResult<u64> {
+        let _capacity_file_guard = self.objects.lock_capacity().await?;
+        let _capacity_guard = self.capacity_lock.lock().await;
         let ttl = self.runtime.read().await.cache_ttl;
         let Some(ttl) = ttl else {
             return Ok(0);
@@ -536,6 +540,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admissions_from_independent_stores_stay_below_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.max_cache_bytes = 100;
+        config.cache_high_watermark = 0.9;
+        config.cache_low_watermark = 0.5;
+        let db_a = crate::db::connect(&config.database_url).await.unwrap();
+        let db_b = crate::db::connect(&config.database_url).await.unwrap();
+        let shared = Arc::new(config);
+        let first_cache = CacheStore::new(shared.clone(), db_a).await.unwrap();
+        let second_cache = CacheStore::new(shared, db_b).await.unwrap();
+        let first = directory.path().join("independent-first.partial");
+        let second = directory.path().join("independent-second.partial");
+        tokio::fs::write(&first, vec![1_u8; 80]).await.unwrap();
+        tokio::fs::write(&second, vec![2_u8; 80]).await.unwrap();
+        let first_key = "2".repeat(64);
+        let second_key = "3".repeat(64);
+        let (first_result, second_result) = tokio::join!(
+            first_cache.admit(&first_key, &first, "application/octet-stream", None,),
+            second_cache.admit(&second_key, &second, "application/octet-stream", None,),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+        let stats = first_cache.stats().await.unwrap();
+        assert!(stats.bytes <= 100, "cache used {} bytes", stats.bytes);
+        assert_eq!(stats.entries, 1);
+    }
+
+    #[tokio::test]
     async fn concurrent_cache_hits_do_not_lose_increments() {
         let directory = tempfile::tempdir().unwrap();
         let config = Config::for_test(directory.path().to_owned());
@@ -581,6 +614,31 @@ mod tests {
             .unwrap();
         assert_eq!(stored.hit_count, 0);
         assert_eq!(cache.stats().await.unwrap().hits, 10);
+    }
+
+    #[tokio::test]
+    async fn re_admission_does_not_reset_persisted_hit_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let cache = CacheStore::new(Arc::new(config), db).await.unwrap();
+        let first = directory.path().join("first-admission.partial");
+        tokio::fs::write(&first, b"first").await.unwrap();
+        let key = "1".repeat(64);
+        cache
+            .admit(&key, &first, "application/octet-stream", None)
+            .await
+            .unwrap();
+        for _ in 0..32 {
+            assert!(cache.get(&key).await.unwrap().is_some());
+        }
+        let second = directory.path().join("second-admission.partial");
+        tokio::fs::write(&second, b"first").await.unwrap();
+        cache
+            .admit(&key, &second, "application/octet-stream", None)
+            .await
+            .unwrap();
+        assert_eq!(cache.stats().await.unwrap().hits, 32);
     }
 
     #[tokio::test]

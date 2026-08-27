@@ -38,6 +38,7 @@ mod proxy_integration {
         DropAfterPrefix,
         ThrottledRange,
         ThrottledWhole,
+        ChunkedWhole,
     }
 
     #[derive(Default)]
@@ -248,6 +249,15 @@ mod proxy_integration {
                     }
                     FixtureBehavior::ThrottledWhole => {
                         throttled_ranged_or_whole(&state.bytes, None, &state.stats).await
+                    }
+                    FixtureBehavior::ChunkedWhole => {
+                        let split = state.bytes.len() / 2;
+                        let first = bytes::Bytes::copy_from_slice(&state.bytes[..split]);
+                        let second = bytes::Bytes::copy_from_slice(&state.bytes[split..]);
+                        Response::new(Body::from_stream(futures_util::stream::iter([
+                            Ok::<_, std::io::Error>(first),
+                            Ok::<_, std::io::Error>(second),
+                        ])))
                     }
                 }
             }
@@ -762,6 +772,153 @@ mod proxy_integration {
             );
             assert_eq!(fixture.head_count(), 1);
             assert_eq!(fixture.get_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn concurrent_stream_misses_share_one_upstream_transfer() {
+            let bytes = vec![b's'; 1024 * 1024 + 17];
+            let fixture = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.parallel_threshold = bytes.len() as u64 + 1;
+            let state = AppState::new(config).await.unwrap();
+            state
+                .nodes
+                .create(NodeInput {
+                    name: "single-stream-flight".into(),
+                    url: fixture.url(),
+                    registry_route_id: DOCKER_HUB_ROUTE_ID,
+                    enabled: true,
+                    priority: 0,
+                    max_concurrency: 4,
+                    cf_preferred: false,
+                    connect_ip: None,
+                    auth_mode: "none".into(),
+                    auth_username: None,
+                    auth_header: None,
+                    auth_secret: None,
+                })
+                .await
+                .unwrap();
+
+            let path = blob_path(&digest(&bytes));
+            let router = registry_router(state.clone());
+            let first = request(router.clone(), Method::GET, &path, None).await;
+            assert_eq!(first.status(), StatusCode::OK);
+            let second =
+                tokio::spawn(async move { request(router, Method::GET, &path, None).await });
+            assert_eq!(
+                to_bytes(first.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            let second = second.await.unwrap();
+            assert_eq!(second.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(second.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert_eq!(fixture.get_count(), 1);
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+        }
+
+        #[tokio::test]
+        async fn chunked_upstream_response_is_streamed_and_cached() {
+            let bytes = vec![b'u'; 1024 * 1024 + 9];
+            let fixture = Fixture::start(FixtureBehavior::ChunkedWhole, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            let state = AppState::new(config).await.unwrap();
+            state
+                .nodes
+                .create(NodeInput {
+                    name: "chunked-upstream".into(),
+                    url: fixture.url(),
+                    registry_route_id: DOCKER_HUB_ROUTE_ID,
+                    enabled: true,
+                    priority: 0,
+                    max_concurrency: 4,
+                    cf_preferred: false,
+                    connect_ip: None,
+                    auth_mode: "none".into(),
+                    auth_username: None,
+                    auth_header: None,
+                    auth_secret: None,
+                })
+                .await
+                .unwrap();
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+            assert_eq!(state.cache.stats().await.unwrap().bytes, bytes.len() as u64);
+            assert_eq!(fixture.get_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn corrupt_full_stream_partial_is_removed_after_digest_failure() {
+            let bytes = vec![b'v'; 1024 * 1024 + 3];
+            let fixture = Fixture::start(FixtureBehavior::CorruptChunk, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            let state = AppState::new(config).await.unwrap();
+            state
+                .nodes
+                .create(NodeInput {
+                    name: "corrupt-stream-partial".into(),
+                    url: fixture.url(),
+                    registry_route_id: DOCKER_HUB_ROUTE_ID,
+                    enabled: true,
+                    priority: 0,
+                    max_concurrency: 4,
+                    cf_preferred: false,
+                    connect_ip: None,
+                    auth_mode: "none".into(),
+                    auth_username: None,
+                    auth_header: None,
+                    auth_secret: None,
+                })
+                .await
+                .unwrap();
+            let path = blob_path(&digest(&bytes));
+            let key = donkey::cache::CacheStore::key(
+                &DOCKER_HUB_ROUTE_ID.to_string(),
+                &path,
+                None,
+                false,
+            );
+            let partial = state.cache.temp_dir().join(&key).join("object.partial");
+            tokio::fs::create_dir_all(partial.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&partial, vec![b'x'; bytes.len()])
+                .await
+                .unwrap();
+            let response = request(registry_router(state.clone()), Method::GET, &path, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(to_bytes(response.into_body(), usize::MAX).await.is_err());
+            assert!(tokio::fs::metadata(&partial).await.is_err());
+            assert_eq!(state.cache.stats().await.unwrap().entries, 0);
         }
 
         #[tokio::test]

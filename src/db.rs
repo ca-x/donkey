@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectOptions, ConnectionTrait, Database,
     DatabaseConnection, DatabaseTransaction, DbBackend, DbErr, EntityTrait, IntoActiveModel,
@@ -1079,26 +1079,20 @@ pub async fn insert_cache_entry(
     db: &DatabaseConnection,
     entry: cache_entry::Model,
 ) -> Result<(), DbErr> {
-    if cache_entry::Entity::find_by_id(&entry.key)
-        .one(db)
-        .await?
-        .is_some()
-    {
-        cache_entry::ActiveModel {
-            key: ActiveValue::Unchanged(entry.key),
-            media_type: ActiveValue::Set(entry.media_type),
-            path: ActiveValue::Set(entry.path),
-            size_bytes: ActiveValue::Set(entry.size_bytes),
-            digest: ActiveValue::Set(entry.digest),
-            hit_count: ActiveValue::Set(entry.hit_count),
-            created_at: ActiveValue::Set(entry.created_at),
-            last_accessed_at: ActiveValue::Set(entry.last_accessed_at),
-        }
-        .update(db)
+    cache_entry::Entity::insert(entry.into_active_model())
+        .on_conflict(
+            OnConflict::column(cache_entry::Column::Key)
+                .update_columns([
+                    cache_entry::Column::MediaType,
+                    cache_entry::Column::Path,
+                    cache_entry::Column::SizeBytes,
+                    cache_entry::Column::Digest,
+                    cache_entry::Column::LastAccessedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(db)
         .await?;
-    } else {
-        entry.into_active_model().insert(db).await?;
-    }
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
@@ -8,7 +8,11 @@ use backoff::backoff::Backoff;
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::{config::SchedulerPolicy, nodes::NodeView};
+use crate::{
+    config::SchedulerPolicy,
+    nodes::NodeView,
+    scheduling::{ScheduleCandidate, ScheduleContext, SchedulerAlgorithm},
+};
 
 #[derive(Clone)]
 pub(crate) struct NodeSelector {
@@ -16,6 +20,7 @@ pub(crate) struct NodeSelector {
     active: Arc<DashMap<Uuid, usize>>,
     failures: Arc<DashMap<Uuid, FailureState>>,
     recovered: Arc<DashMap<Uuid, Instant>>,
+    algorithm: Arc<RwLock<Arc<dyn SchedulerAlgorithm>>>,
 }
 
 struct FailureState {
@@ -57,8 +62,14 @@ impl SpeedWindow {
             .collect::<Vec<_>>();
         values.sort_by(f64::total_cmp);
         if values.len() >= 5 {
-            values.remove(0);
-            values.pop();
+            // Trim a high outlier only when it is clearly separated from the
+            // window's median.  Always dropping the newest/highest sample
+            // would make a genuinely recovered node look slower than it is.
+            let median = values[values.len() / 2];
+            let highest = *values.last().unwrap_or(&median);
+            if median > 0.0 && highest > median * 4.0 {
+                values.pop();
+            }
         }
         Some(values.iter().sum::<f64>() / values.len() as f64)
     }
@@ -76,18 +87,56 @@ impl SpeedWindow {
 
 impl NodeSelector {
     pub(crate) fn new() -> Self {
+        Self::with_algorithm(Arc::new(crate::scheduling::CurrentAlgorithm))
+    }
+
+    pub(crate) fn with_algorithm(algorithm: Arc<dyn SchedulerAlgorithm>) -> Self {
         Self {
             speeds: Arc::new(DashMap::new()),
             active: Arc::new(DashMap::new()),
             failures: Arc::new(DashMap::new()),
             recovered: Arc::new(DashMap::new()),
+            algorithm: Arc::new(RwLock::new(algorithm)),
         }
     }
 
+    pub(crate) fn algorithm_name(&self) -> &'static str {
+        self.algorithm
+            .read()
+            .expect("scheduler algorithm lock poisoned")
+            .name()
+    }
+
+    pub(crate) fn set_algorithm(&self, algorithm: Arc<dyn SchedulerAlgorithm>) {
+        *self
+            .algorithm
+            .write()
+            .expect("scheduler algorithm lock poisoned") = algorithm;
+    }
+
+    #[cfg(test)]
     pub(crate) fn order<'a>(
         &self,
         nodes: &'a [NodeView],
         sequence: usize,
+        policy: SchedulerPolicy,
+    ) -> Vec<&'a NodeView> {
+        self.order_with_context(
+            nodes,
+            ScheduleContext {
+                sequence: sequence as u64,
+                blob_size: 0,
+                range_required: false,
+                chunk: None,
+            },
+            policy,
+        )
+    }
+
+    pub(crate) fn order_with_context<'a>(
+        &self,
+        nodes: &'a [NodeView],
+        context: ScheduleContext,
         policy: SchedulerPolicy,
     ) -> Vec<&'a NodeView> {
         let mut candidates = nodes
@@ -102,80 +151,33 @@ impl NodeSelector {
         if !ready.is_empty() {
             candidates = ready;
         }
-        match policy {
-            SchedulerPolicy::Balanced => {
-                let measured = candidates
-                    .iter()
-                    .any(|node| self.speeds.contains_key(&node.node.id));
-                if measured {
-                    self.weighted_balanced_order(&mut candidates, sequence);
-                } else if !candidates.is_empty() {
-                    let offset = sequence % candidates.len();
-                    candidates.rotate_left(offset);
-                }
-            }
-            SchedulerPolicy::SpeedFirst => candidates.sort_by(|left, right| {
-                self.available_capacity(right)
-                    .total_cmp(&self.available_capacity(left))
-                    .then_with(|| left.node.priority.cmp(&right.node.priority))
-                    .then_with(|| left.node.url.cmp(&right.node.url))
-            }),
-        }
-        candidates
-    }
-
-    fn weighted_balanced_order(&self, candidates: &mut Vec<&NodeView>, sequence: usize) {
         let now = Instant::now();
-        if let Some(recovered) = candidates.iter().position(|node| {
-            self.recovered
-                .get(&node.node.id)
-                .is_some_and(|until| *until > now)
-        }) {
-            // Let a node that just recovered from a failure handle the next
-            // request before exploring an unmeasured node.
-            candidates.rotate_left(recovered);
-            return;
-        }
-        if let Some(unmeasured) = candidates
-            .iter()
-            .position(|node| !self.speeds.contains_key(&node.node.id))
-        {
-            // Give each node one bounded exploration request after a restart
-            // or when a new node is added.  Subsequent requests use measured
-            // weighted ordering, so slow nodes do not receive equal traffic.
-            candidates.rotate_left(unmeasured);
-            return;
-        }
-        candidates.sort_by(|left, right| {
-            self.available_capacity(right)
-                .total_cmp(&self.available_capacity(left))
-                .then_with(|| left.node.priority.cmp(&right.node.priority))
-                .then_with(|| left.node.url.cmp(&right.node.url))
-        });
-        let max_capacity = candidates
-            .iter()
-            .map(|node| self.available_capacity(node))
-            .fold(0.0, f64::max)
-            .max(1.0);
-        let weights = candidates
-            .iter()
-            .map(|node| {
-                (self.available_capacity(node) / max_capacity * 100.0)
-                    .round()
-                    .max(1.0) as u64
+        let candidates = candidates
+            .into_iter()
+            .map(|node| ScheduleCandidate {
+                node,
+                capacity_bps: self.measured_speed(node),
+                latency_ms: node.metric.latency_ms.max(0) as u64,
+                success_rate: node.metric.success_rate,
+                active: self
+                    .active
+                    .get(&node.node.id)
+                    .map(|value| *value)
+                    .unwrap_or(0),
+                max_concurrency: usize::from(node.max_concurrency),
+                measured: self.speeds.contains_key(&node.node.id) || node.metric.speed_bps > 0,
+                recently_recovered: self
+                    .recovered
+                    .get(&node.node.id)
+                    .is_some_and(|until| *until > now),
             })
-            .collect::<Vec<_>>();
-        let total_weight = weights.iter().copied().sum::<u64>().max(1);
-        let ticket = sequence as u64 % total_weight;
-        let mut cumulative = 0_u64;
-        let selected = weights
-            .iter()
-            .position(|weight| {
-                cumulative = cumulative.saturating_add(*weight);
-                ticket < cumulative
-            })
-            .unwrap_or(0);
-        candidates.rotate_left(selected);
+            .collect();
+        let algorithm = self
+            .algorithm
+            .read()
+            .expect("scheduler algorithm lock poisoned")
+            .clone();
+        algorithm.order(candidates, context, policy)
     }
 
     pub(crate) fn try_acquire(&self, node_id: Uuid, max_concurrency: u16) -> Option<NodeLease> {
@@ -268,18 +270,11 @@ impl NodeSelector {
             .count()
     }
 
-    fn available_capacity(&self, node: &NodeView) -> f64 {
-        let measured = self
-            .speeds
+    fn measured_speed(&self, node: &NodeView) -> f64 {
+        self.speeds
             .get(&node.node.id)
             .and_then(|window| window.lock().ok()?.estimate(Instant::now()))
-            .unwrap_or(node.metric.speed_bps.max(0) as f64);
-        let active = self
-            .active
-            .get(&node.node.id)
-            .map(|value| *value)
-            .unwrap_or(0);
-        speed_first_capacity(measured, node.metric.success_rate, active)
+            .unwrap_or(node.metric.speed_bps.max(0) as f64)
     }
 }
 
@@ -296,9 +291,16 @@ impl Drop for NodeLease {
     }
 }
 
-fn speed_first_capacity(measured_bps: f64, success_rate: f64, active: usize) -> f64 {
+#[cfg(test)]
+fn speed_first_capacity(
+    measured_bps: f64,
+    success_rate: f64,
+    active: usize,
+    max_concurrency: usize,
+) -> f64 {
     let discovery_floor = 256.0 * 1024.0;
-    measured_bps.max(discovery_floor) * success_rate.clamp(0.05, 1.0).powi(2) / (active + 1) as f64
+    let load = 1.0 + active as f64 / max_concurrency.max(1) as f64;
+    measured_bps.max(discovery_floor) * success_rate.clamp(0.05, 1.0).powi(2) / load
 }
 
 #[cfg(test)]
@@ -374,11 +376,11 @@ mod tests {
 
     #[test]
     fn speed_first_prefers_available_capacity_not_only_raw_speed() {
-        let fast_idle = speed_first_capacity(8_000_000.0, 0.98, 0);
-        let fast_busy = speed_first_capacity(8_000_000.0, 0.98, 7);
-        let medium_idle = speed_first_capacity(2_000_000.0, 0.99, 0);
+        let fast_idle = speed_first_capacity(8_000_000.0, 0.98, 0, 8);
+        let fast_busy = speed_first_capacity(8_000_000.0, 0.98, 7, 8);
+        let medium_idle = speed_first_capacity(2_000_000.0, 0.99, 0, 8);
         assert!(fast_idle > medium_idle);
-        assert!(medium_idle > fast_busy);
+        assert!(fast_idle > fast_busy);
     }
 
     #[test]
@@ -416,8 +418,18 @@ mod tests {
         );
 
         let nodes = [fast.clone(), slow];
-        let ordered = selector.order(&nodes, 1, SchedulerPolicy::Balanced);
-        assert_eq!(ordered[0].node.id, fast.node.id);
+        let fast_first = (0..64)
+            .filter(|sequence| {
+                selector
+                    .order(&nodes, *sequence, SchedulerPolicy::Balanced)
+                    .first()
+                    .is_some_and(|node| node.node.id == fast.node.id)
+            })
+            .count();
+        assert!(
+            fast_first > 48,
+            "fast node won only {fast_first}/64 selections"
+        );
     }
 
     #[test]

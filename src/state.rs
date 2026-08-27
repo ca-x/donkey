@@ -6,8 +6,12 @@ use std::sync::{
 use sea_orm::DatabaseConnection;
 
 use crate::{
-    cache::CacheStore, config::Config, error::AppError, nodes::NodeService,
-    registry_routes::RegistryRouteService, scheduler::Scheduler,
+    cache::CacheStore,
+    config::Config,
+    error::AppError,
+    nodes::NodeService,
+    registry_routes::RegistryRouteService,
+    scheduler::{Scheduler, SchedulerAlgorithmKind},
 };
 
 #[derive(Clone)]
@@ -65,6 +69,20 @@ impl RuntimeFlags {
 
 impl AppState {
     pub async fn new(config: Config) -> Result<Self, AppError> {
+        Self::new_from_config(config, None).await
+    }
+
+    pub async fn new_with_algorithm(
+        config: Config,
+        algorithm: SchedulerAlgorithmKind,
+    ) -> Result<Self, AppError> {
+        Self::new_from_config(config, Some(algorithm)).await
+    }
+
+    async fn new_from_config(
+        config: Config,
+        algorithm_override: Option<SchedulerAlgorithmKind>,
+    ) -> Result<Self, AppError> {
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let db = crate::db::connect(&config.database_url).await?;
         let mut config = config;
@@ -74,6 +92,10 @@ impl AppState {
         config
             .apply_runtime_overrides(&persisted)
             .map_err(AppError::Internal)?;
+        let algorithm = algorithm_override.unwrap_or_else(|| {
+            SchedulerAlgorithmKind::parse(&config.scheduler_algorithm)
+                .unwrap_or(SchedulerAlgorithmKind::Current)
+        });
         let config = Arc::new(config);
         if config.registry_auth_value().is_none() && crate::db::has_authenticated_nodes(&db).await?
         {
@@ -86,11 +108,12 @@ impl AppState {
         let auth = crate::auth::AuthService::new(config.clone(), db.clone()).await?;
         let cache = CacheStore::new(config.clone(), db.clone()).await?;
         let upstream = crate::upstream::UpstreamService::new(config.clone(), nodes.clone());
-        let scheduler = Scheduler::new(
+        let scheduler = Scheduler::new_with_algorithm(
             config.clone(),
             nodes.clone(),
             cache.clone(),
             upstream.clone(),
+            algorithm,
         );
         let image_tools =
             crate::image_tools::ImageTools::new(config.clone(), db.clone(), nodes.clone()).await?;

@@ -159,6 +159,7 @@ export interface RuntimeConfig {
   partial_ttl_seconds: number
   health_interval_seconds: number
   scheduler_policy: 'balanced' | 'speed-first'
+  scheduler_algorithm: 'current-balanced' | 'projected-completion'
   max_cache_bytes: number
   cache_used_bytes: number
   cache_entries: number
@@ -178,7 +179,7 @@ export interface RuntimeConfig {
   pull_log_max_entries: number
 }
 
-export type RuntimeSettingsInput = Pick<RuntimeConfig, 'chunk_size' | 'adaptive_chunking_enabled' | 'automatic_concurrency_enabled' | 'chunk_concurrency' | 'parallel_threshold' | 'resumable_threshold' | 'scheduler_policy' | 'upstream_timeout_seconds' | 'stream_fallback_timeout_seconds' | 'partial_ttl_seconds' | 'max_cache_bytes' | 'cache_policy' | 'cache_high_watermark' | 'cache_low_watermark' | 'cache_ttl_seconds' | 'public_bearer_cache_enabled' | 'health_interval_seconds' | 'max_export_bytes' | 'export_ttl_seconds' | 'pull_logging_enabled' | 'pull_log_retention_days' | 'pull_log_max_entries'>
+export type RuntimeSettingsInput = Pick<RuntimeConfig, 'chunk_size' | 'adaptive_chunking_enabled' | 'automatic_concurrency_enabled' | 'chunk_concurrency' | 'parallel_threshold' | 'resumable_threshold' | 'scheduler_policy' | 'scheduler_algorithm' | 'upstream_timeout_seconds' | 'stream_fallback_timeout_seconds' | 'partial_ttl_seconds' | 'max_cache_bytes' | 'cache_policy' | 'cache_high_watermark' | 'cache_low_watermark' | 'cache_ttl_seconds' | 'public_bearer_cache_enabled' | 'health_interval_seconds' | 'max_export_bytes' | 'export_ttl_seconds' | 'pull_logging_enabled' | 'pull_log_retention_days' | 'pull_log_max_entries'>
 
 export interface PullEvent {
   id: string

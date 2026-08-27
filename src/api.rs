@@ -335,6 +335,7 @@ struct RuntimeConfig {
     max_export_bytes: u64,
     export_ttl_seconds: u64,
     scheduler_policy: String,
+    scheduler_algorithm: String,
     max_cache_bytes: u64,
     cache_used_bytes: u64,
     cache_entries: usize,
@@ -369,6 +370,8 @@ struct RuntimeSettingsInput {
     parallel_threshold: u64,
     resumable_threshold: u64,
     scheduler_policy: String,
+    #[serde(default = "default_scheduler_algorithm")]
+    scheduler_algorithm: String,
     upstream_timeout_seconds: u64,
     stream_fallback_timeout_seconds: u64,
     partial_ttl_seconds: u64,
@@ -384,6 +387,10 @@ struct RuntimeSettingsInput {
     pull_logging_enabled: bool,
     pull_log_retention_days: u64,
     pull_log_max_entries: u64,
+}
+
+fn default_scheduler_algorithm() -> String {
+    "current-balanced".to_owned()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -455,6 +462,7 @@ async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<Runtime
             parallel_threshold: config.parallel_threshold,
             resumable_threshold: config.resumable_threshold,
             scheduler_policy: config.scheduler_policy.to_string(),
+            scheduler_algorithm: config.scheduler_algorithm.clone(),
             upstream_timeout_seconds: config.upstream_timeout.as_secs(),
             stream_fallback_timeout_seconds: config.stream_fallback_timeout.as_secs(),
             partial_ttl_seconds: config.partial_ttl.as_secs(),
@@ -808,6 +816,10 @@ fn validate_runtime_settings(input: &RuntimeSettingsInput) -> ApiResult<()> {
         ));
     }
     if !matches!(input.scheduler_policy.as_str(), "balanced" | "speed-first")
+        || !matches!(
+            input.scheduler_algorithm.as_str(),
+            "current-balanced" | "projected-completion"
+        )
         || !matches!(input.cache_policy.as_str(), "balanced" | "lru" | "lfu")
     {
         return Err(crate::error::AppError::bad_request(
@@ -838,6 +850,7 @@ fn runtime_setting_values(input: &RuntimeSettingsInput) -> Vec<(String, String)>
         ("parallel_threshold", input.parallel_threshold.to_string()),
         ("resumable_threshold", input.resumable_threshold.to_string()),
         ("scheduler_policy", input.scheduler_policy.clone()),
+        ("scheduler_algorithm", input.scheduler_algorithm.clone()),
         (
             "upstream_timeout_seconds",
             input.upstream_timeout_seconds.to_string(),
@@ -919,6 +932,7 @@ fn runtime_config(
         max_export_bytes: config.max_export_bytes,
         export_ttl_seconds: config.export_ttl.as_secs(),
         scheduler_policy: config.scheduler_policy.to_string(),
+        scheduler_algorithm: config.scheduler_algorithm.clone(),
         max_cache_bytes: config.max_cache_bytes,
         cache_used_bytes: cache.bytes,
         cache_entries: cache.entries,
@@ -1013,6 +1027,34 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_update_switches_scheduler_algorithm_immediately() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(crate::Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let mut settings = export_runtime(State(state.clone()))
+            .await
+            .unwrap()
+            .0
+            .settings
+            .unwrap();
+        settings.scheduler_algorithm = "projected-completion".into();
+        let _ = update_runtime(State(state.clone()), Json(settings))
+            .await
+            .unwrap();
+        assert_eq!(state.scheduler.algorithm_name(), "projected-completion");
+        assert_eq!(
+            db::load_runtime_settings(&state.db)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|setting| setting.key == "scheduler_algorithm")
+                .map(|setting| setting.value),
+            Some("projected-completion".into())
         );
     }
 

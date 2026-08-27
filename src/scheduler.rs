@@ -60,6 +60,29 @@ pub struct SchedulerStats {
     pub cooling_nodes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchedulerAlgorithmKind {
+    Current,
+    ProjectedCompletion,
+}
+
+impl SchedulerAlgorithmKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "current-balanced" | "current" => Some(Self::Current),
+            "projected-completion" | "projected" => Some(Self::ProjectedCompletion),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current-balanced",
+            Self::ProjectedCompletion => "projected-completion",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SchedulerRuntimeConfig {
     chunk_size: u64,
@@ -121,6 +144,36 @@ impl Scheduler {
         cache: CacheStore,
         upstream: UpstreamService,
     ) -> Self {
+        Self::new_from_config(config, nodes, cache, upstream, None)
+    }
+
+    pub fn new_with_algorithm(
+        config: Arc<Config>,
+        nodes: NodeService,
+        cache: CacheStore,
+        upstream: UpstreamService,
+        algorithm: SchedulerAlgorithmKind,
+    ) -> Self {
+        Self::new_from_config(config, nodes, cache, upstream, Some(algorithm))
+    }
+
+    fn new_from_config(
+        config: Arc<Config>,
+        nodes: NodeService,
+        cache: CacheStore,
+        upstream: UpstreamService,
+        algorithm_override: Option<SchedulerAlgorithmKind>,
+    ) -> Self {
+        let algorithm = algorithm_override.unwrap_or_else(|| {
+            SchedulerAlgorithmKind::parse(&config.scheduler_algorithm)
+                .unwrap_or(SchedulerAlgorithmKind::Current)
+        });
+        let selector = match algorithm {
+            SchedulerAlgorithmKind::Current => NodeSelector::new(),
+            SchedulerAlgorithmKind::ProjectedCompletion => NodeSelector::with_algorithm(Arc::new(
+                crate::scheduling::ProjectedCompletionAlgorithm,
+            )),
+        };
         Self {
             runtime: Arc::new(RwLock::new(SchedulerRuntimeConfig {
                 chunk_size: config.chunk_size,
@@ -135,13 +188,17 @@ impl Scheduler {
             nodes,
             cache,
             upstream,
-            selector: NodeSelector::new(),
+            selector,
             stats: Arc::new(SchedulerCounters::default()),
             capabilities: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(std::time::Duration::from_secs(600))
                 .build(),
         }
+    }
+
+    pub fn algorithm_name(&self) -> &'static str {
+        self.selector.algorithm_name()
     }
 
     pub async fn update_runtime(&self, config: &Config) {
@@ -154,6 +211,16 @@ impl Scheduler {
         runtime.chunk_concurrency = config.chunk_concurrency;
         runtime.scheduler_policy = config.scheduler_policy;
         runtime.stream_fallback_timeout = config.stream_fallback_timeout;
+        drop(runtime);
+        let algorithm = SchedulerAlgorithmKind::parse(&config.scheduler_algorithm)
+            .unwrap_or(SchedulerAlgorithmKind::Current);
+        let implementation: Arc<dyn crate::scheduling::SchedulerAlgorithm> = match algorithm {
+            SchedulerAlgorithmKind::Current => Arc::new(crate::scheduling::CurrentAlgorithm),
+            SchedulerAlgorithmKind::ProjectedCompletion => {
+                Arc::new(crate::scheduling::ProjectedCompletionAlgorithm)
+            }
+        };
+        self.selector.set_algorithm(implementation);
     }
 
     pub async fn stream_fallback_timeout(&self) -> std::time::Duration {
@@ -161,22 +228,45 @@ impl Scheduler {
     }
 
     pub async fn ordered_stream_nodes(&self, nodes: &[NodeView], path: &str) -> Vec<NodeView> {
-        let digest = Sha256::digest(path.as_bytes());
-        let sequence = u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix")) as usize;
+        let sequence = Self::sequence_for(path, 0);
         let policy = self.runtime.read().await.scheduler_policy;
-        self.ordered_nodes(nodes, sequence, policy)
-            .into_iter()
-            .cloned()
-            .collect()
+        self.ordered_nodes_with_context(
+            nodes,
+            crate::scheduling::ScheduleContext {
+                sequence,
+                blob_size: 0,
+                range_required: false,
+                chunk: None,
+            },
+            policy,
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    }
+
+    pub(crate) fn sequence_for(path: &str, part: u64) -> u64 {
+        let mut hasher = Sha256::new();
+        hasher.update(path.as_bytes());
+        // Keep the initial stream choice compatible with the pre-Trait
+        // scheduler (which hashed the path alone), while salting subsequent
+        // chunks/resume offsets so equal chunk indexes from different Blobs do
+        // not repeatedly hit the same node.
+        if part != 0 {
+            hasher.update([0]);
+            hasher.update(part.to_be_bytes());
+        }
+        let digest = hasher.finalize();
+        u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix"))
     }
 
     pub(crate) async fn ordered_parallel_nodes(
         &self,
         nodes: &[NodeView],
-        sequence: usize,
+        context: crate::scheduling::ScheduleContext,
     ) -> Vec<NodeView> {
         let policy = self.runtime.read().await.scheduler_policy;
-        self.ordered_nodes(nodes, sequence, policy)
+        self.ordered_nodes_with_context(nodes, context, policy)
             .into_iter()
             .cloned()
             .collect()
@@ -345,18 +435,28 @@ impl Scheduler {
                 )));
             }
         };
-        let (can_parallel, planned_chunk_size) = match plan {
+        let (can_parallel, planned_chunk_size, preferred_single) = match plan {
             BlobDownloadPlan {
                 strategy: DownloadStrategy::MultiSourceChunked { chunk_size, .. },
-            } => (true, chunk_size),
+            } => (true, chunk_size, None),
             BlobDownloadPlan {
                 strategy: DownloadStrategy::CacheHit,
-            }
-            | BlobDownloadPlan {
-                strategy: DownloadStrategy::SingleRequest { .. },
-            } => (false, runtime.chunk_size),
+            } => (false, runtime.chunk_size, None),
+            BlobDownloadPlan {
+                strategy: DownloadStrategy::SingleRequest { node_url },
+            } => (false, runtime.chunk_size, Some(node_url)),
         };
         runtime.chunk_size = planned_chunk_size;
+        let fallback_nodes = preferred_single
+            .as_deref()
+            .map(|preferred| {
+                let mut nodes = detected.fallback_nodes.clone();
+                if let Some(index) = nodes.iter().position(|node| node.node.url == preferred) {
+                    nodes.rotate_left(index);
+                }
+                nodes
+            })
+            .unwrap_or_else(|| detected.fallback_nodes.clone());
 
         let partial_dir = self.cache.temp_dir().join(key);
         tokio::fs::create_dir_all(&partial_dir).await?;
@@ -389,7 +489,7 @@ impl Scheduler {
                 );
                 let _ = tokio::fs::remove_file(&merged).await;
                 self.download_whole(
-                    &detected.fallback_nodes,
+                    &fallback_nodes,
                     request_path,
                     request_headers,
                     &merged,
@@ -413,7 +513,7 @@ impl Scheduler {
             .await?;
         } else {
             self.download_whole(
-                &detected.fallback_nodes,
+                &fallback_nodes,
                 request_path,
                 request_headers,
                 &merged,
@@ -490,11 +590,21 @@ impl Scheduler {
         let mut capacity_wait = capacity_backoff_policy();
         loop {
             let mut attempted = false;
-            for node in self.ordered_nodes(nodes, 0, policy) {
-                let offset = tokio::fs::metadata(destination).await?.len();
-                if offset >= total_size {
-                    return Ok(());
-                }
+            let offset = tokio::fs::metadata(destination).await?.len();
+            if offset >= total_size {
+                return Ok(());
+            }
+            let candidates = self.ordered_nodes_with_context(
+                nodes,
+                crate::scheduling::ScheduleContext {
+                    sequence: Self::sequence_for(request_path, offset),
+                    blob_size: total_size,
+                    range_required: true,
+                    chunk: Some((offset, total_size - 1)),
+                },
+                policy,
+            );
+            for node in candidates {
                 if self.at_capacity(node.node.id, node.max_concurrency) {
                     continue;
                 }
@@ -652,13 +762,21 @@ impl Scheduler {
                 .filter(|(_, capabilities)| capabilities.supports_range)
                 .map(|(node, _)| node.clone())
                 .collect();
-            let compatible_nodes = compatible.into_iter().map(|(node, _)| node).collect();
+            let compatible_nodes = compatible
+                .into_iter()
+                .map(|(node, _)| node)
+                .collect::<Vec<_>>();
             return Ok(DetectedCapabilities {
                 size: baseline.size,
                 media_type: baseline.media_type,
-                nodes: compatible_nodes,
+                nodes: compatible_nodes.clone(),
                 range_nodes,
-                fallback_nodes: nodes.to_vec(),
+                // A node that failed capability detection is not a safe
+                // fallback: retrying it for every chunk amplifies failures
+                // and can duplicate upstream traffic.  Keep only nodes that
+                // agreed on the Blob size; Range-capable nodes are included
+                // here as they can also serve a complete request.
+                fallback_nodes: compatible_nodes.clone(),
             });
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("capability detection failed".into())))
@@ -733,18 +851,28 @@ impl Scheduler {
         let mut capacity_wait = capacity_backoff_policy();
         loop {
             let mut attempted = false;
-            for node in self.ordered_nodes(nodes, chunk.index, policy) {
+            let candidates = self.ordered_nodes_with_context(
+                nodes,
+                crate::scheduling::ScheduleContext {
+                    sequence: Self::sequence_for(request_path, chunk.index as u64),
+                    blob_size: chunk.total_size,
+                    range_required: true,
+                    chunk: Some((chunk.start, chunk.end)),
+                },
+                policy,
+            );
+            for node in candidates {
                 if self.at_capacity(node.node.id, node.max_concurrency) {
                     continue;
                 }
                 let lease = self.acquire(node.node.id, node.max_concurrency).await;
                 attempted = true;
                 let started = Instant::now();
+                let existing = tokio::fs::metadata(destination)
+                    .await
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
                 let result = async {
-                    let existing = tokio::fs::metadata(destination)
-                        .await
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0);
                     let chunk_size = chunk.end - chunk.start + 1;
                     if existing > chunk_size {
                         let _ = tokio::fs::remove_file(destination).await;
@@ -802,20 +930,14 @@ impl Scheduler {
                     }
                 }
                 .await;
-                self.observe_node(
-                    node.node.id,
-                    chunk.end - chunk.start + 1,
-                    started.elapsed(),
-                    result.is_ok(),
-                );
+                let bytes = tokio::fs::metadata(destination)
+                    .await
+                    .map(|metadata| metadata.len().saturating_sub(existing))
+                    .unwrap_or(0);
+                self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
                 drop(lease);
                 self.nodes
-                    .record_transfer(
-                        node.node.id,
-                        chunk.end - chunk.start + 1,
-                        started.elapsed(),
-                        result.is_ok(),
-                    )
+                    .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
                     .await;
                 match result {
                     Ok(()) => return Ok(()),
@@ -853,7 +975,17 @@ impl Scheduler {
         let mut capacity_wait = capacity_backoff_policy();
         loop {
             let mut attempted = false;
-            for node in self.ordered_nodes(nodes, 0, policy) {
+            let candidates = self.ordered_nodes_with_context(
+                nodes,
+                crate::scheduling::ScheduleContext {
+                    sequence: Self::sequence_for(request_path, total_size.unwrap_or_default()),
+                    blob_size: total_size.unwrap_or_default(),
+                    range_required: false,
+                    chunk: None,
+                },
+                policy,
+            );
+            for node in candidates {
                 if self.at_capacity(node.node.id, node.max_concurrency) {
                     continue;
                 }
@@ -968,7 +1100,17 @@ impl Scheduler {
     ) -> ApiResult<()> {
         let policy = self.runtime.read().await.scheduler_policy;
         let mut last_error = None;
-        for node in self.ordered_nodes(nodes, 0, policy) {
+        let candidates = self.ordered_nodes_with_context(
+            nodes,
+            crate::scheduling::ScheduleContext {
+                sequence: Self::sequence_for(request_path, total_size.unwrap_or_default()),
+                blob_size: total_size.unwrap_or_default(),
+                range_required: false,
+                chunk: None,
+            },
+            policy,
+        );
+        for node in candidates {
             let started = Instant::now();
             let result = match self
                 .download_whole(
@@ -999,13 +1141,13 @@ impl Scheduler {
         Err(last_error.unwrap_or(AppError::Integrity))
     }
 
-    fn ordered_nodes<'a>(
+    fn ordered_nodes_with_context<'a>(
         &self,
         nodes: &'a [NodeView],
-        sequence: usize,
+        context: crate::scheduling::ScheduleContext,
         policy: SchedulerPolicy,
     ) -> Vec<&'a NodeView> {
-        self.selector.order(nodes, sequence, policy)
+        self.selector.order_with_context(nodes, context, policy)
     }
 
     async fn acquire(&self, node_id: Uuid, max_concurrency: u16) -> NodeLease {
@@ -1319,6 +1461,21 @@ mod tests {
         assert_eq!(
             effective_chunk_size(test_runtime(false), 1024 * 1024 * 1024, 16),
             512 * 1024
+        );
+    }
+
+    #[test]
+    fn sequence_salts_chunks_but_keeps_initial_stream_hash_stable() {
+        assert_eq!(
+            Scheduler::sequence_for("/v2/library/redis/blobs/sha256:x", 0),
+            {
+                let digest = Sha256::digest("/v2/library/redis/blobs/sha256:x".as_bytes());
+                u64::from_be_bytes(digest[..8].try_into().unwrap())
+            }
+        );
+        assert_ne!(
+            Scheduler::sequence_for("/v2/library/redis/blobs/sha256:x", 1),
+            Scheduler::sequence_for("/v2/library/redis/blobs/sha256:x", 2)
         );
     }
 

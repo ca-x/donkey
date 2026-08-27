@@ -59,7 +59,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
     adaptive_chunking_enabled: config.adaptive_chunking_enabled,
     automatic_concurrency_enabled: config.automatic_concurrency_enabled,
     parallel_threshold: config.parallel_threshold, resumable_threshold: config.resumable_threshold,
-    scheduler_policy: config.scheduler_policy, upstream_timeout_seconds: config.upstream_timeout_seconds,
+    scheduler_policy: config.scheduler_policy, scheduler_algorithm: config.scheduler_algorithm, upstream_timeout_seconds: config.upstream_timeout_seconds,
     stream_fallback_timeout_seconds: config.stream_fallback_timeout_seconds, max_cache_bytes: config.max_cache_bytes,
     partial_ttl_seconds: config.partial_ttl_seconds,
     cache_policy: config.cache_policy, cache_high_watermark: config.cache_high_watermark,
@@ -76,7 +76,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
   const handleImport = async () => { if (!importFile) return; try { const parsed = JSON.parse(await importFile.text()) as import('../types').RuntimeSettingsExport; if (parsed.format !== 'donkey-runtime-settings' || parsed.version !== 1 || !Array.isArray(parsed.nodes) || !Array.isArray(parsed.registry_routes)) throw new Error(t('settings.invalidImport')); setPendingImport(parsed) } catch (error) { notifications.show({ color: 'red', message: error instanceof Error ? error.message : t('settings.invalidImport') }) } }
   const reset = () => form.setValues({
     chunk_size: 2 * 1024 * 1024, chunk_concurrency: 32, parallel_threshold: 8 * 1024 * 1024,
-    resumable_threshold: 8 * 1024 * 1024, scheduler_policy: 'balanced', upstream_timeout_seconds: 30,
+    resumable_threshold: 8 * 1024 * 1024, scheduler_policy: 'balanced', scheduler_algorithm: 'current-balanced', upstream_timeout_seconds: 30,
     stream_fallback_timeout_seconds: 10, partial_ttl_seconds: 3600, max_cache_bytes: 50 * 1024 ** 3,
     cache_policy: 'balanced', cache_high_watermark: 0.9, cache_low_watermark: 0.8,
     cache_ttl_seconds: 0, health_interval_seconds: 60, max_export_bytes: 20 * 1024 ** 3, export_ttl_seconds: 7 * 86400,
@@ -99,6 +99,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
     <SimpleGrid cols={{ base: 1, md: 2 }}>
       {!form.values.automatic_concurrency_enabled && <NumberInput label={t('concurrencyHelp.blobLabel')} description={t('concurrencyHelp.blobDescription')} min={1} max={64} {...form.getInputProps('chunk_concurrency')} />}
       <Select label={t('settings.schedulerPolicy')} data={[{ value: 'balanced', label: t('settings.balancedPolicy') }, { value: 'speed-first', label: t('settings.speedFirstPolicy') }]} {...form.getInputProps('scheduler_policy')} />
+      <Select label={t('settings.schedulerAlgorithm')} description={form.values.scheduler_algorithm === 'projected-completion' ? t('settings.projectedAlgorithmDescription') : t('settings.currentAlgorithmDescription')} data={[{ value: 'current-balanced', label: t('settings.currentAlgorithm') }, { value: 'projected-completion', label: t('settings.projectedAlgorithm') }]} {...form.getInputProps('scheduler_algorithm')} />
       <NumberInput label={t('settings.upstreamTimeout')} min={1} max={3600} suffix=" s" {...form.getInputProps('upstream_timeout_seconds')} />
       <UnitInput label={t('cache.capacity')} value={form.values.max_cache_bytes} onChange={(value) => form.setFieldValue('max_cache_bytes', value)} />
       <Select label={t('cache.policy')} data={[{ value: 'balanced', label: t('cache.balanced') }, { value: 'lru', label: t('cache.lru') }, { value: 'lfu', label: t('cache.lfu') }]} {...form.getInputProps('cache_policy')} />

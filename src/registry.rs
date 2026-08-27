@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use http_content_range::ContentRange;
 use sha2::{Digest, Sha256};
@@ -208,6 +209,35 @@ async fn stream_blob(
     nodes: Vec<crate::nodes::NodeView>,
 ) -> ApiResult<Response> {
     let nodes = state.scheduler.ordered_stream_nodes(&nodes, path).await;
+    if nodes.is_empty() {
+        return Err(AppError::unavailable(
+            "no enabled Registry nodes are available for Blob streaming",
+        ));
+    }
+    let cache = state.cache.clone();
+    let key = cache
+        .request_key(
+            &nodes[0].route.id.to_string(),
+            path,
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            nodes
+                .iter()
+                .all(|node| node.node.auth_mode == "none" && node.node.auth_secret_enc.is_none()),
+        )
+        .await;
+    if let Some(object) = cache.get(&key).await? {
+        return serve_cached(&cache, object, cached_get_request(path, &headers)?).await;
+    }
+    // Acquire the per-Blob lease before opening an upstream connection.  A
+    // second request for the same uncached Blob now waits for the first relay,
+    // then rechecks the index instead of duplicating the entire transfer.
+    let lease = cache.lock(&key).await?;
+    if let Some(object) = cache.get(&key).await? {
+        drop(lease);
+        return serve_cached(&cache, object, cached_get_request(path, &headers)?).await;
+    }
     let mut last_error = None;
     for (node_index, node) in nodes.iter().enumerate() {
         let started = std::time::Instant::now();
@@ -259,7 +289,23 @@ async fn stream_blob(
         let status = upstream.status();
         let response_headers = upstream.headers().clone();
         let Some(window) = stream_window(&upstream) else {
-            return Ok(to_response(upstream));
+            let media_type = response_headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_owned();
+            return stream_unknown_blob(UnknownBlobRelay {
+                cache,
+                key,
+                media_type,
+                expected_digest: expected_digest.map(str::to_owned),
+                node: node.clone(),
+                scheduler: state.scheduler.clone(),
+                node_service: state.nodes.clone(),
+                response: upstream,
+                _lease: lease,
+            })
+            .await;
         };
         let stream_config = state
             .scheduler
@@ -291,20 +337,6 @@ async fn stream_blob(
             .unwrap_or("application/octet-stream")
             .to_owned();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-        let cache = state.cache.clone();
-        let key = cache
-            .request_key(
-                &nodes[0].route.id.to_string(),
-                path,
-                headers
-                    .get(header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok()),
-                nodes.iter().all(|node| {
-                    node.node.auth_mode == "none" && node.node.auth_secret_enc.is_none()
-                }),
-            )
-            .await;
-        let lease = cache.lock(&key).await?;
         let expected = expected_digest.map(str::to_owned);
         let relay = StreamRelay {
             upstream: state.upstream.clone(),
@@ -322,6 +354,7 @@ async fn stream_blob(
             node_service: state.nodes.clone(),
             parallel,
             scheduler: state.scheduler.clone(),
+            range_failures: std::sync::Arc::new(DashMap::new()),
         };
         tokio::spawn(async move {
             let errors = tx.clone();
@@ -347,6 +380,113 @@ async fn stream_blob(
     Err(last_error.unwrap_or_else(|| AppError::unavailable("all upstream nodes failed")))
 }
 
+fn cached_get_request(path: &str, headers: &HeaderMap) -> ApiResult<Request> {
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .body(Body::empty())
+        .map_err(AppError::internal)?;
+    *request.headers_mut() = headers.clone();
+    Ok(request)
+}
+
+async fn stream_unknown_blob(relay: UnknownBlobRelay) -> ApiResult<Response> {
+    let status = relay.response.status();
+    let response_headers = relay.response.headers().clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        let errors = tx.clone();
+        if let Err(error) = relay_unknown_blob(relay, tx).await {
+            let _ = errors
+                .send(Err(std::io::Error::other(error.to_string())))
+                .await;
+        }
+    });
+    let body = futures_util::stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    });
+    let mut response = Response::new(Body::from_stream(body));
+    *response.status_mut() = status;
+    copy_response_headers(&response_headers, response.headers_mut());
+    response.headers_mut().remove(header::CONTENT_LENGTH);
+    response.headers_mut().insert(
+        "docker-distribution-api-version",
+        header::HeaderValue::from_static("registry/2.0"),
+    );
+    Ok(response)
+}
+
+async fn relay_unknown_blob(
+    relay: UnknownBlobRelay,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> ApiResult<()> {
+    let UnknownBlobRelay {
+        cache,
+        key,
+        media_type,
+        expected_digest,
+        node,
+        scheduler,
+        node_service,
+        response,
+        _lease,
+    } = relay;
+    let partial_dir = cache.temp_dir().join(&key);
+    tokio::fs::create_dir_all(&partial_dir).await?;
+    let partial = partial_dir.join("object.partial");
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&partial)
+        .await?;
+    let started = std::time::Instant::now();
+    let mut transferred = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut body = response.bytes_stream();
+    let result = async {
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| AppError::Upstream(error.to_string()))?;
+            if chunk.is_empty() {
+                continue;
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk).await?;
+            transferred = transferred.saturating_add(chunk.len() as u64);
+            node_service.record_live_bytes(node.node.id, chunk.len() as u64);
+            tx.send(Ok(chunk))
+                .await
+                .map_err(|_| AppError::Upstream("client disconnected during Blob stream".into()))?;
+        }
+        file.flush().await?;
+        if let Some(expected) = expected_digest.as_deref() {
+            let actual = format!("sha256:{:x}", hasher.finalize());
+            if actual != expected {
+                // Do not replay a full-size corrupt partial on the next
+                // request; it would fail the same digest check forever while
+                // never giving an alternate node a chance to repair it.
+                let _ = tokio::fs::remove_file(&partial).await;
+                return Err(AppError::Integrity);
+            }
+        }
+        cache
+            .admit(&key, &partial, &media_type, expected_digest)
+            .await?;
+        Ok(())
+    }
+    .await;
+    scheduler.observe_node(node.node.id, transferred, started.elapsed(), result.is_ok());
+    node_service
+        .record_transfer(node.node.id, transferred, started.elapsed(), result.is_ok())
+        .await;
+    if result.is_ok() {
+        let _ = tokio::fs::remove_dir_all(&partial_dir).await;
+    } else {
+        let _ = tokio::fs::remove_file(&partial).await;
+    }
+    result
+}
+
 #[derive(Clone, Copy)]
 struct StreamWindow {
     start: u64,
@@ -370,11 +510,26 @@ struct StreamRelay {
     node_service: crate::nodes::NodeService,
     parallel: Option<crate::scheduler::StreamDownloadConfig>,
     scheduler: crate::scheduler::Scheduler,
+    range_failures: std::sync::Arc<DashMap<uuid::Uuid, ()>>,
+}
+
+struct UnknownBlobRelay {
+    cache: CacheStore,
+    key: String,
+    media_type: String,
+    expected_digest: Option<String>,
+    node: crate::nodes::NodeView,
+    scheduler: crate::scheduler::Scheduler,
+    node_service: crate::nodes::NodeService,
+    response: reqwest::Response,
+    _lease: CacheLease,
 }
 
 struct ResumeRequest<'a> {
     upstream: &'a crate::upstream::UpstreamService,
     nodes: &'a [crate::nodes::NodeView],
+    scheduler: &'a crate::scheduler::Scheduler,
+    node_service: &'a crate::nodes::NodeService,
     current_node: usize,
     path: &'a str,
     headers: &'a HeaderMap,
@@ -441,6 +596,7 @@ async fn relay_stream_blob(
         node_service,
         parallel,
         scheduler,
+        range_failures,
     } = relay;
     let complete_blob = window.start == 0 && window.end.checked_add(1) == Some(window.total);
     let stable_partial_dir = cache.temp_dir().join(&key);
@@ -495,6 +651,8 @@ async fn relay_stream_blob(
             let (next_node, next_response) = resume_stream_response(ResumeRequest {
                 upstream: &upstream,
                 nodes: &nodes,
+                scheduler: &scheduler,
+                node_service: &node_service,
                 current_node,
                 path: &path,
                 headers: &headers,
@@ -532,6 +690,7 @@ async fn relay_stream_blob(
             file: &mut file,
             hasher: &mut hasher,
             tx: &tx,
+            range_failures: range_failures.clone(),
         })
         .await?;
         offset = window.end + 1;
@@ -606,6 +765,8 @@ async fn relay_stream_blob(
         let (next_node, next_response) = resume_stream_response(ResumeRequest {
             upstream: &upstream,
             nodes: &nodes,
+            scheduler: &scheduler,
+            node_service: &node_service,
             current_node,
             path: &path,
             headers: &headers,
@@ -623,6 +784,7 @@ async fn relay_stream_blob(
         if let Some(expected) = expected_digest.as_deref() {
             let actual = format!("sha256:{:x}", hasher.finalize());
             if actual != expected {
+                let _ = tokio::fs::remove_file(&partial).await;
                 return Err(AppError::Integrity);
             }
         }
@@ -651,12 +813,41 @@ async fn resume_stream_response(
         .build();
     let mut last_error = None;
     loop {
-        for step in 1..=request.nodes.len() {
-            let index = (request.current_node + step) % request.nodes.len();
+        let ordered = request
+            .scheduler
+            .ordered_parallel_nodes(
+                request.nodes,
+                crate::scheduling::ScheduleContext {
+                    sequence: crate::scheduler::Scheduler::sequence_for(
+                        request.path,
+                        request.start,
+                    ),
+                    blob_size: request.total,
+                    range_required: true,
+                    chunk: Some((request.start, request.end)),
+                },
+            )
+            .await;
+        let mut candidates = ordered
+            .into_iter()
+            .filter(|node| node.node.id != request.nodes[request.current_node].node.id)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            candidates = request.nodes.to_vec();
+        }
+        for node in candidates {
+            let Some(index) = request
+                .nodes
+                .iter()
+                .position(|candidate| candidate.node.id == node.node.id)
+            else {
+                continue;
+            };
+            let started = std::time::Instant::now();
             match request
                 .upstream
                 .send(
-                    &request.nodes[index],
+                    &node,
                     Method::GET,
                     request.path,
                     request.headers,
@@ -672,16 +863,35 @@ async fn resume_stream_response(
                                 && window.total == request.total
                         }) =>
                 {
+                    request
+                        .scheduler
+                        .observe_node(node.node.id, 0, started.elapsed(), true);
                     return Ok((index, response));
                 }
                 Ok(response) => {
+                    request
+                        .scheduler
+                        .observe_node(node.node.id, 0, started.elapsed(), false);
+                    request
+                        .node_service
+                        .record_transfer(node.node.id, 0, started.elapsed(), false)
+                        .await;
                     last_error = Some(format!(
                         "{} returned an invalid resume response ({})",
-                        request.nodes[index].node.name,
+                        node.node.name,
                         response.status()
                     ));
                 }
-                Err(error) => last_error = Some(error.to_string()),
+                Err(error) => {
+                    request
+                        .scheduler
+                        .observe_node(node.node.id, 0, started.elapsed(), false);
+                    request
+                        .node_service
+                        .record_transfer(node.node.id, 0, started.elapsed(), false)
+                        .await;
+                    last_error = Some(error.to_string());
+                }
             }
         }
         let Some(delay) = policy.next_backoff() else {
@@ -716,6 +926,7 @@ struct ParallelRelay<'a> {
     file: &'a mut tokio::fs::File,
     hasher: &'a mut Sha256,
     tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    range_failures: std::sync::Arc<DashMap<uuid::Uuid, ()>>,
 }
 
 struct ParallelChunkRequest {
@@ -726,6 +937,7 @@ struct ParallelChunkRequest {
     path: std::sync::Arc<str>,
     headers: std::sync::Arc<HeaderMap>,
     chunk: StreamChunk,
+    range_failures: std::sync::Arc<DashMap<uuid::Uuid, ()>>,
 }
 
 async fn relay_parallel_ranges(relay: ParallelRelay<'_>) -> ApiResult<()> {
@@ -757,6 +969,7 @@ async fn relay_parallel_ranges(relay: ParallelRelay<'_>) -> ApiResult<()> {
                 path: path.clone(),
                 headers: headers.clone(),
                 chunk,
+                range_failures: relay.range_failures.clone(),
             })
         })
         .buffered(concurrency);
@@ -791,9 +1004,23 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
         let mut attempted = false;
         let candidates = request
             .scheduler
-            .ordered_parallel_nodes(&request.nodes, request.chunk.sequence)
+            .ordered_parallel_nodes(
+                &request.nodes,
+                crate::scheduling::ScheduleContext {
+                    sequence: crate::scheduler::Scheduler::sequence_for(
+                        &request.path,
+                        request.chunk.sequence as u64,
+                    ),
+                    blob_size: request.chunk.total,
+                    range_required: true,
+                    chunk: Some((request.chunk.start, request.chunk.end)),
+                },
+            )
             .await;
         for node in candidates {
+            if request.range_failures.contains_key(&node.node.id) {
+                continue;
+            }
             let Some(permit) = request
                 .scheduler
                 .try_acquire(node.node.id, node.max_concurrency)
@@ -859,10 +1086,21 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
             match result {
                 Ok(bytes) => return Ok(bytes),
                 Err(error) => {
+                    // A malformed Range response is not useful for any other
+                    // chunk of this Blob.  Exclude the node for the remainder
+                    // of this stream so every chunk does not repeat the same
+                    // failed probe.  Transport failures still go through the
+                    // scheduler cooldown and may be retried later.
+                    if matches!(&error, AppError::Integrity) {
+                        request.range_failures.insert(node.node.id, ());
+                    }
                     request.scheduler.record_retry();
                     last_error = Some(error);
                 }
             }
+        }
+        if request.range_failures.len() >= request.nodes.len() {
+            return Err(last_error.unwrap_or(AppError::Integrity));
         }
         if !attempted {
             let delay = capacity_wait

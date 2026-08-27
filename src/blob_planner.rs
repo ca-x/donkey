@@ -195,8 +195,11 @@ fn single_plan(node: &NodeSnapshot) -> BlobDownloadPlan {
 }
 
 fn estimated_time_ms(size: u64, node: &NodeSnapshot) -> f64 {
-    let throughput = node.throughput_bps.unwrap_or(0).max(1) as f64;
-    let latency = node.latency_ms.unwrap_or(0) as f64;
+    // Unknown nodes use a conservative bootstrap estimate. Treating an
+    // unknown value as 1 B/s makes the choice numerically arbitrary and can
+    // prevent a healthy newly-added node from ever being explored.
+    let throughput = node.throughput_bps.unwrap_or(10 * 1024 * 1024).max(1) as f64;
+    let latency = node.latency_ms.unwrap_or(100) as f64;
     latency + size as f64 * 1_000.0 / throughput
 }
 
@@ -291,6 +294,47 @@ mod tests {
             plan.strategy,
             DownloadStrategy::SingleRequest { .. }
         ));
+    }
+
+    #[test]
+    fn single_request_plan_keeps_the_fastest_node_as_preference() {
+        let blob = BlobMeta {
+            digest: "sha256:abc".into(),
+            size: 32 * 1024 * 1024,
+            media_type: "application/octet-stream".into(),
+        };
+        let nodes = [
+            NodeSnapshot {
+                url: "slow".into(),
+                supports_range: true,
+                max_concurrency: 4,
+                throughput_bps: Some(2 * 1024 * 1024),
+                latency_ms: Some(20),
+                success_rate: 1.0,
+                cooling: false,
+            },
+            NodeSnapshot {
+                url: "fast".into(),
+                supports_range: true,
+                max_concurrency: 4,
+                throughput_bps: Some(20 * 1024 * 1024),
+                latency_ms: Some(20),
+                success_rate: 1.0,
+                cooling: false,
+            },
+        ];
+        let plan = BlobPlanner::new(PlannerConfig {
+            small_blob_threshold: 64 * 1024 * 1024,
+            ..Default::default()
+        })
+        .plan(&blob, false, &nodes)
+        .unwrap();
+        assert_eq!(
+            plan.strategy,
+            DownloadStrategy::SingleRequest {
+                node_url: "fast".into()
+            }
+        );
     }
 
     #[test]

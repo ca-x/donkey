@@ -137,6 +137,16 @@ impl ObjectStore {
         })
     }
 
+    /// Serialize cache admissions across processes without blocking ordinary
+    /// readers or streams.  The in-memory capacity mutex only protects clones
+    /// in one process; this file lock closes the check/evict/commit race when
+    /// multiple Donkey instances share the same data directory.
+    pub(super) async fn lock_capacity(&self) -> ApiResult<ObjectWriteGuard> {
+        Ok(ObjectWriteGuard {
+            _lock: lock_file(self.root.join("capacity.lock"), true).await?,
+        })
+    }
+
     pub(super) async fn cleanup_partials(&self, ttl: std::time::Duration) {
         cleanup_partial_files(&self.root.join("tmp"), ttl).await;
     }

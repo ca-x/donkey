@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 use axum::{Router, body::Body, http::header};
 use donkey::{
     AppState, Config, nodes::NodeInput, registry_routes::DOCKER_HUB_ROUTE_ID,
-    server::registry_router,
+    scheduler::SchedulerAlgorithmKind, server::registry_router,
 };
 use http::{HeaderMap, Method, Request, StatusCode};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 const BASELINE: &[&str] = &["https://docker.1ms.run/"];
@@ -30,6 +31,8 @@ const ALL_SOURCE: &[&str] = &[
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json";
 
 struct ProbeResult {
+    algorithm: &'static str,
+    manifest_digest: String,
     digest: String,
     bytes: usize,
     elapsed: Duration,
@@ -42,11 +45,26 @@ struct ProbeResult {
 #[tokio::test]
 #[ignore = "manual external mirror diagnostic; regional network access is not CI-stable"]
 async fn compare_single_1ms_with_multi_source_donkey() {
-    let baseline = probe("redis", "latest", BASELINE).await;
-    let multi = probe("redis", "latest", MULTI_SOURCE).await;
+    let baseline = probe("redis", "latest", BASELINE, SchedulerAlgorithmKind::Current).await;
+    let current = probe(
+        "redis",
+        &baseline.manifest_digest,
+        MULTI_SOURCE,
+        SchedulerAlgorithmKind::Current,
+    )
+    .await;
+    let projected = probe(
+        "redis",
+        &baseline.manifest_digest,
+        MULTI_SOURCE,
+        SchedulerAlgorithmKind::ProjectedCompletion,
+    )
+    .await;
 
     eprintln!(
-        "redis:latest largest layer\nbaseline: digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}\nmulti:    digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
+        "redis:{} largest layer\nbaseline ({:?}): digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}\nmulti current ({:?}): digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}\nmulti projected ({:?}): digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
+        baseline.manifest_digest,
+        baseline.algorithm,
         baseline.digest,
         baseline.bytes,
         baseline.elapsed,
@@ -54,26 +72,97 @@ async fn compare_single_1ms_with_multi_source_donkey() {
         baseline.parallel_blobs,
         baseline.retries,
         baseline.chunk_size,
-        multi.digest,
-        multi.bytes,
-        multi.elapsed,
-        multi.node_metrics,
-        multi.parallel_blobs,
-        multi.retries,
-        multi.chunk_size
+        current.algorithm,
+        current.digest,
+        current.bytes,
+        current.elapsed,
+        current.node_metrics,
+        current.parallel_blobs,
+        current.retries,
+        current.chunk_size,
+        projected.algorithm,
+        projected.digest,
+        projected.bytes,
+        projected.elapsed,
+        projected.node_metrics,
+        projected.parallel_blobs,
+        projected.retries,
+        projected.chunk_size
     );
-    assert_eq!(baseline.digest, multi.digest);
-    assert_eq!(baseline.bytes, multi.bytes);
+    assert_eq!(baseline.digest, current.digest);
+    assert_eq!(baseline.digest, projected.digest);
+    assert_eq!(baseline.bytes, current.bytes);
+    assert_eq!(baseline.bytes, projected.bytes);
+}
+
+#[tokio::test]
+#[ignore = "manual external mirror diagnostic; regional network access is not CI-stable"]
+async fn probe_redis_multi_source_algorithms() {
+    let current = probe(
+        "redis",
+        "latest",
+        MULTI_SOURCE,
+        SchedulerAlgorithmKind::Current,
+    )
+    .await;
+    let projected = probe(
+        "redis",
+        &current.manifest_digest,
+        MULTI_SOURCE,
+        SchedulerAlgorithmKind::ProjectedCompletion,
+    )
+    .await;
+    eprintln!(
+        "redis:{} multi-source largest layer\ncurrent: digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}\nprojected: digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
+        current.manifest_digest,
+        current.digest,
+        current.bytes,
+        current.elapsed,
+        current.node_metrics,
+        current.parallel_blobs,
+        current.retries,
+        current.chunk_size,
+        projected.digest,
+        projected.bytes,
+        projected.elapsed,
+        projected.node_metrics,
+        projected.parallel_blobs,
+        projected.retries,
+        projected.chunk_size,
+    );
+    assert_eq!(current.digest, projected.digest);
+    assert_eq!(current.bytes, projected.bytes);
 }
 
 #[tokio::test]
 #[ignore = "manual external mirror diagnostic; regional network access is not CI-stable"]
 async fn compare_golang_single_1ms_with_multi_source_donkey() {
-    let baseline = probe("golang", "latest", BASELINE).await;
-    let multi = probe("golang", "latest", MULTI_SOURCE).await;
+    let baseline = probe(
+        "golang",
+        "latest",
+        BASELINE,
+        SchedulerAlgorithmKind::Current,
+    )
+    .await;
+    let current = probe(
+        "golang",
+        &baseline.manifest_digest,
+        MULTI_SOURCE,
+        SchedulerAlgorithmKind::Current,
+    )
+    .await;
+    let projected = probe(
+        "golang",
+        &baseline.manifest_digest,
+        MULTI_SOURCE,
+        SchedulerAlgorithmKind::ProjectedCompletion,
+    )
+    .await;
 
     eprintln!(
-        "golang:latest largest layer\nbaseline: digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}\nmulti:    digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
+        "golang:{} largest layer\nbaseline ({:?}): digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}\nmulti current ({:?}): digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}\nmulti projected ({:?}): digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
+        baseline.manifest_digest,
+        baseline.algorithm,
         baseline.digest,
         baseline.bytes,
         baseline.elapsed,
@@ -81,38 +170,78 @@ async fn compare_golang_single_1ms_with_multi_source_donkey() {
         baseline.parallel_blobs,
         baseline.retries,
         baseline.chunk_size,
-        multi.digest,
-        multi.bytes,
-        multi.elapsed,
-        multi.node_metrics,
-        multi.parallel_blobs,
-        multi.retries,
-        multi.chunk_size
+        current.algorithm,
+        current.digest,
+        current.bytes,
+        current.elapsed,
+        current.node_metrics,
+        current.parallel_blobs,
+        current.retries,
+        current.chunk_size,
+        projected.algorithm,
+        projected.digest,
+        projected.bytes,
+        projected.elapsed,
+        projected.node_metrics,
+        projected.parallel_blobs,
+        projected.retries,
+        projected.chunk_size
     );
-    assert_eq!(baseline.digest, multi.digest);
-    assert_eq!(baseline.bytes, multi.bytes);
+    assert_eq!(baseline.digest, current.digest);
+    assert_eq!(baseline.digest, projected.digest);
+    assert_eq!(baseline.bytes, current.bytes);
+    assert_eq!(baseline.bytes, projected.bytes);
 }
 
 #[tokio::test]
 #[ignore = "manual external mirror diagnostic; regional network access is not CI-stable"]
 async fn probe_golang_multi_source_donkey() {
-    let multi = probe("golang", "latest", MULTI_SOURCE).await;
+    let current = probe(
+        "golang",
+        "latest",
+        MULTI_SOURCE,
+        SchedulerAlgorithmKind::Current,
+    )
+    .await;
+    let projected = probe(
+        "golang",
+        &current.manifest_digest,
+        MULTI_SOURCE,
+        SchedulerAlgorithmKind::ProjectedCompletion,
+    )
+    .await;
     eprintln!(
-        "golang:latest multi-source largest layer\ndigest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
-        multi.digest,
-        multi.bytes,
-        multi.elapsed,
-        multi.node_metrics,
-        multi.parallel_blobs,
-        multi.retries,
-        multi.chunk_size
+        "golang:{} multi-source largest layer\ncurrent: digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}\nprojected: digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
+        current.manifest_digest,
+        current.digest,
+        current.bytes,
+        current.elapsed,
+        current.node_metrics,
+        current.parallel_blobs,
+        current.retries,
+        current.chunk_size,
+        projected.digest,
+        projected.bytes,
+        projected.elapsed,
+        projected.node_metrics,
+        projected.parallel_blobs,
+        projected.retries,
+        projected.chunk_size,
     );
+    assert_eq!(current.digest, projected.digest);
+    assert_eq!(current.bytes, projected.bytes);
 }
 
 #[tokio::test]
 #[ignore = "manual external mirror diagnostic; regional network access is not CI-stable"]
 async fn probe_golang_all_configured_sources_donkey() {
-    let multi = probe("golang", "latest", ALL_SOURCE).await;
+    let multi = probe(
+        "golang",
+        "latest",
+        ALL_SOURCE,
+        SchedulerAlgorithmKind::ProjectedCompletion,
+    )
+    .await;
     eprintln!(
         "golang:latest all-source largest layer\ndigest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
         multi.digest,
@@ -125,7 +254,12 @@ async fn probe_golang_all_configured_sources_donkey() {
     );
 }
 
-async fn probe(repository: &str, reference: &str, endpoints: &[&str]) -> ProbeResult {
+async fn probe(
+    repository: &str,
+    reference: &str,
+    endpoints: &[&str],
+    algorithm: SchedulerAlgorithmKind,
+) -> ProbeResult {
     let directory = tempfile::tempdir().unwrap();
     let mut config = Config::for_test(directory.path().to_owned());
     config.chunk_size = 2 * 1024 * 1024;
@@ -133,7 +267,9 @@ async fn probe(repository: &str, reference: &str, endpoints: &[&str]) -> ProbeRe
     config.parallel_threshold = 4 * 1024 * 1024;
     config.stream_fallback_timeout = Duration::from_secs(1);
     config.upstream_timeout = Duration::from_secs(30);
-    let state = AppState::new(config).await.unwrap();
+    let state = AppState::new_with_algorithm(config, algorithm)
+        .await
+        .unwrap();
     for (index, endpoint) in endpoints.iter().enumerate() {
         state
             .nodes
@@ -155,7 +291,8 @@ async fn probe(repository: &str, reference: &str, endpoints: &[&str]) -> ProbeRe
             .unwrap();
     }
     let router = registry_router(state.clone());
-    let index = manifest(router.clone(), repository, reference).await;
+    let (index, mut manifest_digest) =
+        manifest_with_digest(router.clone(), repository, reference).await;
     let manifest = if let Some(manifests) = index.get("manifests").and_then(Value::as_array) {
         let descriptor = manifests
             .iter()
@@ -167,12 +304,14 @@ async fn probe(repository: &str, reference: &str, endpoints: &[&str]) -> ProbeRe
                         == Some("amd64")
             })
             .expect("linux/amd64 descriptor");
-        manifest(
-            router.clone(),
-            repository,
-            descriptor["digest"].as_str().expect("manifest digest"),
-        )
-        .await
+        let descriptor_digest = descriptor["digest"]
+            .as_str()
+            .expect("manifest digest")
+            .to_owned();
+        let (manifest, resolved_digest) =
+            manifest_with_digest(router.clone(), repository, &descriptor_digest).await;
+        manifest_digest = resolved_digest.or(Some(descriptor_digest));
+        manifest
     } else {
         index
     };
@@ -234,6 +373,8 @@ async fn probe(repository: &str, reference: &str, endpoints: &[&str]) -> ProbeRe
         .collect();
     let scheduler = state.scheduler.stats();
     ProbeResult {
+        algorithm: state.scheduler.algorithm_name(),
+        manifest_digest: manifest_digest.unwrap_or_else(|| reference.to_owned()),
         digest,
         bytes: body.len(),
         elapsed,
@@ -244,7 +385,11 @@ async fn probe(repository: &str, reference: &str, endpoints: &[&str]) -> ProbeRe
     }
 }
 
-async fn manifest(router: Router, repository: &str, reference: &str) -> Value {
+async fn manifest_with_digest(
+    router: Router,
+    repository: &str,
+    reference: &str,
+) -> (Value, Option<String>) {
     let response = request(
         router,
         Method::GET,
@@ -253,10 +398,16 @@ async fn manifest(router: Router, repository: &str, reference: &str) -> Value {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    let header_digest = response
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let body = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
         .await
         .unwrap();
-    serde_json::from_slice(&body).unwrap()
+    let digest = header_digest.or_else(|| Some(format!("sha256:{:x}", Sha256::digest(&body))));
+    (serde_json::from_slice(&body).unwrap(), digest)
 }
 
 async fn request(

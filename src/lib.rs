@@ -15,6 +15,7 @@ pub mod nodes;
 pub mod registry;
 pub mod registry_routes;
 pub mod scheduler;
+pub(crate) mod scheduling;
 pub mod security;
 pub mod server;
 pub mod state;

@@ -305,6 +305,7 @@ http://proxy-user:proxy-password@donkey-host:5003
 | `DONKEY_PARALLEL_THRESHOLD` | `8388608` | 大于该值才启用分片 |
 | `DONKEY_RESUMABLE_THRESHOLD` | `8388608` | 大于该值且上游支持 Range 时启用断点续传 |
 | `DONKEY_SCHEDULER_POLICY` | `balanced` | `balanced` 或 `speed-first` |
+| `DONKEY_SCHEDULER_ALGORITHM` | `current-balanced` | `current-balanced` 适合稳定节点；`projected-completion` 综合吞吐、延迟、成功率和在途负载，适合速度差异或波动明显的节点 |
 | `DONKEY_UPSTREAM_TIMEOUT` | `30s` | 单个上游请求超时 |
 | `DONKEY_STREAM_FALLBACK_TIMEOUT` | `10s` | 完整缓存下载超过该时间后切换流式响应 |
 | `DONKEY_PARTIAL_TTL` | `1h` | 断点临时文件最长保留时间 |

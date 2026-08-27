@@ -38,6 +38,7 @@ pub struct Config {
     pub parallel_threshold: u64,
     pub resumable_threshold: u64,
     pub scheduler_policy: SchedulerPolicy,
+    pub scheduler_algorithm: String,
     pub upstream_timeout: Duration,
     pub stream_fallback_timeout: Duration,
     pub partial_ttl: Duration,
@@ -192,6 +193,7 @@ impl Config {
                 u64::MAX,
             )?,
             scheduler_policy: scheduler_policy_env()?,
+            scheduler_algorithm: scheduler_algorithm_env()?,
             upstream_timeout: duration_env("DONKEY_UPSTREAM_TIMEOUT", "30s")?,
             stream_fallback_timeout: duration_env("DONKEY_STREAM_FALLBACK_TIMEOUT", "10s")?,
             partial_ttl: duration_env("DONKEY_PARTIAL_TTL", "1h")?,
@@ -267,6 +269,7 @@ impl Config {
             parallel_threshold: 1024 * 1024,
             resumable_threshold: 8 * 1024 * 1024,
             scheduler_policy: SchedulerPolicy::Balanced,
+            scheduler_algorithm: "current-balanced".into(),
             upstream_timeout: Duration::from_secs(5),
             stream_fallback_timeout: Duration::from_secs(10),
             partial_ttl: Duration::from_secs(3600),
@@ -309,6 +312,15 @@ impl Config {
                         "speed-first" => SchedulerPolicy::SpeedFirst,
                         _ => anyhow::bail!("invalid persisted scheduler_policy"),
                     }
+                }
+                "scheduler_algorithm" => {
+                    if !matches!(
+                        setting.value.as_str(),
+                        "current-balanced" | "projected-completion"
+                    ) {
+                        anyhow::bail!("invalid persisted scheduler_algorithm")
+                    }
+                    self.scheduler_algorithm = setting.value.clone();
                 }
                 "upstream_timeout_seconds" => {
                     self.upstream_timeout = Duration::from_secs(setting.value.parse()?)
@@ -512,6 +524,22 @@ fn scheduler_policy_env() -> anyhow::Result<SchedulerPolicy> {
     }
 }
 
+fn scheduler_algorithm_env() -> anyhow::Result<String> {
+    let value = env_or("DONKEY_SCHEDULER_ALGORITHM", "current-balanced").to_ascii_lowercase();
+    if matches!(
+        value.as_str(),
+        "current-balanced" | "current" | "projected-completion" | "projected"
+    ) {
+        Ok(match value.as_str() {
+            "current" => "current-balanced".to_owned(),
+            "projected" => "projected-completion".to_owned(),
+            _ => value,
+        })
+    } else {
+        bail!("DONKEY_SCHEDULER_ALGORITHM must be current-balanced or projected-completion")
+    }
+}
+
 fn f64_env(key: &str, default: f64, min: f64, max: f64) -> anyhow::Result<f64> {
     let value = env_or(key, &default.to_string())
         .parse::<f64>()
@@ -595,9 +623,14 @@ mod tests {
                     key: "stream_fallback_timeout_seconds".into(),
                     value: "22".into(),
                 },
+                crate::db::RuntimeSetting {
+                    key: "scheduler_algorithm".into(),
+                    value: "projected-completion".into(),
+                },
             ])
             .unwrap();
         assert_eq!(config.resumable_threshold, 4 * 1024 * 1024);
         assert_eq!(config.stream_fallback_timeout.as_secs(), 22);
+        assert_eq!(config.scheduler_algorithm, "projected-completion");
     }
 }

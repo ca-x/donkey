@@ -139,6 +139,20 @@ const resources = {
 
 Object.assign(resources.zh.translation.imageTools, imageToolLabels.zh)
 Object.assign(resources.en.translation.imageTools, imageToolLabels.en)
+Object.assign(resources.zh.translation.settings, {
+  schedulerAlgorithm: '调度算法',
+  currentAlgorithm: '当前算法（稳健均衡）',
+  projectedAlgorithm: '预计完成时间（自适应）',
+  currentAlgorithmDescription: '适合节点表现稳定、希望保持平滑流量分布的场景。',
+  projectedAlgorithmDescription: '综合吞吐、延迟、成功率和在途负载，适合节点速度差异或网络波动明显的场景。',
+})
+Object.assign(resources.en.translation.settings, {
+  schedulerAlgorithm: 'Scheduling algorithm',
+  currentAlgorithm: 'Current (balanced)',
+  projectedAlgorithm: 'Projected completion (adaptive)',
+  currentAlgorithmDescription: 'Best for stable nodes when you want smooth, predictable traffic distribution.',
+  projectedAlgorithmDescription: 'Combines throughput, latency, success rate, and in-flight load for uneven or fluctuating nodes.',
+})
 
 const initialLanguage = localStorage.getItem('donkey-language') ?? (navigator.language.startsWith('zh') ? 'zh' : 'en')
 document.documentElement.lang = initialLanguage === 'zh' ? 'zh-CN' : 'en'
