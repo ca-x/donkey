@@ -43,6 +43,14 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked --all-targets
+      - name: Verify Docker archive can be loaded
+        env:
+          DONKEY_DOCKER_ARCHIVE_OUTPUT: /tmp/donkey-archive-fixture.tar
+        run: |
+          cargo test --locked docker_archive_fixture_for_ci_load
+          docker load --input "$DONKEY_DOCKER_ARCHIVE_OUTPUT"
+          docker image inspect donkey/archive-fixture:latest >/dev/null
+          docker image rm donkey/archive-fixture:latest >/dev/null
       - name: Build embedded binary
         run: cargo build --locked
       - name: Check helper scripts

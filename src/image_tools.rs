@@ -2733,6 +2733,46 @@ mod tests {
         assert!(!paths.iter().any(|path| path == "manifest.json"));
     }
 
+    #[test]
+    fn docker_archive_fixture_for_ci_load() {
+        let Some(output) = std::env::var_os("DONKEY_DOCKER_ARCHIVE_OUTPUT").map(PathBuf::from)
+        else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let layer = directory.path().join("layer.tar");
+        let file = std::fs::File::create(&layer).unwrap();
+        let mut layer_builder = tar::Builder::new(file);
+        let payload = b"donkey archive fixture\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(payload.len() as u64);
+        header.set_cksum();
+        layer_builder
+            .append_data(&mut header, "fixture.txt", &payload[..])
+            .unwrap();
+        layer_builder.finish().unwrap();
+        let layer_bytes = std::fs::read(&layer).unwrap();
+        let diff_id = format!("sha256:{:x}", Sha256::digest(&layer_bytes));
+        let config = serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": { "type": "layers", "diff_ids": [diff_id] },
+            "history": [{ "created_by": "donkey archive CI fixture" }],
+            "config": { "Cmd": ["/bin/sh"] }
+        })
+        .to_string();
+        build_docker_archive(
+            &output,
+            &config,
+            "donkey/archive-fixture:latest".into(),
+            &[layer],
+            &["application/vnd.oci.image.layer.v1.tar".into()],
+        )
+        .unwrap();
+        assert!(output.is_file());
+    }
+
     #[tokio::test]
     async fn same_selected_id_has_only_one_claim_cas_winner() {
         let (_directory, service) = test_service().await;
