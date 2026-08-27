@@ -849,13 +849,44 @@ pub async fn save_node(db: &DatabaseConnection, model: node::Model) -> Result<no
 }
 
 pub async fn delete_node(db: &DatabaseConnection, id: Uuid) -> Result<u64, DbErr> {
-    let deleted = node::Entity::delete_by_id(id).exec(db).await?.rows_affected;
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "DELETE FROM node_limits WHERE node_id = ?",
-        [id.to_string().into()],
-    ))
-    .await?;
+    let transaction = db
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await?;
+    let active_job = image_job::Entity::find()
+        .filter(image_job::Column::SourceNodeId.eq(id))
+        .filter(image_job::Column::Status.is_in(["pending", "running"]))
+        .one(&transaction)
+        .await?
+        .is_some();
+    let sync_rule = image_sync_rule::Entity::find()
+        .filter(image_sync_rule::Column::SourceNodeId.eq(id))
+        .one(&transaction)
+        .await?
+        .is_some();
+    if active_job || sync_rule {
+        transaction.rollback().await?;
+        return Err(DbErr::Custom(
+            "node is referenced by an active job or sync rule".into(),
+        ));
+    }
+    node_metric::Entity::delete_by_id(id)
+        .exec(&transaction)
+        .await?;
+    transaction
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM node_limits WHERE node_id = ?",
+            [id.to_string().into()],
+        ))
+        .await?;
+    let deleted = node::Entity::delete_by_id(id)
+        .exec(&transaction)
+        .await?
+        .rows_affected;
+    transaction.commit().await?;
     Ok(deleted)
 }
 

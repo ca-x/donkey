@@ -289,7 +289,17 @@ impl NodeService {
     }
 
     pub async fn delete(&self, id: Uuid) -> ApiResult<()> {
-        if db::delete_node(&self.db, id).await? == 0 {
+        let deleted = db::delete_node(&self.db, id)
+            .await
+            .map_err(|error| match &error {
+                sea_orm::DbErr::Custom(message)
+                    if message == "node is referenced by an active job or sync rule" =>
+                {
+                    AppError::conflict(message.clone())
+                }
+                _ => error.into(),
+            })?;
+        if deleted == 0 {
             return Err(AppError::not_found("node"));
         }
         Ok(())
@@ -665,6 +675,7 @@ mod tests {
         DOCKER_HUB_ROUTE_ID, GHCR_ROUTE_ID, RegistryRouteInput, RegistryRouteService,
     };
     use axum::http::StatusCode;
+    use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel};
     use secrecy::SecretString;
 
     fn plain_node_input(registry_route_id: Uuid) -> NodeInput {
@@ -849,5 +860,56 @@ mod tests {
             nodes.create(plain_node_input(route.id)),
         );
         assert_one_success_one_conflict(delete, create.map(|_| ()));
+    }
+
+    #[tokio::test]
+    async fn node_delete_is_blocked_by_sync_rule_and_cleans_runtime_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.credential_key = Some(SecretString::from("22".repeat(32)));
+        let db = db::connect(&config.database_url).await.unwrap();
+        let service = NodeService::new(Arc::new(config), db.clone()).unwrap();
+        let node = service
+            .create(plain_node_input(
+                crate::registry_routes::DOCKER_HUB_ROUTE_ID,
+            ))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let rule = crate::db::image_sync_rule::Model {
+            id: Uuid::new_v4(),
+            name: "uses node".into(),
+            enabled: true,
+            source_ref: "docker.io/library/redis:latest".into(),
+            source_node_id: Some(node.node.id),
+            source_credential_id: None,
+            destination_ref: "registry.example/redis:latest".into(),
+            destination_credential_id: Uuid::new_v4(),
+            platform_os: "linux".into(),
+            platform_arch: "amd64".into(),
+            cron: "0 * * * * *".into(),
+            timezone: "UTC".into(),
+            last_digest: None,
+            last_run_at: None,
+            next_run_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            service.delete(node.node.id).await,
+            Err(AppError::Conflict(_))
+        ));
+        crate::db::image_sync_rule::Entity::delete_by_id(rule.id)
+            .exec(&db)
+            .await
+            .unwrap();
+        service.delete(node.node.id).await.unwrap();
+        assert!(db::get_node(&db, node.node.id).await.unwrap().is_none());
+        assert!(db::metric_for(&db, node.node.id).await.unwrap().is_none());
     }
 }
