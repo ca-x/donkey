@@ -562,6 +562,9 @@ pub async fn replace_runtime_settings(
     settings: &[(String, String)],
 ) -> Result<(), DbErr> {
     let transaction = db.begin().await?;
+    transaction
+        .execute_unprepared("DELETE FROM runtime_settings")
+        .await?;
     for (key, value) in settings {
         transaction
             .execute_raw(Statement::from_sql_and_values(
@@ -1409,10 +1412,20 @@ mod tests {
     #[tokio::test]
     async fn runtime_settings_round_trip() {
         let db = connect("sqlite::memory:").await.unwrap();
+        replace_runtime_settings(
+            &db,
+            &[
+                ("resumable_threshold".into(), "4194304".into()),
+                ("chunk_concurrency".into(), "8".into()),
+            ],
+        )
+            .await
+            .unwrap();
         replace_runtime_settings(&db, &[("resumable_threshold".into(), "4194304".into())])
             .await
             .unwrap();
         let settings = load_runtime_settings(&db).await.unwrap();
+        assert_eq!(settings.len(), 1);
         assert_eq!(settings[0].key, "resumable_threshold");
         assert_eq!(settings[0].value, "4194304");
     }
