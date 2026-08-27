@@ -182,15 +182,7 @@ async fn list_cache(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<CacheEntryView>>> {
-    Ok(Json(
-        state
-            .cache
-            .list(query.limit)
-            .await?
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-    ))
+    Ok(Json(state.cache.list(query.limit).await?))
 }
 
 async fn delete_cache(
