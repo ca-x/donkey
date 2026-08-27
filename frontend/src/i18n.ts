@@ -29,6 +29,8 @@ const ui = {
     settingsTitle: '参数设置',
     settingsDescription: '调整并持久化运行参数、缓存策略和账户信息。部署说明已移至独立页面。',
     unitLabel: '{{label}}的单位',
+    publicBearerCache: '公共 Registry 跨令牌复用缓存',
+    publicBearerCacheDescription: '默认关闭。开启后，仅对未配置上游认证的命名空间忽略 Bearer 令牌轮换；认证节点和不同命名空间仍保持隔离。',
   },
   en: {
     more: 'More',
@@ -40,6 +42,8 @@ const ui = {
     settingsTitle: 'Settings',
     settingsDescription: 'Tune and persist runtime parameters, cache policy, and account information. Deployment guidance has its own page.',
     unitLabel: 'Unit for {{label}}',
+    publicBearerCache: 'Reuse public Registry cache across tokens',
+    publicBearerCacheDescription: 'Off by default. When enabled, only namespaces without upstream credentials ignore Bearer token rotation; authenticated nodes and separate namespaces remain isolated.',
   },
 } as const
 

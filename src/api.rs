@@ -336,6 +336,7 @@ struct RuntimeConfig {
     cache_high_watermark: f64,
     cache_low_watermark: f64,
     cache_ttl_seconds: Option<u64>,
+    public_bearer_cache_enabled: bool,
     admin_external_tls: bool,
     admin_external_loopback: bool,
     registry_external_tls: bool,
@@ -370,6 +371,7 @@ struct RuntimeSettingsInput {
     cache_high_watermark: f64,
     cache_low_watermark: f64,
     cache_ttl_seconds: Option<u64>,
+    public_bearer_cache_enabled: bool,
     health_interval_seconds: u64,
     max_export_bytes: u64,
     export_ttl_seconds: u64,
@@ -455,6 +457,7 @@ async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<Runtime
             cache_high_watermark: config.cache_high_watermark,
             cache_low_watermark: config.cache_low_watermark,
             cache_ttl_seconds: config.cache_ttl.map(|value| value.as_secs()),
+            public_bearer_cache_enabled: config.public_bearer_cache_enabled,
             health_interval_seconds: config.health_interval.as_secs(),
             max_export_bytes: config.max_export_bytes,
             export_ttl_seconds: config.export_ttl.as_secs(),
@@ -507,13 +510,16 @@ async fn validate_import_snapshot(
     }
     let existing = state.registry_routes.list().await?;
     for node in &export.nodes {
-        if node.auth_mode != "none" {
+        if !matches!(
+            node.auth_mode.as_str(),
+            "none" | "basic" | "bearer" | "header"
+        ) {
             return Err(crate::error::AppError::bad_request(format!(
-                "node '{}' requires credentials after import",
+                "node '{}' has an invalid authentication mode",
                 node.name
             )));
         }
-        if !(1..=256).contains(&node.max_concurrency) {
+        if !(1..=64).contains(&node.max_concurrency) {
             return Err(crate::error::AppError::bad_request(format!(
                 "node '{}' has an invalid concurrency limit",
                 node.name
@@ -628,13 +634,13 @@ async fn apply_runtime_snapshot(state: &AppState, export: &RuntimeSettingsExport
                 name: input.name.trim().to_owned(),
                 url: canonical,
                 registry_route_id: route_id,
-                enabled: input.enabled,
+                enabled: input.enabled && node.auth_mode == "none",
                 priority: input.priority,
                 cf_preferred: input.cf_preferred,
                 connect_ip: input.connect_ip,
-                auth_mode: "none".into(),
-                auth_username: None,
-                auth_header: None,
+                auth_mode: node.auth_mode.clone(),
+                auth_username: node.auth_username.clone(),
+                auth_header: node.auth_header.clone(),
                 auth_secret_enc: None,
                 created_at: existing.map_or(now, |node| node.created_at),
                 updated_at: now,
@@ -824,6 +830,10 @@ fn runtime_setting_values(input: &RuntimeSettingsInput) -> Vec<(String, String)>
             input.cache_ttl_seconds.unwrap_or(0).to_string(),
         ),
         (
+            "public_bearer_cache_enabled",
+            input.public_bearer_cache_enabled.to_string(),
+        ),
+        (
             "health_interval_seconds",
             input.health_interval_seconds.to_string(),
         ),
@@ -887,6 +897,7 @@ fn runtime_config(
         cache_high_watermark: config.cache_high_watermark,
         cache_low_watermark: config.cache_low_watermark,
         cache_ttl_seconds: config.cache_ttl.map(|value| value.as_secs()),
+        public_bearer_cache_enabled: config.public_bearer_cache_enabled,
         admin_external_tls: config.admin_external_tls,
         admin_external_loopback: config.admin_external_loopback,
         registry_external_tls: config.registry_external_tls,
@@ -974,5 +985,42 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_import_disables_node_until_secret_is_reentered() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(crate::Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let export = RuntimeSettingsExport {
+            format: "donkey-runtime-settings".into(),
+            version: 1,
+            settings: None,
+            registry_routes: Vec::new(),
+            nodes: vec![ExportNode {
+                name: "authenticated import".into(),
+                url: "http://127.0.0.1:5002/".into(),
+                registry_route: crate::registry_routes::DOCKER_HUB_ROUTE_KEY.into(),
+                enabled: true,
+                priority: 3,
+                max_concurrency: 8,
+                cf_preferred: false,
+                connect_ip: None,
+                auth_mode: "basic".into(),
+                auth_username: Some("robot".into()),
+                auth_header: None,
+            }],
+        };
+
+        validate_import_snapshot(&state, &export).await.unwrap();
+        apply_runtime_snapshot(&state, &export).await.unwrap();
+
+        let imported = db::list_nodes(&state.db).await.unwrap();
+        assert_eq!(imported.len(), 1);
+        assert!(!imported[0].enabled);
+        assert_eq!(imported[0].auth_mode, "basic");
+        assert_eq!(imported[0].auth_username.as_deref(), Some("robot"));
+        assert!(imported[0].auth_secret_enc.is_none());
     }
 }

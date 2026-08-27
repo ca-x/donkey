@@ -35,6 +35,7 @@ struct CacheRuntimeConfig {
     cache_policy: CachePolicy,
     cache_high_watermark: f64,
     cache_low_watermark: f64,
+    public_bearer_cache_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +82,7 @@ pub struct CacheStats {
 pub struct CacheLease {
     key: String,
     active_flights: Arc<DashMap<String, ()>>,
+    _object_guard: object_store::ObjectWriteGuard,
     _guard: OwnedMutexGuard<()>,
 }
 
@@ -93,7 +95,7 @@ impl Drop for CacheLease {
 impl CacheStore {
     pub async fn new(config: Arc<Config>, db: sea_orm::DatabaseConnection) -> ApiResult<Self> {
         let objects = ObjectStore::open(&config.data_dir, config.partial_ttl).await?;
-        Ok(Self {
+        let store = Self {
             objects,
             repository: CacheRepository::new(db),
             flights: Cache::builder()
@@ -108,9 +110,12 @@ impl CacheStore {
                 cache_policy: config.cache_policy,
                 cache_high_watermark: config.cache_high_watermark,
                 cache_low_watermark: config.cache_low_watermark,
+                public_bearer_cache_enabled: config.public_bearer_cache_enabled,
             })),
             capacity_lock: Arc::new(Mutex::new(())),
-        })
+        };
+        store.reconcile_startup().await?;
+        Ok(store)
     }
 
     pub async fn update_runtime(&self, config: &Config) {
@@ -121,10 +126,18 @@ impl CacheStore {
         runtime.cache_policy = config.cache_policy;
         runtime.cache_high_watermark = config.cache_high_watermark;
         runtime.cache_low_watermark = config.cache_low_watermark;
+        runtime.public_bearer_cache_enabled = config.public_bearer_cache_enabled;
     }
 
-    pub fn key(request_path: &str, authorization: Option<&str>) -> String {
+    pub fn key(
+        cache_scope: &str,
+        request_path: &str,
+        authorization: Option<&str>,
+        public_bearer_cache_enabled: bool,
+    ) -> String {
         let mut hasher = Sha256::new();
+        hasher.update(cache_scope.as_bytes());
+        hasher.update([0]);
         let public_identity = request_path
             .rsplit_once("/blobs/")
             .map(|(_, digest)| digest)
@@ -136,10 +149,30 @@ impl CacheStore {
             .unwrap_or(request_path);
         hasher.update(public_identity.as_bytes());
         hasher.update([0]);
-        if let Some(value) = authorization {
+        if let Some(value) = authorization.filter(|value| {
+            !(public_bearer_cache_enabled
+                && value
+                    .get(..7)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer ")))
+        }) {
             hasher.update(value.as_bytes());
         }
         hex::encode(hasher.finalize())
+    }
+
+    pub async fn request_key(
+        &self,
+        cache_scope: &str,
+        request_path: &str,
+        authorization: Option<&str>,
+        public_route: bool,
+    ) -> String {
+        Self::key(
+            cache_scope,
+            request_path,
+            authorization,
+            public_route && self.runtime.read().await.public_bearer_cache_enabled,
+        )
     }
 
     pub fn object_path(&self, key: &str) -> PathBuf {
@@ -182,6 +215,7 @@ impl CacheStore {
         digest: Option<String>,
     ) -> ApiResult<CachedObject> {
         let incoming = tokio::fs::metadata(temporary).await?.len();
+        let _object_write_guard = self.objects.lock_writer().await?;
         let _capacity_guard = self.capacity_lock.lock().await;
         self.reserve_capacity_locked(incoming, key).await?;
         let size = self.objects.commit(key, temporary).await?;
@@ -208,7 +242,8 @@ impl CacheStore {
         })
     }
 
-    pub async fn lock(&self, key: &str) -> CacheLease {
+    pub async fn lock(&self, key: &str) -> ApiResult<CacheLease> {
+        let object_guard = self.objects.lock_writer().await?;
         let lock = self
             .flights
             .get_with(key.to_owned(), async { Arc::new(Mutex::new(())) })
@@ -216,11 +251,12 @@ impl CacheStore {
         let key = key.to_owned();
         let guard = lock.lock_owned().await;
         self.active_flights.insert(key.clone(), ());
-        CacheLease {
+        Ok(CacheLease {
             key,
             active_flights: self.active_flights.clone(),
+            _object_guard: object_guard,
             _guard: guard,
-        }
+        })
     }
 
     pub async fn list(&self, limit: u64) -> ApiResult<Vec<CacheEntryView>> {
@@ -246,20 +282,27 @@ impl CacheStore {
         if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(AppError::bad_request("invalid cache key"));
         }
-        let _guard = self.lock(key).await;
+        let _guard = self.lock(key).await?;
         self.repository.discard_pending_hits(key);
         self.remove_locked(key).await
     }
 
     pub async fn clear_all(&self) -> ApiResult<u64> {
+        let Some(_maintenance_guard) = self.objects.try_lock_maintenance().await? else {
+            return Ok(0);
+        };
         let _capacity_guard = self.capacity_lock.lock().await;
         let entries = self.repository.all().await?;
         let mut freed = 0_u64;
         for entry in &entries {
+            if self.active_flights.contains_key(&entry.key) {
+                continue;
+            }
             self.objects.remove_indexed_path(&entry.path).await?;
+            self.repository.discard_pending_hits(&entry.key);
+            self.repository.delete(&entry.key).await?;
             freed = freed.saturating_add(entry.size_bytes.max(0) as u64);
         }
-        self.repository.clear().await?;
         // Remove orphaned object files and stale partials that are not present
         // in the index. Active downloads remain protected by the partial TTL.
         let partial_ttl = self.runtime.read().await.partial_ttl;
@@ -267,6 +310,29 @@ impl CacheStore {
             .prune_orphans(partial_ttl, &self.active_flights)
             .await;
         Ok(freed)
+    }
+
+    async fn reconcile_startup(&self) -> ApiResult<()> {
+        let _maintenance_guard = self.objects.lock_maintenance().await?;
+        self.objects
+            .cleanup_partials(self.runtime.read().await.partial_ttl)
+            .await;
+        let entries = self.repository.all().await?;
+        let mut indexed = std::collections::HashSet::new();
+        for entry in entries {
+            let valid = tokio::fs::metadata(&entry.path)
+                .await
+                .is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.len() == entry.size_bytes.max(0) as u64
+                });
+            if valid {
+                indexed.insert(entry.key);
+            } else {
+                self.repository.delete(&entry.key).await?;
+            }
+        }
+        self.objects.remove_unindexed(&indexed).await?;
+        Ok(())
     }
 
     async fn remove_locked(&self, key: &str) -> ApiResult<()> {
@@ -384,10 +450,61 @@ mod tests {
 
     #[test]
     fn authorization_scopes_cache_keys_without_storing_secret() {
-        let anonymous = CacheStore::key("/v2/a/blobs/sha256:abc", None);
-        let private = CacheStore::key("/v2/a/blobs/sha256:abc", Some("Bearer secret"));
+        let anonymous = CacheStore::key("route", "/v2/a/blobs/sha256:abc", None, false);
+        let private = CacheStore::key(
+            "route",
+            "/v2/a/blobs/sha256:abc",
+            Some("Bearer secret"),
+            false,
+        );
         assert_ne!(anonymous, private);
         assert!(!private.contains("secret"));
+    }
+
+    #[test]
+    fn explicit_public_bearer_cache_survives_token_rotation() {
+        let path = format!("/v2/library/alpine/blobs/sha256:{}", "a".repeat(64));
+        let first = CacheStore::key("public", &path, Some("Bearer first-token"), true);
+        let rotated = CacheStore::key("public", &path, Some("Bearer rotated-token"), true);
+        let private_first = CacheStore::key("private", &path, Some("Bearer first-token"), false);
+        let private_rotated =
+            CacheStore::key("private", &path, Some("Bearer rotated-token"), false);
+        let basic_first = CacheStore::key("public", &path, Some("Basic first"), true);
+        let basic_second = CacheStore::key("public", &path, Some("Basic second"), true);
+
+        assert_eq!(first, rotated);
+        assert_ne!(private_first, private_rotated);
+        assert_ne!(basic_first, basic_second);
+        assert_ne!(
+            CacheStore::key("first-route", &path, None, true),
+            CacheStore::key("second-route", &path, None, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn public_bearer_setting_never_overrides_private_route_isolation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.public_bearer_cache_enabled = true;
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let cache = CacheStore::new(Arc::new(config), db).await.unwrap();
+        let path = format!("/v2/library/alpine/blobs/sha256:{}", "c".repeat(64));
+
+        let public_first = cache
+            .request_key("dockerhub", &path, Some("Bearer first"), true)
+            .await;
+        let public_rotated = cache
+            .request_key("dockerhub", &path, Some("Bearer rotated"), true)
+            .await;
+        let private_first = cache
+            .request_key("private", &path, Some("Bearer first"), false)
+            .await;
+        let private_rotated = cache
+            .request_key("private", &path, Some("Bearer rotated"), false)
+            .await;
+
+        assert_eq!(public_first, public_rotated);
+        assert_ne!(private_first, private_rotated);
     }
 
     #[tokio::test]
@@ -464,5 +581,97 @@ mod tests {
             .unwrap();
         assert_eq!(stored.hit_count, 0);
         assert_eq!(cache.stats().await.unwrap().hits, 10);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_missing_indexed_files_and_orphans() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.partial_ttl = std::time::Duration::ZERO;
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let missing_key = "e".repeat(64);
+        let now = chrono::Utc::now();
+        crate::db::insert_cache_entry(
+            &db,
+            crate::db::cache_entry::Model {
+                key: missing_key.clone(),
+                media_type: "application/octet-stream".into(),
+                path: directory
+                    .path()
+                    .join("missing-object")
+                    .display()
+                    .to_string(),
+                size_bytes: 8,
+                digest: None,
+                hit_count: 0,
+                created_at: now,
+                last_accessed_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let orphan_key = "f".repeat(64);
+        let orphan = directory
+            .path()
+            .join("cache/objects")
+            .join(&orphan_key[..2])
+            .join(&orphan_key);
+        tokio::fs::create_dir_all(orphan.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&orphan, b"orphan").await.unwrap();
+
+        let _cache = CacheStore::new(Arc::new(config), db.clone()).await.unwrap();
+
+        assert!(
+            crate::db::cache_entry::Entity::find_by_id(missing_key)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn clear_preserves_active_object_and_partial() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.partial_ttl = std::time::Duration::ZERO;
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let cache = CacheStore::new(Arc::new(config), db.clone()).await.unwrap();
+        let temporary = directory.path().join("active.partial");
+        tokio::fs::write(&temporary, b"active payload")
+            .await
+            .unwrap();
+        let key = "1".repeat(64);
+        let object = cache
+            .admit(&key, &temporary, "application/octet-stream", None)
+            .await
+            .unwrap();
+        let partial_dir = cache.temp_dir().join(&key);
+        tokio::fs::create_dir_all(&partial_dir).await.unwrap();
+        let partial = partial_dir.join("object.partial");
+        tokio::fs::write(&partial, b"active partial").await.unwrap();
+        let lease = cache.lock(&key).await.unwrap();
+
+        assert_eq!(cache.clear_all().await.unwrap(), 0);
+        assert!(object.path.exists());
+        assert!(partial.exists());
+        assert!(
+            crate::db::cache_entry::Entity::find_by_id(&key)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        drop(lease);
+        assert_eq!(
+            cache.clear_all().await.unwrap(),
+            b"active payload".len() as u64
+        );
+        assert!(!object.path.exists());
+        assert!(!partial.exists());
     }
 }

@@ -47,6 +47,7 @@ pub struct Config {
     pub cache_high_watermark: f64,
     pub cache_low_watermark: f64,
     pub cache_ttl: Option<Duration>,
+    pub public_bearer_cache_enabled: bool,
     pub max_export_bytes: u64,
     pub export_ttl: Duration,
     pub pull_logging_enabled: bool,
@@ -205,6 +206,7 @@ impl Config {
             cache_high_watermark: high,
             cache_low_watermark: low,
             cache_ttl: optional_duration_env("DONKEY_CACHE_TTL")?,
+            public_bearer_cache_enabled: bool_env("DONKEY_PUBLIC_BEARER_CACHE_ENABLED", false)?,
             max_export_bytes: u64_env(
                 "DONKEY_MAX_EXPORT_BYTES",
                 20 * 1024 * 1024 * 1024,
@@ -274,6 +276,7 @@ impl Config {
             cache_high_watermark: 0.9,
             cache_low_watermark: 0.8,
             cache_ttl: None,
+            public_bearer_cache_enabled: false,
             max_export_bytes: 1024 * 1024 * 1024,
             export_ttl: Duration::from_secs(7 * 24 * 60 * 60),
             pull_logging_enabled: true,
@@ -330,6 +333,9 @@ impl Config {
                 "cache_ttl_seconds" => {
                     let seconds: u64 = setting.value.parse()?;
                     self.cache_ttl = (seconds > 0).then(|| Duration::from_secs(seconds));
+                }
+                "public_bearer_cache_enabled" => {
+                    self.public_bearer_cache_enabled = setting.value.parse()?
                 }
                 "health_interval_seconds" => {
                     self.health_interval = Duration::from_secs(setting.value.parse()?)

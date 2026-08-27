@@ -75,6 +75,8 @@ pub struct StreamDownloadConfig {
     pub parallel_threshold: u64,
 }
 
+const MAX_IN_MEMORY_PARALLEL_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 struct BlobCapabilities {
     size: u64,
@@ -162,9 +164,13 @@ impl Scheduler {
         node_capacity: usize,
     ) -> StreamDownloadConfig {
         let runtime = *self.runtime.read().await;
+        let chunk_size = effective_chunk_size(runtime, total_size, node_capacity);
         StreamDownloadConfig {
-            chunk_size: effective_chunk_size(runtime, total_size, node_capacity),
-            concurrency: effective_concurrency(runtime, node_capacity),
+            chunk_size,
+            concurrency: bounded_stream_concurrency(
+                chunk_size,
+                effective_concurrency(runtime, node_capacity),
+            ),
             parallel_threshold: runtime.parallel_threshold,
         }
     }
@@ -209,12 +215,23 @@ impl Scheduler {
         let authorization = request_headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
-        let key = CacheStore::key(request_path, authorization);
+        let public_route = nodes
+            .iter()
+            .all(|node| node.node.auth_mode == "none" && node.node.auth_secret_enc.is_none());
+        let key = self
+            .cache
+            .request_key(
+                &nodes[0].route.id.to_string(),
+                request_path,
+                authorization,
+                public_route,
+            )
+            .await;
         if let Some(object) = self.cache.get(&key).await? {
             return Ok(object);
         }
 
-        let guard = self.cache.lock(&key).await;
+        let guard = self.cache.lock(&key).await?;
         if let Some(object) = self.cache.get(&key).await? {
             drop(guard);
             return Ok(object);
@@ -259,7 +276,7 @@ impl Scheduler {
         let merged = partial_dir.join("object.partial");
         let can_parallel = capabilities.supports_range
             && capabilities.size >= runtime.parallel_threshold
-            && nodes.len() > 1;
+            && node_capacity > 1;
 
         if can_parallel {
             self.record_parallel_blob(runtime.chunk_size);
@@ -343,73 +360,73 @@ impl Scheduler {
     ) -> ApiResult<()> {
         self.record_resume();
         let mut last_error = None;
-        let mut attempted = false;
         let policy = self.runtime.read().await.scheduler_policy;
-        for node in self.ordered_nodes(nodes, 0, policy) {
-            let offset = tokio::fs::metadata(destination).await?.len();
-            if offset >= total_size {
-                return Ok(());
-            }
-            if self.at_capacity(node.node.id, node.max_concurrency) {
-                continue;
-            }
-            let lease = self.acquire(node.node.id, node.max_concurrency).await;
-            attempted = true;
-            let started = Instant::now();
-            let result = async {
-                let response = self
-                    .upstream
-                    .send(
-                        node,
-                        http::Method::GET,
-                        request_path,
-                        request_headers,
-                        RangeMode::Exact(offset, total_size - 1),
-                    )
-                    .await?;
-                if response.status() != StatusCode::PARTIAL_CONTENT
-                    || !content_range_matches(
-                        response.headers(),
-                        offset,
-                        total_size - 1,
-                        total_size,
-                    )
-                {
-                    return Err(AppError::Integrity);
+        let mut capacity_wait = capacity_backoff_policy();
+        loop {
+            let mut attempted = false;
+            for node in self.ordered_nodes(nodes, 0, policy) {
+                let offset = tokio::fs::metadata(destination).await?.len();
+                if offset >= total_size {
+                    return Ok(());
                 }
-                append_response_to_file(response, destination, total_size - offset).await
-            }
-            .await;
-            let bytes = tokio::fs::metadata(destination)
-                .await
-                .map(|m| m.len().saturating_sub(offset))
-                .unwrap_or(0);
-            self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
-            drop(lease);
-            self.nodes
-                .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
-                .await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    self.record_retry();
-                    if matches!(&error, AppError::Integrity) {
-                        let _ = tokio::fs::remove_file(destination).await;
+                if self.at_capacity(node.node.id, node.max_concurrency) {
+                    continue;
+                }
+                let lease = self.acquire(node.node.id, node.max_concurrency).await;
+                attempted = true;
+                let started = Instant::now();
+                let result = async {
+                    let response = self
+                        .upstream
+                        .send(
+                            node,
+                            http::Method::GET,
+                            request_path,
+                            request_headers,
+                            RangeMode::Exact(offset, total_size - 1),
+                        )
+                        .await?;
+                    if response.status() != StatusCode::PARTIAL_CONTENT
+                        || !content_range_matches(
+                            response.headers(),
+                            offset,
+                            total_size - 1,
+                            total_size,
+                        )
+                    {
+                        return Err(AppError::Integrity);
                     }
-                    last_error = Some(error)
+                    append_response_to_file(response, destination, total_size - offset).await
+                }
+                .await;
+                let bytes = tokio::fs::metadata(destination)
+                    .await
+                    .map(|m| m.len().saturating_sub(offset))
+                    .unwrap_or(0);
+                self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
+                drop(lease);
+                self.nodes
+                    .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
+                    .await;
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        self.record_retry();
+                        if matches!(&error, AppError::Integrity) {
+                            let _ = tokio::fs::remove_file(destination).await;
+                        }
+                        last_error = Some(error)
+                    }
                 }
             }
-        }
-        if !attempted {
-            tokio::time::sleep(capacity_backoff()).await;
-            return Box::pin(self.download_resume(
-                nodes,
-                request_path,
-                request_headers,
-                total_size,
-                destination,
-            ))
-            .await;
+            if attempted {
+                break;
+            }
+            use backoff::backoff::Backoff;
+            let delay = capacity_wait
+                .next_backoff()
+                .unwrap_or_else(|| std::time::Duration::from_millis(250));
+            tokio::time::sleep(delay).await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed resume".into())))
     }
@@ -553,96 +570,100 @@ impl Scheduler {
         policy: SchedulerPolicy,
     ) -> ApiResult<()> {
         let mut last_error = None;
-        let mut attempted = false;
-        for node in self.ordered_nodes(nodes, chunk.index, policy) {
-            if self.at_capacity(node.node.id, node.max_concurrency) {
-                continue;
-            }
-            let lease = self.acquire(node.node.id, node.max_concurrency).await;
-            attempted = true;
-            let started = Instant::now();
-            let result = async {
-                let existing = tokio::fs::metadata(destination)
-                    .await
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0);
-                let chunk_size = chunk.end - chunk.start + 1;
-                if existing > chunk_size {
-                    let _ = tokio::fs::remove_file(destination).await;
-                    return Err(AppError::Integrity);
+        let mut capacity_wait = capacity_backoff_policy();
+        loop {
+            let mut attempted = false;
+            for node in self.ordered_nodes(nodes, chunk.index, policy) {
+                if self.at_capacity(node.node.id, node.max_concurrency) {
+                    continue;
                 }
-                let start = chunk.start + existing;
-                if start > chunk.end {
-                    return Ok(());
+                let lease = self.acquire(node.node.id, node.max_concurrency).await;
+                attempted = true;
+                let started = Instant::now();
+                let result = async {
+                    let existing = tokio::fs::metadata(destination)
+                        .await
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+                    let chunk_size = chunk.end - chunk.start + 1;
+                    if existing > chunk_size {
+                        let _ = tokio::fs::remove_file(destination).await;
+                        return Err(AppError::Integrity);
+                    }
+                    let start = chunk.start + existing;
+                    if start > chunk.end {
+                        return Ok(());
+                    }
+                    let response = self
+                        .upstream
+                        .send(
+                            node,
+                            http::Method::GET,
+                            request_path,
+                            request_headers,
+                            RangeMode::Exact(start, chunk.end),
+                        )
+                        .await?;
+                    if response.status() != StatusCode::PARTIAL_CONTENT {
+                        return Err(AppError::Upstream(format!(
+                            "{} ignored Range with status {}",
+                            node.node.name,
+                            response.status()
+                        )));
+                    }
+                    let expected = chunk.end - start + 1;
+                    if response.content_length() != Some(expected) {
+                        return Err(AppError::Integrity);
+                    }
+                    if !content_range_matches(
+                        response.headers(),
+                        start,
+                        chunk.end,
+                        chunk.total_size,
+                    ) {
+                        return Err(AppError::Integrity);
+                    }
+                    if existing > 0 {
+                        append_response_to_file(response, destination, expected).await
+                    } else {
+                        stream_response_to_file(response, destination, Some(expected)).await
+                    }
                 }
-                let response = self
-                    .upstream
-                    .send(
-                        node,
-                        http::Method::GET,
-                        request_path,
-                        request_headers,
-                        RangeMode::Exact(start, chunk.end),
-                    )
-                    .await?;
-                if response.status() != StatusCode::PARTIAL_CONTENT {
-                    return Err(AppError::Upstream(format!(
-                        "{} ignored Range with status {}",
-                        node.node.name,
-                        response.status()
-                    )));
-                }
-                let expected = chunk.end - start + 1;
-                if response.content_length() != Some(expected) {
-                    return Err(AppError::Integrity);
-                }
-                if !content_range_matches(response.headers(), start, chunk.end, chunk.total_size) {
-                    return Err(AppError::Integrity);
-                }
-                if existing > 0 {
-                    append_response_to_file(response, destination, expected).await
-                } else {
-                    stream_response_to_file(response, destination, Some(expected)).await
-                }
-            }
-            .await;
-            self.observe_node(
-                node.node.id,
-                chunk.end - chunk.start + 1,
-                started.elapsed(),
-                result.is_ok(),
-            );
-            drop(lease);
-            self.nodes
-                .record_transfer(
+                .await;
+                self.observe_node(
                     node.node.id,
                     chunk.end - chunk.start + 1,
                     started.elapsed(),
                     result.is_ok(),
-                )
-                .await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    self.record_retry();
-                    if matches!(&error, AppError::Integrity) {
-                        let _ = tokio::fs::remove_file(destination).await;
+                );
+                drop(lease);
+                self.nodes
+                    .record_transfer(
+                        node.node.id,
+                        chunk.end - chunk.start + 1,
+                        started.elapsed(),
+                        result.is_ok(),
+                    )
+                    .await;
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        self.record_retry();
+                        if matches!(&error, AppError::Integrity) {
+                            let _ = tokio::fs::remove_file(destination).await;
+                        }
+                        last_error = Some(error)
                     }
-                    last_error = Some(error)
                 }
             }
-        }
-        if !attempted {
-            tokio::time::sleep(capacity_backoff()).await;
-            return Box::pin(self.download_chunk(
-                nodes,
-                request_path,
-                request_headers,
-                chunk,
-                destination,
-                policy,
-            ))
-            .await;
+            if attempted {
+                break;
+            }
+            use backoff::backoff::Backoff;
+            let delay = capacity_wait
+                .next_backoff()
+                .unwrap_or_else(|| std::time::Duration::from_millis(250));
+            tokio::time::sleep(delay).await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed a chunk".into())))
     }
@@ -656,56 +677,69 @@ impl Scheduler {
     ) -> ApiResult<()> {
         let mut last_error = None;
         let policy = self.runtime.read().await.scheduler_policy;
-        for node in self.ordered_nodes(nodes, 0, policy) {
-            if self.at_capacity(node.node.id, node.max_concurrency) {
-                continue;
-            }
-            let lease = self.acquire(node.node.id, node.max_concurrency).await;
-            let started = Instant::now();
-            let result = async {
-                let response = self
-                    .upstream
-                    .send(
-                        node,
-                        http::Method::GET,
-                        request_path,
-                        request_headers,
-                        RangeMode::Suppress,
-                    )
-                    .await?;
-                if !response.status().is_success() {
-                    return Err(AppError::Upstream(format!(
-                        "{} returned {}",
-                        node.node.name,
-                        response.status()
-                    )));
+        let mut capacity_wait = capacity_backoff_policy();
+        loop {
+            let mut attempted = false;
+            for node in self.ordered_nodes(nodes, 0, policy) {
+                if self.at_capacity(node.node.id, node.max_concurrency) {
+                    continue;
                 }
-                let length = response.content_length();
-                stream_response_to_file(response, destination, length).await
-            }
-            .await;
-            let bytes = tokio::fs::metadata(destination)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
-            drop(lease);
-            self.nodes
-                .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
-                .await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    self.record_retry();
-                    // Keep a transport-truncated file for a future request to
-                    // resume. Integrity failures are unsafe to resume and
-                    // must start from a clean file.
-                    if matches!(&error, AppError::Integrity) {
-                        let _ = tokio::fs::remove_file(destination).await;
+                attempted = true;
+                let lease = self.acquire(node.node.id, node.max_concurrency).await;
+                let started = Instant::now();
+                let result = async {
+                    let response = self
+                        .upstream
+                        .send(
+                            node,
+                            http::Method::GET,
+                            request_path,
+                            request_headers,
+                            RangeMode::Suppress,
+                        )
+                        .await?;
+                    if !response.status().is_success() {
+                        return Err(AppError::Upstream(format!(
+                            "{} returned {}",
+                            node.node.name,
+                            response.status()
+                        )));
                     }
-                    last_error = Some(error);
+                    let length = response.content_length();
+                    stream_response_to_file(response, destination, length).await
+                }
+                .await;
+                let bytes = tokio::fs::metadata(destination)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
+                drop(lease);
+                self.nodes
+                    .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
+                    .await;
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        self.record_retry();
+                        // Keep a transport-truncated file for a future request to
+                        // resume. Integrity failures are unsafe to resume and
+                        // must start from a clean file.
+                        if matches!(&error, AppError::Integrity) {
+                            let _ = tokio::fs::remove_file(destination).await;
+                        }
+                        last_error = Some(error);
+                    }
                 }
             }
+            if attempted {
+                break;
+            }
+            use backoff::backoff::Backoff;
+            let delay = capacity_wait
+                .next_backoff()
+                .unwrap_or_else(|| std::time::Duration::from_millis(250));
+            tokio::time::sleep(delay).await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed".into())))
     }
@@ -720,11 +754,17 @@ impl Scheduler {
     }
 
     async fn acquire(&self, node_id: Uuid, max_concurrency: u16) -> NodeLease {
+        use backoff::backoff::Backoff;
+
+        let mut policy = capacity_backoff_policy();
         loop {
             if let Some(lease) = self.try_acquire(node_id, max_concurrency) {
                 return lease;
             }
-            tokio::time::sleep(capacity_backoff()).await;
+            let delay = policy
+                .next_backoff()
+                .unwrap_or_else(|| std::time::Duration::from_millis(250));
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -747,15 +787,12 @@ impl Scheduler {
     }
 }
 
-fn capacity_backoff() -> std::time::Duration {
-    use backoff::backoff::Backoff;
+fn capacity_backoff_policy() -> backoff::ExponentialBackoff {
     backoff::ExponentialBackoffBuilder::new()
         .with_initial_interval(std::time::Duration::from_millis(10))
         .with_max_interval(std::time::Duration::from_millis(250))
         .with_max_elapsed_time(None)
         .build()
-        .next_backoff()
-        .unwrap_or_else(|| std::time::Duration::from_millis(250))
 }
 
 fn effective_chunk_size(
@@ -778,6 +815,15 @@ fn effective_chunk_size(
         .div_euclid(MIB)
         .saturating_mul(MIB)
         .clamp(MIN_CHUNK, MAX_CHUNK)
+}
+
+fn bounded_stream_concurrency(chunk_size: u64, desired: usize) -> usize {
+    let memory_slots = MAX_IN_MEMORY_PARALLEL_BYTES
+        .checked_div(chunk_size.max(1))
+        .unwrap_or(1)
+        .max(1)
+        .min(usize::MAX as u64) as usize;
+    desired.min(memory_slots).max(1)
 }
 
 fn effective_concurrency(runtime: SchedulerRuntimeConfig, node_capacity: usize) -> usize {
@@ -1028,6 +1074,13 @@ mod tests {
         runtime.chunk_concurrency = 12;
         assert_eq!(effective_concurrency(runtime, 24), 12);
         assert_eq!(effective_concurrency(runtime, 8), 8);
+    }
+
+    #[test]
+    fn streaming_concurrency_respects_memory_budget() {
+        assert_eq!(bounded_stream_concurrency(8 * 1024 * 1024, 64), 8);
+        assert_eq!(bounded_stream_concurrency(2 * 1024 * 1024, 64), 32);
+        assert_eq!(bounded_stream_concurrency(128 * 1024 * 1024, 64), 1);
     }
 
     #[test]

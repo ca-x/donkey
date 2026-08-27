@@ -51,6 +51,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
     partial_ttl_seconds: config.partial_ttl_seconds,
     cache_policy: config.cache_policy, cache_high_watermark: config.cache_high_watermark,
     cache_low_watermark: config.cache_low_watermark, cache_ttl_seconds: config.cache_ttl_seconds ?? 0,
+    public_bearer_cache_enabled: config.public_bearer_cache_enabled,
     health_interval_seconds: config.health_interval_seconds, max_export_bytes: config.max_export_bytes, export_ttl_seconds: config.export_ttl_seconds,
     pull_logging_enabled: config.pull_logging_enabled,
     pull_log_retention_days: config.pull_log_retention_days, pull_log_max_entries: config.pull_log_max_entries,
@@ -66,6 +67,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
     stream_fallback_timeout_seconds: 10, partial_ttl_seconds: 3600, max_cache_bytes: 50 * 1024 ** 3,
     cache_policy: 'balanced', cache_high_watermark: 0.9, cache_low_watermark: 0.8,
     cache_ttl_seconds: 0, health_interval_seconds: 60, max_export_bytes: 20 * 1024 ** 3, export_ttl_seconds: 7 * 86400,
+    public_bearer_cache_enabled: false,
     pull_logging_enabled: true,
     adaptive_chunking_enabled: true,
     automatic_concurrency_enabled: true,
@@ -89,6 +91,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
       <Select label={t('cache.policy')} data={[{ value: 'balanced', label: t('cache.balanced') }, { value: 'lru', label: t('cache.lru') }, { value: 'lfu', label: t('cache.lfu') }]} {...form.getInputProps('cache_policy')} />
     </SimpleGrid>
     <Switch label={t('pulls.loggingEnabled')} description={t('pulls.loggingDescription')} {...form.getInputProps('pull_logging_enabled', { type: 'checkbox' })} />
+    <Switch label={t('ui.publicBearerCache')} description={t('ui.publicBearerCacheDescription')} {...form.getInputProps('public_bearer_cache_enabled', { type: 'checkbox' })} />
     <Group justify="space-between"><Switch checked={advanced} onChange={(event) => setAdvanced(event.currentTarget.checked)} label={t('settings.advancedSettings')} /><Button variant="subtle" leftSection={<IconRotateClockwise size={16} />} onClick={reset}>{t('settings.resetDefaults')}</Button></Group>
     <Collapse expanded={advanced}><SimpleGrid cols={{ base: 1, md: 2 }}>{!form.values.adaptive_chunking_enabled && <UnitInput label={t('settings.chunk')} value={form.values.chunk_size} onChange={(value) => form.setFieldValue('chunk_size', value)} />}<UnitInput label={t('settings.threshold')} value={form.values.parallel_threshold} onChange={(value) => form.setFieldValue('parallel_threshold', value)} /><UnitInput label={t('settings.resumableThreshold')} value={form.values.resumable_threshold} onChange={(value) => form.setFieldValue('resumable_threshold', value)} /><NumberInput label={t('settings.streamFallbackTimeout')} min={1} max={3600} suffix=" s" {...form.getInputProps('stream_fallback_timeout_seconds')} /><NumberInput label={t('settings.partialTtl')} min={60} max={604800} suffix=" s" {...form.getInputProps('partial_ttl_seconds')} /><NumberInput label={t('settings.healthInterval')} min={1} max={86400} suffix=" s" {...form.getInputProps('health_interval_seconds')} /><NumberInput label={t('settings.cacheHighWatermark')} min={0.5} max={1} step={0.01} {...form.getInputProps('cache_high_watermark')} /><NumberInput label={t('settings.cacheLowWatermark')} min={0.1} max={0.99} step={0.01} {...form.getInputProps('cache_low_watermark')} /><NumberInput label={t('cache.ttl')} min={0} suffix=" s" {...form.getInputProps('cache_ttl_seconds')} /><NumberInput label={t('pulls.retentionDays')} description={t('pulls.retentionDaysDescription')} min={1} max={3650} suffix={` ${t('pulls.days')}`} {...form.getInputProps('pull_log_retention_days')} /><NumberInput label={t('pulls.maxEntries')} description={t('pulls.maxEntriesDescription')} min={100} max={1000000} step={100} {...form.getInputProps('pull_log_max_entries')} /></SimpleGrid></Collapse>
     <Group justify="space-between" align="flex-end"><Group align="flex-end"><FileInput label={t('settings.importSettings')} placeholder={t('settings.chooseFile')} value={importFile} onChange={setImportFile} accept="application/json" clearable /><Button variant="default" leftSection={<IconUpload size={16} />} disabled={!importFile} onClick={() => void handleImport()}>{t('settings.previewImport')}</Button><Button variant="default" leftSection={<IconDownload size={16} />} loading={exportSettings.isPending} onClick={() => exportSettings.mutate()}>{t('settings.export')}</Button></Group><Button onClick={() => save.mutate()} loading={save.isPending}>{t('common.save')}</Button></Group>

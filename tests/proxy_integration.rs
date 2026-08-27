@@ -37,6 +37,7 @@ mod proxy_integration {
         CorruptChunk,
         DropAfterPrefix,
         ThrottledRange,
+        ThrottledWhole,
     }
 
     #[derive(Default)]
@@ -244,6 +245,9 @@ mod proxy_integration {
                     }
                     FixtureBehavior::ThrottledRange => {
                         throttled_ranged_or_whole(&state.bytes, requested_range, &state.stats).await
+                    }
+                    FixtureBehavior::ThrottledWhole => {
+                        throttled_ranged_or_whole(&state.bytes, None, &state.stats).await
                     }
                 }
             }
@@ -724,8 +728,12 @@ mod proxy_integration {
             );
 
             let cached = request(router, Method::GET, &path, None).await;
-            let key =
-                donkey::cache::CacheStore::key(&format!("/v2/{REPOSITORY}/blobs/{digest}"), None);
+            let key = donkey::cache::CacheStore::key(
+                &DOCKER_HUB_ROUTE_ID.to_string(),
+                &format!("/v2/{REPOSITORY}/blobs/{digest}"),
+                None,
+                false,
+            );
             let cache = state.cache.clone();
             let mut remove = tokio::spawn(async move { cache.remove(&key).await });
             assert!(
@@ -818,8 +826,12 @@ mod proxy_integration {
             }
             let digest = digest(&bytes);
             let path = blob_path(&digest);
-            let key =
-                donkey::cache::CacheStore::key(&format!("/v2/{REPOSITORY}/blobs/{digest}"), None);
+            let key = donkey::cache::CacheStore::key(
+                &DOCKER_HUB_ROUTE_ID.to_string(),
+                &format!("/v2/{REPOSITORY}/blobs/{digest}"),
+                None,
+                false,
+            );
             let partial_dir = directory.path().join("cache/tmp").join(&key);
             tokio::fs::create_dir_all(&partial_dir).await.unwrap();
             tokio::fs::write(partial_dir.join("object.partial"), &bytes[..8])
@@ -1075,6 +1087,55 @@ mod proxy_integration {
         }
 
         #[tokio::test]
+        async fn single_node_capacity_parallelizes_one_blob() {
+            let bytes = vec![b'p'; 1024 * 1024];
+            let fixture = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.parallel_threshold = 1;
+            config.chunk_size = 256 * 1024;
+            config.chunk_concurrency = 4;
+            let state = AppState::new(config).await.unwrap();
+            state
+                .nodes
+                .create(NodeInput {
+                    name: "single-node-parallel".into(),
+                    url: fixture.url(),
+                    registry_route_id: DOCKER_HUB_ROUTE_ID,
+                    enabled: true,
+                    priority: 0,
+                    max_concurrency: 4,
+                    cf_preferred: false,
+                    connect_ip: None,
+                    auth_mode: "none".into(),
+                    auth_username: None,
+                    auth_header: None,
+                    auth_secret: None,
+                })
+                .await
+                .unwrap();
+
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert!(fixture.max_active_requests() > 1);
+            assert!(state.scheduler.stats().parallel_blobs >= 1);
+        }
+
+        #[tokio::test]
         async fn node_concurrency_limit_is_global_across_streams() {
             let bytes = vec![b'g'; 1024 * 1024];
             let first = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;
@@ -1129,6 +1190,57 @@ mod proxy_integration {
             assert!(first.max_active_requests() <= 1);
             assert!(second.max_active_requests() <= 1);
             assert!(first.get_count() > 0 && second.get_count() > 0);
+        }
+
+        #[tokio::test]
+        async fn whole_download_waits_for_node_capacity() {
+            let bytes = vec![b'w'; 1024 * 1024];
+            let fixture = Fixture::start(FixtureBehavior::ThrottledWhole, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.parallel_threshold = 1;
+            let state = AppState::new(config).await.unwrap();
+            state
+                .nodes
+                .create(NodeInput {
+                    name: "whole-capacity".into(),
+                    url: fixture.url(),
+                    registry_route_id: DOCKER_HUB_ROUTE_ID,
+                    enabled: true,
+                    priority: 0,
+                    max_concurrency: 1,
+                    cf_preferred: false,
+                    connect_ip: None,
+                    auth_mode: "none".into(),
+                    auth_username: None,
+                    auth_header: None,
+                    auth_secret: None,
+                })
+                .await
+                .unwrap();
+            let router = registry_router(state);
+            let path = blob_path(&digest(&bytes));
+            let pull = |authorization: &'static str| {
+                let router = router.clone();
+                let path = path.clone();
+                let bytes = bytes.clone();
+                async move {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::AUTHORIZATION, authorization.parse().unwrap());
+                    let response = request_with_headers(router, Method::GET, &path, headers).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(
+                        to_bytes(response.into_body(), usize::MAX)
+                            .await
+                            .unwrap()
+                            .as_ref(),
+                        bytes
+                    );
+                }
+            };
+
+            tokio::join!(pull("Bearer first-whole"), pull("Bearer second-whole"));
+            assert_eq!(fixture.get_count(), 2);
         }
 
         #[tokio::test]

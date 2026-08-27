@@ -106,12 +106,6 @@ impl CacheRepository {
             .collect())
     }
 
-    pub(super) async fn clear(&self) -> ApiResult<()> {
-        self.pending_hits.clear();
-        db::clear_cache_entries(&self.db).await?;
-        Ok(())
-    }
-
     pub(super) async fn aggregate(&self) -> ApiResult<CacheAggregate> {
         self.flush_hits().await?;
         let aggregate = db::cache_aggregate(&self.db).await?;

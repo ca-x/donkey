@@ -164,6 +164,7 @@ export interface RuntimeConfig {
   cache_high_watermark: number
   cache_low_watermark: number
   cache_ttl_seconds: number | null
+  public_bearer_cache_enabled: boolean
   max_export_bytes: number
   export_ttl_seconds: number
   admin_external_tls: boolean
@@ -175,7 +176,7 @@ export interface RuntimeConfig {
   pull_log_max_entries: number
 }
 
-export type RuntimeSettingsInput = Pick<RuntimeConfig, 'chunk_size' | 'adaptive_chunking_enabled' | 'automatic_concurrency_enabled' | 'chunk_concurrency' | 'parallel_threshold' | 'resumable_threshold' | 'scheduler_policy' | 'upstream_timeout_seconds' | 'stream_fallback_timeout_seconds' | 'partial_ttl_seconds' | 'max_cache_bytes' | 'cache_policy' | 'cache_high_watermark' | 'cache_low_watermark' | 'cache_ttl_seconds' | 'health_interval_seconds' | 'max_export_bytes' | 'export_ttl_seconds' | 'pull_logging_enabled' | 'pull_log_retention_days' | 'pull_log_max_entries'>
+export type RuntimeSettingsInput = Pick<RuntimeConfig, 'chunk_size' | 'adaptive_chunking_enabled' | 'automatic_concurrency_enabled' | 'chunk_concurrency' | 'parallel_threshold' | 'resumable_threshold' | 'scheduler_policy' | 'upstream_timeout_seconds' | 'stream_fallback_timeout_seconds' | 'partial_ttl_seconds' | 'max_cache_bytes' | 'cache_policy' | 'cache_high_watermark' | 'cache_low_watermark' | 'cache_ttl_seconds' | 'public_bearer_cache_enabled' | 'health_interval_seconds' | 'max_export_bytes' | 'export_ttl_seconds' | 'pull_logging_enabled' | 'pull_log_retention_days' | 'pull_log_max_entries'>
 
 export interface PullEvent {
   id: string

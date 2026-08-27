@@ -91,13 +91,20 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
             return Err(AppError::bad_request("invalid Blob digest"));
         }
         if request.method() == Method::HEAD {
-            let key = CacheStore::key(
-                &upstream_path,
-                request
-                    .headers()
-                    .get(header::AUTHORIZATION)
-                    .and_then(|value| value.to_str().ok()),
-            );
+            let key = state
+                .cache
+                .request_key(
+                    &registry_route_id.to_string(),
+                    &upstream_path,
+                    request
+                        .headers()
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok()),
+                    nodes.iter().all(|node| {
+                        node.node.auth_mode == "none" && node.node.auth_secret_enc.is_none()
+                    }),
+                )
+                .await;
             if let Some(object) = state.cache.get(&key).await? {
                 return serve_cached(&state.cache, object, request).await;
             }
@@ -242,7 +249,7 @@ async fn stream_blob(
                     .sum(),
             )
             .await;
-        let parallel = (nodes.len() > 1
+        let parallel = (stream_config.concurrency > 1
             && window.start == 0
             && window.end.checked_add(1) == Some(window.total)
             && window.total >= stream_config.parallel_threshold
@@ -263,13 +270,19 @@ async fn stream_blob(
             .to_owned();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
         let cache = state.cache.clone();
-        let key = CacheStore::key(
-            path,
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok()),
-        );
-        let lease = cache.lock(&key).await;
+        let key = cache
+            .request_key(
+                &nodes[0].route.id.to_string(),
+                path,
+                headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok()),
+                nodes.iter().all(|node| {
+                    node.node.auth_mode == "none" && node.node.auth_secret_enc.is_none()
+                }),
+            )
+            .await;
+        let lease = cache.lock(&key).await?;
         let expected = expected_digest.map(str::to_owned);
         let relay = StreamRelay {
             upstream: state.upstream.clone(),
@@ -736,6 +749,11 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
         .with_max_interval(std::time::Duration::from_secs(1))
         .with_max_elapsed_time(Some(std::time::Duration::from_secs(15)))
         .build();
+    let mut capacity_wait = backoff::ExponentialBackoffBuilder::new()
+        .with_initial_interval(std::time::Duration::from_millis(10))
+        .with_max_interval(std::time::Duration::from_millis(250))
+        .with_max_elapsed_time(None)
+        .build();
     let mut last_error = None;
     loop {
         let mut attempted = false;
@@ -804,9 +822,13 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
             }
         }
         if !attempted {
-            tokio::task::yield_now().await;
+            let delay = capacity_wait
+                .next_backoff()
+                .unwrap_or_else(|| std::time::Duration::from_millis(250));
+            tokio::time::sleep(delay).await;
             continue;
         }
+        capacity_wait.reset();
         let Some(delay) = policy.next_backoff() else {
             break;
         };
@@ -820,7 +842,7 @@ async fn serve_cached(
     object: CachedObject,
     request: Request,
 ) -> ApiResult<Response> {
-    let guard = cache.lock(&object.key).await;
+    let guard = cache.lock(&object.key).await?;
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
@@ -1064,16 +1086,6 @@ fn copy_response_headers(source: &HeaderMap, destination: &mut HeaderMap) {
     }
 }
 
-pub fn cache_key_for(request: &Request) -> String {
-    CacheStore::key(
-        request.uri().path(),
-        request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok()),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,7 +1207,12 @@ mod tests {
         let digest = format!("sha256:{}", "a".repeat(64));
         let client_path = format!("/v2/test/blobs/{digest}");
         let upstream_path = format!("/v2/library/test/blobs/{digest}");
-        let cache_key = CacheStore::key(&upstream_path, None);
+        let cache_key = CacheStore::key(
+            &DOCKER_HUB_ROUTE_ID.to_string(),
+            &upstream_path,
+            None,
+            false,
+        );
         let temporary = directory.path().join("primed-blob");
         tokio::fs::write(&temporary, b"cached").await.unwrap();
         state

@@ -495,7 +495,7 @@ impl ImageTools {
                 if cancellation.is_cancelled() {
                     break;
                 }
-                if let Err(error) = self.tick().await {
+                if let Err(error) = self.tick(&cancellation).await {
                     tracing::error!(?error, "image tools worker tick failed");
                 }
                 tokio::select! {
@@ -507,7 +507,7 @@ impl ImageTools {
         })
     }
 
-    async fn tick(&self) -> ApiResult<()> {
+    async fn tick(&self, cancellation: &tokio_util::sync::CancellationToken) -> ApiResult<()> {
         self.cleanup_storage(None).await?;
         self.enqueue_due_rules().await?;
         self.recover_abandoned_jobs(Utc::now()).await?;
@@ -516,20 +516,35 @@ impl ImageTools {
         };
 
         let heartbeat = {
-            let service = self.clone();
-            tokio::spawn(async move {
-                let interval = Duration::from_secs((JOB_LEASE_MINUTES as u64 * 60 / 3).max(1));
-                loop {
-                    tokio::time::sleep(interval).await;
-                    if !service.jobs.renew(job.id, attempt).await.unwrap_or(false) {
-                        break;
-                    }
-                }
-            })
+            let jobs = self.jobs.clone();
+            let lease_lost = tokio_util::sync::CancellationToken::new();
+            let heartbeat_lost = lease_lost.clone();
+            let heartbeat = tokio::spawn(renew_job_lease(
+                jobs,
+                job.id,
+                attempt,
+                Duration::from_secs((JOB_LEASE_MINUTES as u64 * 60 / 3).max(1)),
+                heartbeat_lost,
+            ));
+            (heartbeat, lease_lost)
         };
-        let result = self.process_job(&job).await;
-        heartbeat.abort();
-        let finished = self.finish_job(job.id, attempt, result).await;
+        let work_cancellation = tokio_util::sync::CancellationToken::new();
+        let result = tokio::select! {
+            result = self.process_job(&job, work_cancellation.clone()) => Some(result),
+            _ = heartbeat.1.cancelled() => {
+                work_cancellation.cancel();
+                Some(Err(AppError::Conflict("image job lease was lost".into())))
+            },
+            _ = cancellation.cancelled() => {
+                work_cancellation.cancel();
+                None
+            },
+        };
+        heartbeat.0.abort();
+        let finished = match result {
+            Some(result) => self.finish_job(job.id, attempt, result).await,
+            None => Ok(()),
+        };
         self.jobs.deactivate(job.id);
         finished
     }
@@ -627,7 +642,11 @@ impl ImageTools {
         Ok(cancelled.rows_affected + recovered.rows_affected)
     }
 
-    async fn process_job(&self, job: &image_job::Model) -> ApiResult<JobOutcome> {
+    async fn process_job(
+        &self,
+        job: &image_job::Model,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> ApiResult<JobOutcome> {
         let prepared = self.prepare_image(job).await?;
         self.update_job_manifest(job.id, &prepared).await?;
         self.check_cancelled(job.id).await?;
@@ -639,7 +658,7 @@ impl ImageTools {
             return Ok(JobOutcome::Skipped);
         }
         match JobKind::parse(&job.kind) {
-            Some(JobKind::Export) => self.export_image(job, &prepared).await?,
+            Some(JobKind::Export) => self.export_image(job, &prepared, cancellation).await?,
             Some(JobKind::Extract) => self.extract_image(job, &prepared).await?,
             Some(JobKind::Copy) => self.copy_image(job, &prepared).await?,
             _ => return Err(AppError::bad_request("unsupported image job kind")),
@@ -682,7 +701,9 @@ impl ImageTools {
         let config_path = blob_path(&layout, &manifest.config.digest)?;
         let shared_config = self.artifacts.shared_blob_path(&manifest.config.digest)?;
         if tokio::fs::metadata(&shared_config).await.is_err() {
-            atomic_write(&shared_config, config_json.as_bytes()).await?;
+            self.artifacts
+                .write_blob_bytes(job.id, &manifest.config.digest, config_json.as_bytes())
+                .await?;
         }
         link_or_copy(&shared_config, &config_path).await?;
 
@@ -695,9 +716,14 @@ impl ImageTools {
             let path = blob_path(&layout, &layer.digest)?;
             let shared = self.artifacts.shared_blob_path(&layer.digest)?;
             if tokio::fs::metadata(&shared).await.is_err() {
-                let temp = shared.with_extension("partial");
-                source.pull_blob(layer, File::create(&temp).await?).await?;
-                tokio::fs::rename(&temp, &shared).await?;
+                let guard = self
+                    .artifacts
+                    .begin_blob_write(job.id, &layer.digest)
+                    .await?;
+                source
+                    .pull_blob(layer, File::create(guard.temporary_path()).await?)
+                    .await?;
+                guard.commit().await?;
             }
             link_or_copy(&shared, &path).await?;
             downloaded = downloaded.saturating_add(layer.size.max(0) as u64);
@@ -827,7 +853,9 @@ impl ImageTools {
         let layout_config = blob_path(&layout, &manifest.config.digest)?;
         let shared_config = self.artifacts.shared_blob_path(&manifest.config.digest)?;
         if tokio::fs::metadata(&shared_config).await.is_err() {
-            atomic_write(&shared_config, config_json.as_bytes()).await?;
+            self.artifacts
+                .write_blob_bytes(job.id, &manifest.config.digest, config_json.as_bytes())
+                .await?;
         }
         link_or_copy(&shared_config, &layout_config).await?;
 
@@ -840,15 +868,18 @@ impl ImageTools {
             let path = blob_path(&layout, &layer.digest)?;
             let shared = self.artifacts.shared_blob_path(&layer.digest)?;
             if tokio::fs::metadata(&shared).await.is_err() {
-                let temporary = shared.with_extension("partial");
+                let guard = self
+                    .artifacts
+                    .begin_blob_write(job.id, &layer.digest)
+                    .await?;
                 let result = self
-                    .download_node_blob(&node, logical.repository(), layer, &temporary)
+                    .download_node_blob(&node, logical.repository(), layer, guard.temporary_path())
                     .await;
                 if result.is_err() {
-                    let _ = tokio::fs::remove_file(&temporary).await;
+                    let _ = tokio::fs::remove_file(guard.temporary_path()).await;
                 }
                 result?;
-                tokio::fs::rename(&temporary, &shared).await?;
+                guard.commit().await?;
             }
             link_or_copy(&shared, &path).await?;
             downloaded = downloaded.saturating_add(layer.size.max(0) as u64);
@@ -1035,7 +1066,12 @@ impl ImageTools {
         Ok((logical.clone(), auth))
     }
 
-    async fn export_image(&self, job: &image_job::Model, image: &PreparedImage) -> ApiResult<()> {
+    async fn export_image(
+        &self,
+        job: &image_job::Model,
+        image: &PreparedImage,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> ApiResult<()> {
         self.set_stage(job.id, "archiving").await?;
         let format = job.output_format.as_deref().unwrap_or("docker");
         if !matches!(format, "docker" | "oci") {
@@ -1061,16 +1097,21 @@ impl ImageTools {
                 layout: image.layout.clone(),
             }
         };
-        tokio::task::spawn_blocking(move || build_archive(&output_clone, archive))
-            .await
-            .map_err(AppError::internal)?
-            .map_err(AppError::internal)?;
+        let job_lock = self.artifacts.lock_job(job.id).await?;
+        tokio::task::spawn_blocking(move || {
+            let _job_lock = job_lock;
+            build_archive(&output_clone, archive, cancellation)
+        })
+        .await
+        .map_err(AppError::internal)?
+        .map_err(AppError::internal)?;
         self.set_artifact(job.id, &output, &name).await
     }
 
     #[cfg(unix)]
     async fn extract_image(&self, job: &image_job::Model, image: &PreparedImage) -> ApiResult<()> {
         self.set_stage(job.id, "extracting").await?;
+        let _job_lock = self.artifacts.lock_job(job.id).await?;
         let rootfs = self.artifacts.job_root(job.id).join("rootfs");
         if tokio::fs::metadata(&rootfs).await.is_ok() {
             tokio::fs::remove_dir_all(&rootfs).await?;
@@ -1210,6 +1251,11 @@ impl ImageTools {
     }
 
     async fn check_cancelled(&self, id: Uuid) -> ApiResult<()> {
+        if let Some(attempt) = self.jobs.active_attempt(id)
+            && !self.jobs.owns(id, attempt).await?
+        {
+            return Err(AppError::Conflict("image job lease was lost".into()));
+        }
         if self.jobs.is_cancelled(id).await? {
             Err(AppError::bad_request("image job was cancelled"))
         } else {
@@ -1425,6 +1471,42 @@ impl ImageTools {
             .exec(&self.db)
             .await?;
         Ok(())
+    }
+}
+
+async fn renew_job_lease(
+    jobs: JobStore,
+    job_id: Uuid,
+    attempt: i64,
+    interval: Duration,
+    lease_lost: tokio_util::sync::CancellationToken,
+) {
+    use backoff::backoff::Backoff;
+
+    loop {
+        tokio::time::sleep(interval).await;
+        let mut retry = backoff::ExponentialBackoffBuilder::new()
+            .with_initial_interval(Duration::from_millis(250))
+            .with_max_interval(Duration::from_secs(2))
+            .with_max_elapsed_time(Some(Duration::from_secs(30)))
+            .build();
+        loop {
+            match jobs.renew(job_id, attempt).await {
+                Ok(true) => break,
+                Ok(false) => {
+                    lease_lost.cancel();
+                    return;
+                }
+                Err(error) => {
+                    let Some(delay) = retry.next_backoff() else {
+                        tracing::error!(?error, %job_id, "image job lease renewal failed");
+                        lease_lost.cancel();
+                        return;
+                    };
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
     }
 }
 
@@ -2586,7 +2668,10 @@ mod tests {
             .await
             .unwrap();
 
-        service.tick().await.unwrap();
+        service
+            .tick(&tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
 
         let abandoned = image_job::Entity::find_by_id(abandoned.id)
             .one(&service.db)
@@ -2661,6 +2746,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.stage, "resolving");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_cancels_work_after_lease_is_lost() {
+        let (_directory, service) = test_service().await;
+        let job = insert_test_job(&service.db, JobStatus::Pending, None).await;
+        let (_, attempt) = service.jobs.claim_selected(job.id).await.unwrap().unwrap();
+        service
+            .db
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "UPDATE image_job_owners SET worker_id = ?, attempt = ? WHERE job_id = ?",
+                [Uuid::new_v4().into(), (attempt + 1).into(), job.id.into()],
+            ))
+            .await
+            .unwrap();
+        let lease_lost = tokio_util::sync::CancellationToken::new();
+        let heartbeat = tokio::spawn(renew_job_lease(
+            service.jobs.clone(),
+            job.id,
+            attempt,
+            Duration::from_millis(1),
+            lease_lost.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), lease_lost.cancelled())
+            .await
+            .unwrap();
+        heartbeat.await.unwrap();
+        assert!(matches!(
+            service.check_cancelled(job.id).await,
+            Err(AppError::Conflict(_))
+        ));
     }
 
     #[tokio::test]

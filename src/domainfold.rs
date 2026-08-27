@@ -287,6 +287,11 @@ fn normalize_base(raw: &str) -> ApiResult<String> {
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(AppError::bad_request("mapping base must be an HTTP(S) URL"));
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::bad_request(
+            "mapping base URL must not contain credentials",
+        ));
+    }
     url.set_query(None);
     url.set_fragment(None);
     if !url.path().ends_with('/') {
@@ -344,6 +349,22 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn rejects_credentials_in_mapping_urls() {
+        let db = db::connect("sqlite::memory:").await.unwrap();
+        let result = create(
+            &db,
+            MappingInput {
+                source_host: "downloads.example".into(),
+                upstream_base: "https://user:secret@downloads.example/releases/".into(),
+                public_base: "https://mirror.example/".into(),
+                enabled: true,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
     }
 
     #[tokio::test]

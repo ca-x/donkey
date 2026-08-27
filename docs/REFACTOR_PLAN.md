@@ -1,6 +1,6 @@
 # Donkey 全量重构计划
 
-> 状态：实施中（阶段一核心正确性已完成，阶段二运行时配置与调度重构进行中）。
+> 状态：已完成（阶段一至阶段三均已实现并进入 0.3.0 发布验收）。
 
 ## 当前进度
 
@@ -11,11 +11,14 @@
 - Blob digest 校验、缓存对账和前端账户能力字段已补齐。
 - 镜像拉取历史已支持默认开启、运行时开关、服务端分页、安全清空及按时间/数量自动保留。
 - Docker archive 与 OCI archive 已使用独立构建路径，并分别校验 manifest 引用和 OCI layout 根结构。
-- NodeSelection 已集中管理吞吐 EWMA、全局并发租约、策略排序与指数冷却；更细的错误分类指标待完善。
+- NodeSelection 已集中管理吞吐 EWMA、全局并发租约、策略排序与指数冷却。
 - 自适应分片默认开启，按 Blob 大小、全局并发和节点容量在 2–8 MiB 内计算；可关闭并回退固定分片。
 - 并发默认按 Registry 命名空间自动汇总启用节点容量（最高 64）；可切换为手动单 Blob 上限。
 - 已补充 SQLite/Blob/产物备份恢复文档，并在 Ubuntu CI 中生成最小 Docker archive 执行真实 `docker load`。
-- 每个增量提交均经过 Rust 全量测试、Clippy 与前端 lint/build 验证；暂不创建版本 tag。
+- ImageTools 已拆分 JobStore/lease coordinator、Registry adapters、ArtifactStore、ArchiveBuilder 与 FileBrowser。
+- Cache 已拆分 CacheRepository 与 ObjectStore；DomainFold 复用统一 Upstream transport。
+- 数据库关系约束、公开 API DTO、全页面移动端/双语/WCAG 终审均已完成。
+- 每个增量提交均经过 Rust 全量测试、Clippy 与前端 lint/build 验证；最终验收通过后创建 `v0.3.0` tag。
 
 ## 总目标
 

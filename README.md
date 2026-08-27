@@ -297,6 +297,7 @@ http://proxy-user:proxy-password@donkey-host:5003
 | `DONKEY_CACHE_HIGH_WATERMARK` | `0.90` | 达到该比例时开始回收 |
 | `DONKEY_CACHE_LOW_WATERMARK` | `0.80` | 回收到该比例后停止 |
 | `DONKEY_CACHE_TTL` | 空 | 可选，例如 `30d`、`12h` |
+| `DONKEY_PUBLIC_BEARER_CACHE_ENABLED` | `false` | 显式允许未配置上游认证的公共命名空间跨 Bearer 令牌轮换复用 Blob；认证节点和不同命名空间始终隔离 |
 | `DONKEY_CHUNK_SIZE` | `2097152` | 上游 Range 分片大小 |
 | `DONKEY_ADAPTIVE_CHUNKING_ENABLED` | `true` | 根据 Blob 大小和节点容量在 2–8 MiB 内自动选择分片 |
 | `DONKEY_CHUNK_CONCURRENCY` | `32` | 关闭自动并发计算后使用的单个 Blob 手动上限 |
