@@ -572,6 +572,18 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_image_job_lineage_rule ON image_job_lineage(sync_rule_id, scheduled_for)",
         ]),
     },
+    Migration {
+        version: 9,
+        name: "operational relationship triggers",
+        action: MigrationAction::Statements(&[
+            "CREATE TRIGGER IF NOT EXISTS trg_node_metrics_insert_parent BEFORE INSERT ON node_metrics WHEN NOT EXISTS (SELECT 1 FROM nodes WHERE id = NEW.node_id) BEGIN SELECT RAISE(ABORT, 'node metric requires an existing node'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_node_metrics_update_parent BEFORE UPDATE OF node_id ON node_metrics WHEN NOT EXISTS (SELECT 1 FROM nodes WHERE id = NEW.node_id) BEGIN SELECT RAISE(ABORT, 'node metric requires an existing node'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_nodes_delete_metrics AFTER DELETE ON nodes BEGIN DELETE FROM node_metrics WHERE node_id = OLD.id; END",
+            "CREATE TRIGGER IF NOT EXISTS trg_admin_sessions_insert_parent BEFORE INSERT ON admin_sessions WHEN NOT EXISTS (SELECT 1 FROM users WHERE id = NEW.user_id) BEGIN SELECT RAISE(ABORT, 'admin session requires an existing user'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_admin_sessions_update_parent BEFORE UPDATE OF user_id ON admin_sessions WHEN NOT EXISTS (SELECT 1 FROM users WHERE id = NEW.user_id) BEGIN SELECT RAISE(ABORT, 'admin session requires an existing user'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_users_delete_sessions AFTER DELETE ON users BEGIN DELETE FROM admin_sessions WHERE user_id = OLD.id; END",
+        ]),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -1654,6 +1666,7 @@ mod tests {
                 (6, 1),
                 (7, 1),
                 (8, 1),
+                (9, 1),
             ]
         );
         assert_expected_indexes(&db).await;
@@ -1690,7 +1703,7 @@ mod tests {
     #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_version() {
         const FAILING_MIGRATION: &[Migration] = &[Migration {
-            version: 9,
+            version: 10,
             name: "rollback test",
             action: MigrationAction::Statements(&[
                 "CREATE TABLE migration_rollback_marker (id INTEGER PRIMARY KEY)",
@@ -1720,6 +1733,7 @@ mod tests {
                 (6, 1),
                 (7, 1),
                 (8, 1),
+                (9, 1),
             ]
         );
     }
@@ -1830,6 +1844,85 @@ mod tests {
                 .exec(&db)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_relationship_triggers_reject_and_cleanup_orphans() {
+        let db = connect("sqlite::memory:").await.unwrap();
+        let now = Utc::now();
+        assert!(
+            upsert_metric(
+                &db,
+                node_metric::Model {
+                    node_id: Uuid::new_v4(),
+                    healthy: true,
+                    latency_ms: 0,
+                    speed_bps: 0,
+                    success_rate: 1.0,
+                    current_bps: 0,
+                    total_bytes: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            admin_session::Model {
+                token_hash: "missing-user".into(),
+                user_id: Uuid::new_v4(),
+                created_at: now,
+                last_seen_at: now,
+                expires_at: now + chrono::Duration::hours(1),
+            }
+            .into_active_model()
+            .insert(&db)
+            .await
+            .is_err()
+        );
+
+        let account = user::Model {
+            id: Uuid::new_v4(),
+            identity_key: "test:relationship".into(),
+            username: Some("relationship".into()),
+            issuer: None,
+            subject: "relationship".into(),
+            display_name: "Relationship".into(),
+            email: None,
+            password_hash: None,
+            role: "member".into(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            last_login_at: None,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .unwrap();
+        admin_session::Model {
+            token_hash: "session".into(),
+            user_id: account.id,
+            created_at: now,
+            last_seen_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .unwrap();
+        user::Entity::delete_by_id(account.id)
+            .exec(&db)
+            .await
+            .unwrap();
+        assert!(
+            admin_session::Entity::find_by_id("session")
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
