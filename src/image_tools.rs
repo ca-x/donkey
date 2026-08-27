@@ -189,6 +189,47 @@ pub struct SyncRuleInput {
     pub timezone: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ImageSyncRuleView {
+    pub id: Uuid,
+    pub name: String,
+    pub enabled: bool,
+    pub source_ref: String,
+    pub source_node_id: Option<Uuid>,
+    pub source_credential_id: Option<Uuid>,
+    pub destination_ref: String,
+    pub destination_credential_id: Uuid,
+    pub platform_os: String,
+    pub platform_arch: String,
+    pub cron: String,
+    pub timezone: String,
+    pub last_digest: Option<String>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<DateTime<Utc>>,
+}
+
+impl From<image_sync_rule::Model> for ImageSyncRuleView {
+    fn from(rule: image_sync_rule::Model) -> Self {
+        Self {
+            id: rule.id,
+            name: rule.name,
+            enabled: rule.enabled,
+            source_ref: rule.source_ref,
+            source_node_id: rule.source_node_id,
+            source_credential_id: rule.source_credential_id,
+            destination_ref: rule.destination_ref,
+            destination_credential_id: rule.destination_credential_id,
+            platform_os: rule.platform_os,
+            platform_arch: rule.platform_arch,
+            cron: rule.cron,
+            timezone: rule.timezone,
+            last_digest: rule.last_digest,
+            last_run_at: rule.last_run_at,
+            next_run_at: rule.next_run_at,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     #[serde(default = "default_limit")]
@@ -1972,21 +2013,22 @@ async fn download_file(
     serve_path(path, None, request).await
 }
 
-async fn list_rules(
-    State(service): State<ImageTools>,
-) -> ApiResult<Json<Vec<image_sync_rule::Model>>> {
+async fn list_rules(State(service): State<ImageTools>) -> ApiResult<Json<Vec<ImageSyncRuleView>>> {
     Ok(Json(
         image_sync_rule::Entity::find()
             .order_by_asc(image_sync_rule::Column::Name)
             .all(&service.db)
-            .await?,
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
     ))
 }
 
 async fn create_rule(
     State(service): State<ImageTools>,
     Json(input): Json<SyncRuleInput>,
-) -> ApiResult<(StatusCode, Json<image_sync_rule::Model>)> {
+) -> ApiResult<(StatusCode, Json<ImageSyncRuleView>)> {
     let input = validate_rule(input)?;
     let now = Utc::now();
     let model = image_sync_rule::Model {
@@ -2012,14 +2054,14 @@ async fn create_rule(
     .insert(&service.db)
     .await?;
     service.wake.notify_one();
-    Ok((StatusCode::CREATED, Json(model)))
+    Ok((StatusCode::CREATED, Json(model.into())))
 }
 
 async fn update_rule(
     State(service): State<ImageTools>,
     AxumPath(id): AxumPath<Uuid>,
     Json(input): Json<SyncRuleInput>,
-) -> ApiResult<Json<image_sync_rule::Model>> {
+) -> ApiResult<Json<ImageSyncRuleView>> {
     let input = validate_rule(input)?;
     let model = image_sync_rule::Entity::find_by_id(id)
         .one(&service.db)
@@ -2039,7 +2081,7 @@ async fn update_rule(
     active.timezone = Set(input.timezone.clone());
     active.next_run_at = Set(Some(next_run(&input.cron, &input.timezone)?));
     active.updated_at = Set(Utc::now());
-    Ok(Json(active.update(&service.db).await?))
+    Ok(Json(active.update(&service.db).await?.into()))
 }
 
 async fn delete_rule(
