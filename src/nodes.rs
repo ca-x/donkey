@@ -214,6 +214,10 @@ impl NodeService {
             .await?
             .ok_or_else(|| AppError::conflict(NODE_ROUTE_CONFLICT))?;
         let validated = security::validate_upstream(&input.url, &self.config).await?;
+        if let Some(ip) = &input.connect_ip {
+            ip.parse::<std::net::IpAddr>()
+                .map_err(|_| AppError::bad_request("connect_ip must be an IP address"))?;
+        }
         let mut node = db::get_node(&self.db, id)
             .await?
             .ok_or_else(|| AppError::not_found("node"))?;
