@@ -366,4 +366,70 @@ mod tests {
             .unwrap();
         assert!(proxy_if_mapping(&state, invalid).await.is_err());
     }
+
+    #[tokio::test]
+    async fn follows_public_redirects_and_preserves_client_range() {
+        let redirected = MockServer::start_async().await;
+        let range_mock = redirected
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/objects/release.bin")
+                    .header("range", "bytes=4-7");
+                then.status(206)
+                    .header("content-type", "application/octet-stream")
+                    .header("content-range", "bytes 4-7/12")
+                    .header("accept-ranges", "bytes")
+                    .body("4567");
+            })
+            .await;
+        let upstream = MockServer::start_async().await;
+        let redirect_mock = upstream
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/files/release.bin")
+                    .header("range", "bytes=4-7");
+                then.status(302).header(
+                    "location",
+                    format!("{}/objects/release.bin", redirected.base_url()),
+                );
+            })
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        create(
+            &state.db,
+            MappingInput {
+                source_host: "downloads.example".into(),
+                upstream_base: format!("{}/files/", upstream.base_url()),
+                public_base: "http://donkey.test:5443/dl/".into(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        let request = Request::builder()
+            .uri("/dl/release.bin")
+            .header(header::HOST, "donkey.test:5443")
+            .header(header::RANGE, "bytes=4-7")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = proxy_if_mapping(&state, request).await.unwrap().unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 4-7/12"
+        );
+        assert_eq!(
+            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"4567");
+        redirect_mock.assert_async().await;
+        range_mock.assert_async().await;
+    }
 }
