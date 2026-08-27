@@ -18,7 +18,7 @@ import type {
   AuthConfig,
   AuthUser,
   HealthData,
-  PullEvent,
+  PullEventPage,
 } from './types'
 import { adminUrl } from './basePath'
 
@@ -92,7 +92,7 @@ export const api = {
   cache: (limit = 250) => request<CacheEntry[]>(`/cache?limit=${limit}`),
   deleteCache: (key: string) => request<void>(`/cache/${key}`, { method: 'DELETE' }),
   clearCache: () => request<{ freed_bytes: number }>('/cache/clear', { method: 'DELETE' }),
-  pullEvents: (limit = 500) => request<PullEvent[]>(`/pull-events?limit=${limit}`),
+  pullEvents: (page = 1, pageSize = 50) => request<PullEventPage>(`/pull-events?page=${page}&page_size=${pageSize}`),
   clearPullEvents: () => request<{ deleted: number }>('/pull-events', { method: 'DELETE' }),
   mappings: () => request<Mapping[]>('/mappings'),
   createMapping: (input: MappingInput) =>

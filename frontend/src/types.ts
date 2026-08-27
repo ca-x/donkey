@@ -180,6 +180,13 @@ export interface PullEvent {
   created_at: string
 }
 
+export interface PullEventPage {
+  items: PullEvent[]
+  total: number
+  page: number
+  page_size: number
+}
+
 export interface RuntimeSettingsExport {
   format: 'donkey-runtime-settings'
   version: 1

@@ -521,6 +521,10 @@ a,
   min-height: 250px;
 }
 
+.settings-panel .mantine-FileInput-placeholder {
+  color: var(--muted);
+}
+
 .setting-value {
   max-width: 62%;
   overflow: hidden;

@@ -1,4 +1,4 @@
-import { Badge, Box, Button, Group, Paper, Stack, Table, Text } from '@mantine/core'
+import { Badge, Box, Button, Group, Pagination, Paper, Stack, Table, Text } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { IconHistory, IconTrash } from '@tabler/icons-react'
@@ -15,13 +15,15 @@ export function PullHistoryPage() {
   const { t, i18n } = useTranslation()
   const canWrite = useAuth().role === 'admin'
   const client = useQueryClient()
+  const [page, setPage] = useState(1)
   const [clearRequested, setClearRequested] = useState(false)
-  const events = useQuery({ queryKey: ['pull-events'], queryFn: () => api.pullEvents(500), refetchInterval: 15_000 })
+  const events = useQuery({ queryKey: ['pull-events', page], queryFn: () => api.pullEvents(page, 50), refetchInterval: 15_000 })
   const routes = useQuery({ queryKey: ['registry-routes'], queryFn: api.registryRoutes })
   const clear = useMutation({
     mutationFn: api.clearPullEvents,
     onSuccess: () => {
       setClearRequested(false)
+      setPage(1)
       void client.invalidateQueries({ queryKey: ['pull-events'] })
       notifications.show({ color: 'green', message: t('pulls.cleared') })
     },
@@ -32,7 +34,8 @@ export function PullHistoryPage() {
 
   const routeNames = new Map(routes.data!.map((route) => [route.id, route.name]))
   const date = new Intl.DateTimeFormat(i18n.resolvedLanguage === 'zh' ? 'zh-CN' : 'en', { dateStyle: 'medium', timeStyle: 'medium' })
-  const history = events.data!
+  const history = events.data!.items
+  const totalPages = Math.max(1, Math.ceil(events.data!.total / events.data!.page_size))
   return <Stack gap={24}>
     <PageHeader
       title={t('pulls.title')}
@@ -49,6 +52,7 @@ export function PullHistoryPage() {
       <Stack className="mobile-cache-list" gap="sm">
         {history.map((event) => <PullCard key={event.id} event={event} route={routeNames.get(event.registry_route_id) ?? event.registry_route_id} date={date} />)}
       </Stack>
+      {totalPages > 1 && <Group justify="center" mt="lg"><Pagination value={page} onChange={setPage} total={totalPages} withEdges /></Group>}
     </Paper>}
     <NamedConfirmDialog opened={clearRequested} title={t('pulls.clearTitle')} name={t('pulls.clearName')} consequence={t('pulls.clearMessage')} confirmLabel={t('pulls.clear')} loading={clear.isPending} onCancel={() => setClearRequested(false)} onConfirm={() => clear.mutate()} />
   </Stack>
