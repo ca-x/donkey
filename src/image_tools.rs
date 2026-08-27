@@ -2454,6 +2454,22 @@ mod tests {
         next_run_at: DateTime<Utc>,
     ) -> image_sync_rule::Model {
         let now = Utc::now();
+        let destination_credential_id = Uuid::new_v4();
+        registry_credential::Model {
+            id: destination_credential_id,
+            name: "scheduled destination".into(),
+            registry: "registry.example".into(),
+            auth_mode: "bearer".into(),
+            username: None,
+            secret_enc: "encrypted-test-secret".into(),
+            generation: 1,
+            created_at: now,
+            updated_at: now,
+        }
+        .into_active_model()
+        .insert(db)
+        .await
+        .unwrap();
         image_sync_rule::Model {
             id: Uuid::new_v4(),
             name: "scheduled copy".into(),
@@ -2462,7 +2478,7 @@ mod tests {
             source_node_id: None,
             source_credential_id: None,
             destination_ref: "registry.example/alpine:latest".into(),
-            destination_credential_id: Uuid::new_v4(),
+            destination_credential_id,
             platform_os: "linux".into(),
             platform_arch: "amd64".into(),
             cron: "0 * * * * *".into(),
@@ -2875,9 +2891,9 @@ mod tests {
                 sea_orm::DbBackend::Sqlite,
                 "UPDATE image_job_owners SET worker_id = ?, attempt = ? WHERE job_id = ?",
                 [
-                    replacement_worker.to_string().into(),
+                    replacement_worker.into(),
                     (attempt + 1).into(),
-                    job.id.to_string().into(),
+                    job.id.into(),
                 ],
             ))
             .await
@@ -3365,6 +3381,22 @@ mod tests {
         let nodes = NodeService::new(config.clone(), db.clone()).unwrap();
         let service = ImageTools::new(config, db, nodes).await.unwrap();
         let credential_id = Uuid::new_v4();
+        let now = Utc::now();
+        registry_credential::Model {
+            id: credential_id,
+            name: "copy destination".into(),
+            registry: registry.address().to_string(),
+            auth_mode: "bearer".into(),
+            username: None,
+            secret_enc: "encrypted-test-secret".into(),
+            generation: 1,
+            created_at: now,
+            updated_at: now,
+        }
+        .into_active_model()
+        .insert(&service.db)
+        .await
+        .unwrap();
         let destination_ref = format!("{}/team/copied:latest", registry.address());
         let job = service
             .create_job(

@@ -26,6 +26,31 @@ pub struct MappingInput {
     pub enabled: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct MappingView {
+    pub id: Uuid,
+    pub source_host: String,
+    pub upstream_base: String,
+    pub public_base: String,
+    pub enabled: bool,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+impl From<domain_mapping::Model> for MappingView {
+    fn from(mapping: domain_mapping::Model) -> Self {
+        Self {
+            id: mapping.id,
+            source_host: mapping.source_host,
+            upstream_base: mapping.upstream_base,
+            public_base: mapping.public_base,
+            enabled: mapping.enabled,
+            created_at: mapping.created_at,
+            updated_at: mapping.updated_at,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ConvertInput {
     pub url: String,
@@ -42,10 +67,7 @@ fn default_true() -> bool {
     true
 }
 
-pub async fn create(
-    db: &DatabaseConnection,
-    input: MappingInput,
-) -> ApiResult<domain_mapping::Model> {
+pub async fn create(db: &DatabaseConnection, input: MappingInput) -> ApiResult<MappingView> {
     let input = validate(input)?;
     let now = Utc::now();
     db::insert_mapping(
@@ -61,6 +83,7 @@ pub async fn create(
         },
     )
     .await
+    .map(Into::into)
     .map_err(Into::into)
 }
 
@@ -68,7 +91,7 @@ pub async fn update(
     db: &DatabaseConnection,
     id: Uuid,
     input: MappingInput,
-) -> ApiResult<domain_mapping::Model> {
+) -> ApiResult<MappingView> {
     let input = validate(input)?;
     let mut model = db::get_mapping(db, id)
         .await?
@@ -78,7 +101,10 @@ pub async fn update(
     model.public_base = input.public_base;
     model.enabled = input.enabled;
     model.updated_at = Utc::now();
-    db::save_mapping(db, model).await.map_err(Into::into)
+    db::save_mapping(db, model)
+        .await
+        .map(Into::into)
+        .map_err(Into::into)
 }
 
 pub async fn delete(db: &DatabaseConnection, id: Uuid) -> ApiResult<()> {

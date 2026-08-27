@@ -888,6 +888,22 @@ mod tests {
             .await
             .unwrap();
         let now = Utc::now();
+        let destination_credential_id = Uuid::new_v4();
+        crate::db::registry_credential::Model {
+            id: destination_credential_id,
+            name: "node deletion test".into(),
+            registry: "registry.example".into(),
+            auth_mode: "bearer".into(),
+            username: None,
+            secret_enc: "encrypted-test-secret".into(),
+            generation: 1,
+            created_at: now,
+            updated_at: now,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .unwrap();
         let rule = crate::db::image_sync_rule::Model {
             id: Uuid::new_v4(),
             name: "uses node".into(),
@@ -896,7 +912,7 @@ mod tests {
             source_node_id: Some(node.node.id),
             source_credential_id: None,
             destination_ref: "registry.example/redis:latest".into(),
-            destination_credential_id: Uuid::new_v4(),
+            destination_credential_id,
             platform_os: "linux".into(),
             platform_arch: "amd64".into(),
             cron: "0 * * * * *".into(),

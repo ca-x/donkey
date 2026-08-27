@@ -109,7 +109,22 @@ pub mod node_metric {
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::node::Entity",
+            from = "Column::NodeId",
+            to = "super::node::Column::Id",
+            on_update = "Cascade",
+            on_delete = "Cascade"
+        )]
+        Node,
+    }
+
+    impl Related<super::node::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Node.def()
+        }
+    }
 
     impl ActiveModelBehavior for ActiveModel {}
 }
@@ -154,7 +169,22 @@ pub mod pull_event {
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::registry_route::Entity",
+            from = "Column::RegistryRouteId",
+            to = "super::registry_route::Column::Id",
+            on_update = "Cascade",
+            on_delete = "Cascade"
+        )]
+        RegistryRoute,
+    }
+
+    impl Related<super::registry_route::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::RegistryRoute.def()
+        }
+    }
 
     impl ActiveModelBehavior for ActiveModel {}
 }
@@ -245,7 +275,38 @@ pub mod image_job {
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::node::Entity",
+            from = "Column::SourceNodeId",
+            to = "super::node::Column::Id",
+            on_update = "Cascade",
+            on_delete = "SetNull"
+        )]
+        SourceNode,
+        #[sea_orm(
+            belongs_to = "super::registry_credential::Entity",
+            from = "Column::SourceCredentialId",
+            to = "super::registry_credential::Column::Id",
+            on_update = "Cascade",
+            on_delete = "SetNull"
+        )]
+        SourceCredential,
+        #[sea_orm(
+            belongs_to = "super::registry_credential::Entity",
+            from = "Column::DestinationCredentialId",
+            to = "super::registry_credential::Column::Id",
+            on_update = "Cascade",
+            on_delete = "SetNull"
+        )]
+        DestinationCredential,
+    }
+
+    impl Related<super::node::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::SourceNode.def()
+        }
+    }
 
     impl ActiveModelBehavior for ActiveModel {}
 }
@@ -277,7 +338,38 @@ pub mod image_sync_rule {
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::node::Entity",
+            from = "Column::SourceNodeId",
+            to = "super::node::Column::Id",
+            on_update = "Cascade",
+            on_delete = "Restrict"
+        )]
+        SourceNode,
+        #[sea_orm(
+            belongs_to = "super::registry_credential::Entity",
+            from = "Column::SourceCredentialId",
+            to = "super::registry_credential::Column::Id",
+            on_update = "Cascade",
+            on_delete = "Restrict"
+        )]
+        SourceCredential,
+        #[sea_orm(
+            belongs_to = "super::registry_credential::Entity",
+            from = "Column::DestinationCredentialId",
+            to = "super::registry_credential::Column::Id",
+            on_update = "Cascade",
+            on_delete = "Restrict"
+        )]
+        DestinationCredential,
+    }
+
+    impl Related<super::node::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::SourceNode.def()
+        }
+    }
 
     impl ActiveModelBehavior for ActiveModel {}
 }
@@ -328,7 +420,22 @@ pub mod admin_session {
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::user::Entity",
+            from = "Column::UserId",
+            to = "super::user::Column::Id",
+            on_update = "Cascade",
+            on_delete = "Cascade"
+        )]
+        User,
+    }
+
+    impl Related<super::user::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::User.def()
+        }
+    }
 
     impl ActiveModelBehavior for ActiveModel {}
 }
@@ -584,6 +691,37 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE TRIGGER IF NOT EXISTS trg_users_delete_sessions AFTER DELETE ON users BEGIN DELETE FROM admin_sessions WHERE user_id = OLD.id; END",
         ]),
     },
+    Migration {
+        version: 10,
+        name: "image tools relational integrity",
+        action: MigrationAction::Statements(&[
+            "DROP TABLE IF EXISTS node_limits",
+            "CREATE TABLE node_limits (node_id BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, max_concurrency INTEGER NOT NULL DEFAULT 8 CHECK(max_concurrency BETWEEN 1 AND 64))",
+            "DROP TABLE IF EXISTS image_job_owners",
+            "CREATE TABLE image_job_owners (job_id BLOB PRIMARY KEY NOT NULL REFERENCES image_jobs(id) ON DELETE CASCADE, worker_id BLOB NOT NULL, attempt INTEGER NOT NULL CHECK(attempt > 0), claimed_at TEXT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_image_jobs_source_node ON image_jobs(source_node_id)",
+            "CREATE INDEX IF NOT EXISTS idx_image_jobs_source_credential ON image_jobs(source_credential_id)",
+            "CREATE INDEX IF NOT EXISTS idx_image_jobs_destination_credential ON image_jobs(destination_credential_id)",
+            "CREATE INDEX IF NOT EXISTS idx_image_sync_rules_source_node ON image_sync_rules(source_node_id)",
+            "CREATE INDEX IF NOT EXISTS idx_image_sync_rules_source_credential ON image_sync_rules(source_credential_id)",
+            "CREATE INDEX IF NOT EXISTS idx_image_sync_rules_destination_credential ON image_sync_rules(destination_credential_id)",
+            "CREATE INDEX IF NOT EXISTS idx_pull_events_registry_route ON pull_events(registry_route_id)",
+            "CREATE TRIGGER IF NOT EXISTS trg_registry_credentials_validate_insert BEFORE INSERT ON registry_credentials WHEN NEW.auth_mode NOT IN ('basic', 'bearer') OR NEW.generation < 1 OR length(trim(NEW.name)) = 0 OR length(trim(NEW.registry)) = 0 OR length(NEW.secret_enc) = 0 OR (NEW.auth_mode = 'basic' AND (NEW.username IS NULL OR length(trim(NEW.username)) = 0)) BEGIN SELECT RAISE(ABORT, 'invalid Registry credential'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_registry_credentials_validate_update BEFORE UPDATE ON registry_credentials WHEN NEW.auth_mode NOT IN ('basic', 'bearer') OR NEW.generation < 1 OR length(trim(NEW.name)) = 0 OR length(trim(NEW.registry)) = 0 OR length(NEW.secret_enc) = 0 OR (NEW.auth_mode = 'basic' AND (NEW.username IS NULL OR length(trim(NEW.username)) = 0)) BEGIN SELECT RAISE(ABORT, 'invalid Registry credential'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_image_jobs_validate_insert BEFORE INSERT ON image_jobs WHEN NEW.kind NOT IN ('export', 'extract', 'copy') OR NEW.status NOT IN ('pending', 'running', 'completed', 'skipped', 'failed', 'cancelled') OR NEW.progress_bytes < 0 OR NEW.total_bytes < 0 OR (NEW.total_bytes > 0 AND NEW.progress_bytes > NEW.total_bytes) OR (NEW.source_node_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM nodes WHERE id = NEW.source_node_id)) OR (NEW.source_credential_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM registry_credentials WHERE id = NEW.source_credential_id)) OR (NEW.destination_credential_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM registry_credentials WHERE id = NEW.destination_credential_id)) BEGIN SELECT RAISE(ABORT, 'invalid image job'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_image_jobs_validate_update BEFORE UPDATE ON image_jobs WHEN NEW.kind NOT IN ('export', 'extract', 'copy') OR NEW.status NOT IN ('pending', 'running', 'completed', 'skipped', 'failed', 'cancelled') OR NEW.progress_bytes < 0 OR NEW.total_bytes < 0 OR (NEW.total_bytes > 0 AND NEW.progress_bytes > NEW.total_bytes) OR (NEW.source_node_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM nodes WHERE id = NEW.source_node_id)) OR (NEW.source_credential_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM registry_credentials WHERE id = NEW.source_credential_id)) OR (NEW.destination_credential_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM registry_credentials WHERE id = NEW.destination_credential_id)) BEGIN SELECT RAISE(ABORT, 'invalid image job'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_image_sync_rules_validate_insert BEFORE INSERT ON image_sync_rules WHEN length(trim(NEW.name)) = 0 OR length(trim(NEW.source_ref)) = 0 OR length(trim(NEW.destination_ref)) = 0 OR NEW.destination_credential_id IS NULL OR (NEW.source_node_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM nodes WHERE id = NEW.source_node_id)) OR (NEW.source_credential_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM registry_credentials WHERE id = NEW.source_credential_id)) OR NOT EXISTS (SELECT 1 FROM registry_credentials WHERE id = NEW.destination_credential_id) BEGIN SELECT RAISE(ABORT, 'invalid image sync rule'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_image_sync_rules_validate_update BEFORE UPDATE ON image_sync_rules WHEN length(trim(NEW.name)) = 0 OR length(trim(NEW.source_ref)) = 0 OR length(trim(NEW.destination_ref)) = 0 OR NEW.destination_credential_id IS NULL OR (NEW.source_node_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM nodes WHERE id = NEW.source_node_id)) OR (NEW.source_credential_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM registry_credentials WHERE id = NEW.source_credential_id)) OR NOT EXISTS (SELECT 1 FROM registry_credentials WHERE id = NEW.destination_credential_id) BEGIN SELECT RAISE(ABORT, 'invalid image sync rule'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_pull_events_validate_insert BEFORE INSERT ON pull_events WHEN NOT EXISTS (SELECT 1 FROM registry_routes WHERE id = NEW.registry_route_id) OR NEW.status_code < 100 OR NEW.status_code > 599 OR length(trim(NEW.repository)) = 0 OR length(trim(NEW.reference)) = 0 BEGIN SELECT RAISE(ABORT, 'invalid pull event'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_nodes_delete_image_references BEFORE DELETE ON nodes WHEN EXISTS (SELECT 1 FROM image_sync_rules WHERE source_node_id = OLD.id) OR EXISTS (SELECT 1 FROM image_jobs WHERE source_node_id = OLD.id AND status IN ('pending', 'running')) BEGIN SELECT RAISE(ABORT, 'node is referenced by an active job or sync rule'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_nodes_delete_terminal_job_references AFTER DELETE ON nodes BEGIN UPDATE image_jobs SET source_node_id = NULL WHERE source_node_id = OLD.id; END",
+            "CREATE TRIGGER IF NOT EXISTS trg_credentials_delete_image_references BEFORE DELETE ON registry_credentials WHEN EXISTS (SELECT 1 FROM image_sync_rules WHERE source_credential_id = OLD.id OR destination_credential_id = OLD.id) OR EXISTS (SELECT 1 FROM image_jobs WHERE status IN ('pending', 'running') AND (source_credential_id = OLD.id OR destination_credential_id = OLD.id)) BEGIN SELECT RAISE(ABORT, 'credential is referenced by an active job or sync rule'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_credentials_delete_terminal_job_references AFTER DELETE ON registry_credentials BEGIN UPDATE image_jobs SET source_credential_id = NULL WHERE source_credential_id = OLD.id; UPDATE image_jobs SET destination_credential_id = NULL WHERE destination_credential_id = OLD.id; END",
+            "CREATE TRIGGER IF NOT EXISTS trg_registry_routes_delete_pull_events AFTER DELETE ON registry_routes BEGIN DELETE FROM pull_events WHERE registry_route_id = OLD.id; END",
+            "CREATE TRIGGER IF NOT EXISTS trg_users_validate_insert BEFORE INSERT ON users WHEN NEW.role NOT IN ('admin', 'member') OR length(trim(NEW.identity_key)) = 0 OR length(trim(NEW.subject)) = 0 OR length(trim(NEW.display_name)) = 0 BEGIN SELECT RAISE(ABORT, 'invalid user'); END",
+            "CREATE TRIGGER IF NOT EXISTS trg_users_validate_update BEFORE UPDATE ON users WHEN NEW.role NOT IN ('admin', 'member') OR length(trim(NEW.identity_key)) = 0 OR length(trim(NEW.subject)) = 0 OR length(trim(NEW.display_name)) = 0 BEGIN SELECT RAISE(ABORT, 'invalid user'); END",
+        ]),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -817,7 +955,7 @@ pub async fn get_node_max_concurrency(db: &DatabaseConnection, id: Uuid) -> Resu
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT max_concurrency FROM node_limits WHERE node_id = ?",
-            [id.to_string().into()],
+            [id.into()],
         ))
         .await?;
     Ok(row
@@ -834,7 +972,7 @@ pub async fn set_node_max_concurrency(
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO node_limits(node_id, max_concurrency) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET max_concurrency = excluded.max_concurrency",
-        [id.to_string().into(), (max_concurrency as i64).into()],
+        [id.into(), (max_concurrency as i64).into()],
     ))
     .await?;
     Ok(())
@@ -891,7 +1029,7 @@ pub async fn delete_node(db: &DatabaseConnection, id: Uuid) -> Result<u64, DbErr
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "DELETE FROM node_limits WHERE node_id = ?",
-            [id.to_string().into()],
+            [id.into()],
         ))
         .await?;
     let deleted = node::Entity::delete_by_id(id)
@@ -1127,7 +1265,7 @@ pub async fn claim_image_job(
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT attempt FROM image_job_owners WHERE job_id = ?",
-            [job_id.to_string().into()],
+            [job_id.into()],
         ))
         .await?
         .and_then(|row| row.try_get::<i64>("", "attempt").ok())
@@ -1156,8 +1294,8 @@ pub async fn claim_image_job(
             "INSERT INTO image_job_owners(job_id, worker_id, attempt, claimed_at) VALUES (?, ?, ?, ?)
              ON CONFLICT(job_id) DO UPDATE SET worker_id = excluded.worker_id, attempt = excluded.attempt, claimed_at = excluded.claimed_at",
             [
-                job_id.to_string().into(),
-                worker_id.to_string().into(),
+                job_id.into(),
+                worker_id.into(),
                 attempt.into(),
                 now.to_rfc3339().into(),
             ],
@@ -1175,11 +1313,11 @@ pub async fn image_job_owner(
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT worker_id, attempt FROM image_job_owners WHERE job_id = ?",
-            [job_id.to_string().into()],
+            [job_id.into()],
         ))
         .await?;
     Ok(row.and_then(|row| {
-        let worker = row.try_get::<String>("", "worker_id").ok()?.parse().ok()?;
+        let worker = row.try_get::<Uuid>("", "worker_id").ok()?;
         let attempt = row.try_get::<i64>("", "attempt").ok()?;
         Some((worker, attempt))
     }))
@@ -1189,7 +1327,7 @@ pub async fn clear_image_job_owner(db: &DatabaseConnection, job_id: Uuid) -> Res
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM image_job_owners WHERE job_id = ?",
-        [job_id.to_string().into()],
+        [job_id.into()],
     ))
     .await?;
     Ok(())
@@ -1257,8 +1395,8 @@ pub async fn finish_image_job_owned(
                 finish.now.into(),
                 finish.job_id.into(),
                 finish.cancel_requested.into(),
-                finish.job_id.to_string().into(),
-                finish.worker_id.to_string().into(),
+                finish.job_id.into(),
+                finish.worker_id.into(),
                 finish.attempt.into(),
             ],
         ))
@@ -1284,8 +1422,8 @@ pub async fn finish_image_job_owned(
                 DbBackend::Sqlite,
                 "DELETE FROM image_job_owners WHERE job_id = ? AND worker_id = ? AND attempt = ?",
                 [
-                    finish.job_id.to_string().into(),
-                    finish.worker_id.to_string().into(),
+                    finish.job_id.into(),
+                    finish.worker_id.into(),
                     finish.attempt.into(),
                 ],
             ))
@@ -1311,8 +1449,8 @@ pub async fn renew_image_job(
                 lease_until.into(),
                 now.into(),
                 job_id.into(),
-                job_id.to_string().into(),
-                worker_id.to_string().into(),
+                job_id.into(),
+                worker_id.into(),
                 attempt.into(),
             ],
         ))
@@ -1342,8 +1480,8 @@ pub async fn update_image_job_manifest_owned(
                 index_digest.map(str::to_owned).into(),
                 total_bytes.into(),
                 job_id.into(),
-                job_id.to_string().into(),
-                worker_id.to_string().into(),
+                job_id.into(),
+                worker_id.into(),
                 attempt.into(),
             ],
         ))
@@ -1377,8 +1515,8 @@ pub async fn update_image_job_progress_owned(
                 progress.now.into(),
                 progress.lease_until.into(),
                 progress.job_id.into(),
-                progress.job_id.to_string().into(),
-                progress.worker_id.to_string().into(),
+                progress.job_id.into(),
+                progress.worker_id.into(),
                 progress.attempt.into(),
             ],
         ))
@@ -1404,8 +1542,8 @@ pub async fn update_image_job_stage_owned(
                 now.into(),
                 lease_until.into(),
                 job_id.into(),
-                job_id.to_string().into(),
-                worker_id.to_string().into(),
+                job_id.into(),
+                worker_id.into(),
                 attempt.into(),
             ],
         ))
@@ -1429,8 +1567,8 @@ pub async fn update_image_job_artifact_owned(
                 artifact_path.into(),
                 artifact_name.into(),
                 job_id.into(),
-                job_id.to_string().into(),
-                worker_id.to_string().into(),
+                job_id.into(),
+                worker_id.into(),
                 attempt.into(),
             ],
         ))
@@ -1499,6 +1637,16 @@ mod tests {
         ("pull_events", "idx_pull_events_created_at"),
         ("pull_events", "idx_pull_events_route_repository"),
         ("image_job_lineage", "idx_image_job_lineage_rule"),
+        ("image_jobs", "idx_image_jobs_source_node"),
+        ("image_jobs", "idx_image_jobs_source_credential"),
+        ("image_jobs", "idx_image_jobs_destination_credential"),
+        ("image_sync_rules", "idx_image_sync_rules_source_node"),
+        ("image_sync_rules", "idx_image_sync_rules_source_credential"),
+        (
+            "image_sync_rules",
+            "idx_image_sync_rules_destination_credential",
+        ),
+        ("pull_events", "idx_pull_events_registry_route"),
     ];
 
     async fn create_v0_database(url: &str) {
@@ -1667,6 +1815,7 @@ mod tests {
                 (7, 1),
                 (8, 1),
                 (9, 1),
+                (10, 1),
             ]
         );
         assert_expected_indexes(&db).await;
@@ -1703,7 +1852,7 @@ mod tests {
     #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_version() {
         const FAILING_MIGRATION: &[Migration] = &[Migration {
-            version: 10,
+            version: 11,
             name: "rollback test",
             action: MigrationAction::Statements(&[
                 "CREATE TABLE migration_rollback_marker (id INTEGER PRIMARY KEY)",
@@ -1734,6 +1883,7 @@ mod tests {
                 (7, 1),
                 (8, 1),
                 (9, 1),
+                (10, 1),
             ]
         );
     }
@@ -1924,6 +2074,137 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn image_tools_relationships_and_checks_are_enforced() {
+        let db = connect("sqlite::memory:").await.unwrap();
+        let now = Utc::now();
+
+        assert!(
+            set_node_max_concurrency(&db, Uuid::new_v4(), 8)
+                .await
+                .is_err()
+        );
+        let node_id = Uuid::new_v4();
+        insert_node(
+            &db,
+            node::Model {
+                id: node_id,
+                name: "bounded".into(),
+                url: "https://bounded.example/".into(),
+                registry_route_id: crate::registry_routes::DOCKER_HUB_ROUTE_ID,
+                enabled: true,
+                priority: 10,
+                cf_preferred: false,
+                connect_ip: None,
+                auth_mode: "none".into(),
+                auth_username: None,
+                auth_header: None,
+                auth_secret_enc: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        set_node_max_concurrency(&db, node_id, 12).await.unwrap();
+        assert_eq!(get_node_max_concurrency(&db, node_id).await.unwrap(), 12);
+        let node_limit_storage = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT typeof(node_id) AS storage_type FROM node_limits WHERE node_id = ?",
+                [node_id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "storage_type")
+            .unwrap();
+        assert_eq!(node_limit_storage, "blob");
+
+        let invalid_credential = registry_credential::Model {
+            id: Uuid::new_v4(),
+            name: "invalid".into(),
+            registry: "registry.example".into(),
+            auth_mode: "none".into(),
+            username: None,
+            secret_enc: "ciphertext".into(),
+            generation: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(
+            invalid_credential
+                .into_active_model()
+                .insert(&db)
+                .await
+                .is_err()
+        );
+
+        let missing_node_job = image_job::Model {
+            id: Uuid::new_v4(),
+            kind: "export".into(),
+            status: "pending".into(),
+            source_ref: "docker.io/library/alpine:latest".into(),
+            source_node_id: Some(Uuid::new_v4()),
+            source_credential_id: None,
+            destination_ref: None,
+            destination_credential_id: None,
+            platform_os: "linux".into(),
+            platform_arch: "amd64".into(),
+            output_format: Some("docker".into()),
+            resolved_digest: None,
+            index_digest: None,
+            stage: "queued".into(),
+            progress_bytes: 0,
+            total_bytes: 0,
+            artifact_path: None,
+            artifact_name: None,
+            error: None,
+            idempotency_key: None,
+            cancel_requested: false,
+            lease_until: None,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+        assert!(
+            missing_node_job
+                .into_active_model()
+                .insert(&db)
+                .await
+                .is_err()
+        );
+
+        assert!(
+            insert_pull_event(
+                &db,
+                pull_event::Model {
+                    id: Uuid::new_v4(),
+                    registry_route_id: Uuid::new_v4(),
+                    repository: "library/alpine".into(),
+                    reference: "latest".into(),
+                    resolved_digest: None,
+                    status_code: 200,
+                    created_at: now,
+                },
+            )
+            .await
+            .is_err()
+        );
+
+        node::Entity::delete_by_id(node_id).exec(&db).await.unwrap();
+        let remaining_limit = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT 1 AS present FROM node_limits WHERE node_id = ?",
+                [node_id.into()],
+            ))
+            .await
+            .unwrap();
+        assert!(remaining_limit.is_none());
     }
 
     #[tokio::test]

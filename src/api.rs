@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::{
     cache::CacheEntryView,
-    db::{self, domain_mapping},
-    domainfold::{self, ConvertInput, ConvertOutput, MappingInput},
+    db::{self},
+    domainfold::{self, ConvertInput, ConvertOutput, MappingInput, MappingView},
     error::ApiResult,
     nodes::{NodeInput, NodeView},
     registry_routes::{RegistryRouteInput, RegistryRouteView},
@@ -267,16 +267,20 @@ async fn clear_pull_events(State(state): State<AppState>) -> ApiResult<Json<serd
     Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
 
-async fn list_mappings(
-    State(state): State<AppState>,
-) -> ApiResult<Json<Vec<domain_mapping::Model>>> {
-    Ok(Json(db::list_mappings(&state.db).await?))
+async fn list_mappings(State(state): State<AppState>) -> ApiResult<Json<Vec<MappingView>>> {
+    Ok(Json(
+        db::list_mappings(&state.db)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    ))
 }
 
 async fn create_mapping(
     State(state): State<AppState>,
     Json(input): Json<MappingInput>,
-) -> ApiResult<(StatusCode, Json<domain_mapping::Model>)> {
+) -> ApiResult<(StatusCode, Json<MappingView>)> {
     Ok((
         StatusCode::CREATED,
         Json(domainfold::create(&state.db, input).await?),
@@ -287,7 +291,7 @@ async fn update_mapping(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(input): Json<MappingInput>,
-) -> ApiResult<Json<domain_mapping::Model>> {
+) -> ApiResult<Json<MappingView>> {
     Ok(Json(domainfold::update(&state.db, id, input).await?))
 }
 
@@ -723,7 +727,7 @@ async fn apply_prepared_snapshot(
                 DbBackend::Sqlite,
                 "INSERT INTO node_limits(node_id, max_concurrency) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET max_concurrency = excluded.max_concurrency",
                 [
-                    node.model.id.to_string().into(),
+                    node.model.id.into(),
                     i64::from(node.max_concurrency).into(),
                 ],
             ))
