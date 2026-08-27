@@ -59,11 +59,19 @@ export function App() {
             <Route path="/image-tools" element={<ImageToolsPage />} />
             <Route path="/about" element={<AboutPage />} />
             <Route path="/deployment" element={<DeploymentPage />} />
-            <Route path="/pull-history" element={<PullHistoryPage />} />
+            <Route path="/pull-history" element={<PullHistoryGate />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Suspense>
       </AppShell>
     </AuthProvider>
   )
+}
+
+function PullHistoryGate() {
+  const runtime = useQuery({ queryKey: ['runtime'], queryFn: api.runtime, staleTime: 30_000 })
+  if (runtime.isLoading) return <LoadingState />
+  if (runtime.error) return <ErrorState error={runtime.error} retry={() => void runtime.refetch()} />
+  if (!runtime.data?.pull_logging_enabled) return <Navigate to="/" replace />
+  return <PullHistoryPage />
 }

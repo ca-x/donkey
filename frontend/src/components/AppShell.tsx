@@ -9,7 +9,7 @@ import {
   Tooltip,
   UnstyledButton,
 } from '@mantine/core'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMantineColorScheme } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import {
@@ -50,6 +50,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const user = useAuth()
+  const runtime = useQuery({ queryKey: ['runtime'], queryFn: api.runtime, staleTime: 30_000 })
   const { t, i18n } = useTranslation()
   const { colorScheme, setColorScheme } = useMantineColorScheme()
   const dark = colorScheme === 'dark'
@@ -71,7 +72,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       <aside className="desktop-sidebar" aria-label={t('shell.mainNav')}>
         <Brand />
         <Stack gap={4} mt={28}>
-          {navigation.map((item) => (
+          {navigation.filter((item) => item.path !== '/pull-history' || runtime.data?.pull_logging_enabled).map((item) => (
             <NavLink
               key={item.path}
               component={RouterNavLink}
@@ -111,7 +112,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       </main>
 
       <nav className="mobile-nav" aria-label={t('shell.mobileNav')}>
-        {navigation.filter((item) => item.path !== '/settings').map((item) => {
+        {navigation.filter((item) => item.path !== '/settings' && (item.path !== '/pull-history' || runtime.data?.pull_logging_enabled)).map((item) => {
           const active = location.pathname === item.path
           return (
             <UnstyledButton
