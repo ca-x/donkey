@@ -206,6 +206,30 @@ struct PullEventView {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Deserialize)]
+struct PullEventQuery {
+    #[serde(default = "default_page")]
+    page: u64,
+    #[serde(default = "default_page_size")]
+    page_size: u64,
+}
+
+fn default_page() -> u64 {
+    1
+}
+
+fn default_page_size() -> u64 {
+    50
+}
+
+#[derive(Serialize)]
+struct PullEventPage {
+    items: Vec<PullEventView>,
+    total: u64,
+    page: u64,
+    page_size: u64,
+}
+
 impl From<db::pull_event::Model> for PullEventView {
     fn from(event: db::pull_event::Model) -> Self {
         Self {
@@ -222,15 +246,17 @@ impl From<db::pull_event::Model> for PullEventView {
 
 async fn list_pull_events(
     State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-) -> ApiResult<Json<Vec<PullEventView>>> {
-    Ok(Json(
-        db::list_pull_events(&state.db, query.limit)
-            .await?
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-    ))
+    Query(query): Query<PullEventQuery>,
+) -> ApiResult<Json<PullEventPage>> {
+    let page = query.page.max(1);
+    let page_size = query.page_size.clamp(1, 100);
+    let (items, total) = db::paginate_pull_events(&state.db, page, page_size).await?;
+    Ok(Json(PullEventPage {
+        items: items.into_iter().map(Into::into).collect(),
+        total,
+        page,
+        page_size,
+    }))
 }
 
 async fn clear_pull_events(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {

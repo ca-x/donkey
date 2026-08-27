@@ -987,6 +987,24 @@ pub async fn list_pull_events(
         .await
 }
 
+pub async fn paginate_pull_events(
+    db: &DatabaseConnection,
+    page: u64,
+    page_size: u64,
+) -> Result<(Vec<pull_event::Model>, u64), DbErr> {
+    let page = page.max(1);
+    let page_size = page_size.clamp(1, 100);
+    let total = pull_event::Entity::find().count(db).await?;
+    let items = pull_event::Entity::find()
+        .order_by_desc(pull_event::Column::CreatedAt)
+        .order_by_desc(pull_event::Column::Id)
+        .offset(page.saturating_sub(1).saturating_mul(page_size))
+        .limit(page_size)
+        .all(db)
+        .await?;
+    Ok((items, total))
+}
+
 pub async fn clear_pull_events(db: &DatabaseConnection) -> Result<u64, DbErr> {
     Ok(pull_event::Entity::delete_many()
         .exec(db)
@@ -1829,5 +1847,11 @@ mod tests {
                 .iter()
                 .all(|event| { event.created_at >= now - chrono::Duration::days(2) })
         );
+        let (first_page, total) = paginate_pull_events(&db, 1, 1).await.unwrap();
+        let (second_page, _) = paginate_pull_events(&db, 2, 1).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(second_page.len(), 1);
+        assert_ne!(first_page[0].id, second_page[0].id);
     }
 }
