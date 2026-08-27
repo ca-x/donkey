@@ -2,6 +2,7 @@ import { useEffect, type ReactNode } from 'react'
 import {
   ActionIcon,
   Box,
+  Drawer,
   Group,
   NavLink,
   Stack,
@@ -9,6 +10,7 @@ import {
   Tooltip,
   UnstyledButton,
 } from '@mantine/core'
+import { useDisclosure } from '@mantine/hooks'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMantineColorScheme } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
@@ -26,6 +28,7 @@ import {
   IconInfoCircle,
   IconTerminal2,
   IconHistory,
+  IconDots,
 } from '@tabler/icons-react'
 import { NavLink as RouterNavLink, useLocation, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
@@ -44,6 +47,7 @@ const navigation = [
   { path: '/deployment', label: 'nav.deployment', short: 'nav.deploymentShort', icon: IconTerminal2 },
   { path: '/about', label: 'nav.about', short: 'nav.about', icon: IconInfoCircle },
 ]
+const mobilePrimaryPaths = new Set(['/', '/nodes', '/cache', '/image-tools'])
 
 export function AppShell({ children }: { children: ReactNode }) {
   const location = useLocation()
@@ -51,6 +55,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient()
   const user = useAuth()
   const runtime = useQuery({ queryKey: ['runtime'], queryFn: api.runtime, staleTime: 30_000 })
+  const [moreOpened, more] = useDisclosure(false)
   const { t, i18n } = useTranslation()
   const { colorScheme, setColorScheme } = useMantineColorScheme()
   const dark = colorScheme === 'dark'
@@ -64,6 +69,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => {
     document.getElementById('main-content')?.focus({ preventScroll: true })
   }, [location.pathname])
+  const visibleNavigation = navigation.filter((item) => item.path !== '/pull-history' || runtime.data?.pull_logging_enabled)
+  const mobilePrimary = visibleNavigation.filter((item) => mobilePrimaryPaths.has(item.path))
+  const mobileSecondary = visibleNavigation.filter((item) => !mobilePrimaryPaths.has(item.path))
+  const moreActive = mobileSecondary.some((item) => item.path === location.pathname)
   return (
     <div className="app-frame">
       <a className="skip-link" href="#main-content">
@@ -72,7 +81,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       <aside className="desktop-sidebar" aria-label={t('shell.mainNav')}>
         <Brand />
         <Stack gap={4} mt={28}>
-          {navigation.filter((item) => item.path !== '/pull-history' || runtime.data?.pull_logging_enabled).map((item) => (
+          {visibleNavigation.map((item) => (
             <NavLink
               key={item.path}
               component={RouterNavLink}
@@ -102,7 +111,6 @@ export function AppShell({ children }: { children: ReactNode }) {
         <Group gap={2} wrap="nowrap">
           <ActionIcon variant="subtle" size={44} aria-label={t('shell.language')} onClick={toggleLanguage}><IconLanguage size={19} /></ActionIcon>
           <ActionIcon variant="subtle" size={44} aria-label={t(dark ? 'shell.light' : 'shell.dark')} onClick={toggleTheme}>{dark ? <IconSun size={19} /> : <IconMoon size={19} />}</ActionIcon>
-          <Tooltip label={t('nav.settings')}><ActionIcon component={RouterNavLink} to="/settings" variant="subtle" size={44} aria-label={t('nav.settings')}><IconSettings size={20} /></ActionIcon></Tooltip>
           <ActionIcon variant="subtle" size={44} aria-label={t('login.logout')} loading={logout.isPending} onClick={() => logout.mutate()}><IconLogout size={19} /></ActionIcon>
         </Group>
       </header>
@@ -112,7 +120,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       </main>
 
       <nav className="mobile-nav" aria-label={t('shell.mobileNav')}>
-        {navigation.filter((item) => item.path !== '/settings' && (item.path !== '/pull-history' || runtime.data?.pull_logging_enabled)).map((item) => {
+        {mobilePrimary.map((item) => {
           const active = location.pathname === item.path
           return (
             <UnstyledButton
@@ -128,12 +136,51 @@ export function AppShell({ children }: { children: ReactNode }) {
             </UnstyledButton>
           )
         })}
+        <UnstyledButton
+          className="mobile-nav-item pressable"
+          data-active={moreActive || undefined}
+          aria-label={t('ui.more')}
+          aria-expanded={moreOpened}
+          aria-controls="mobile-more-navigation"
+          onClick={more.open}
+        >
+          <IconDots size={21} stroke={moreActive ? 2.2 : 1.7} />
+          <span>{t('ui.more')}</span>
+        </UnstyledButton>
       </nav>
+
+      <Drawer
+        id="mobile-more-navigation"
+        opened={moreOpened}
+        onClose={more.close}
+        title={t('ui.moreNav')}
+        position="bottom"
+        size="min(70dvh, 380px)"
+        radius="lg"
+        closeButtonProps={{ 'aria-label': t('ui.close') }}
+        classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }}
+      >
+        <Stack gap={4} pb="md">
+          {mobileSecondary.map((item) => (
+            <NavLink
+              key={item.path}
+              component={RouterNavLink}
+              to={item.path}
+              active={location.pathname === item.path}
+              label={t(item.label)}
+              leftSection={<item.icon size={20} stroke={1.8} />}
+              className="mobile-more-item pressable"
+              onClick={more.close}
+            />
+          ))}
+        </Stack>
+      </Drawer>
     </div>
   )
 }
 
 function Brand({ compact = false }: { compact?: boolean }) {
+  const { t } = useTranslation()
   return (
     <Group gap={compact ? 8 : 10} wrap="nowrap">
       <img
@@ -145,7 +192,7 @@ function Brand({ compact = false }: { compact?: boolean }) {
       />
       <Box>
         <Text className="brand-name">DONKEY</Text>
-        {!compact && <Text className="brand-caption">REGISTRY ACCELERATOR</Text>}
+        {!compact && <Text className="brand-caption">{t('ui.brandCaption')}</Text>}
       </Box>
     </Group>
   )

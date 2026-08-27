@@ -71,7 +71,7 @@ export function LoginPage() {
         <div className="login-identity">
           <img className="login-logo" src={adminUrl('/donkey-logo.webp')} width="112" height="112" alt="Donkey" />
           <Text className="login-wordmark">DONKEY</Text>
-          <Text c="dimmed" size="sm">Registry control plane</Text>
+          <Text c="dimmed" size="sm">{t('ui.loginSubtitle')}</Text>
         </div>
 
         <Paper className="login-panel">
@@ -100,6 +100,7 @@ export function LoginPage() {
                     label={t('login.password')}
                     autoComplete="current-password"
                     maxLength={1024}
+                    visibilityToggleButtonProps={{ 'aria-label': t('ui.togglePassword') }}
                     {...form.getInputProps('password')}
                   />
                   {error && <Text className="login-error" role="alert" c="red.5" size="sm">{error}</Text>}

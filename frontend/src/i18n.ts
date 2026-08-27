@@ -18,10 +18,65 @@ const concurrencyHelp = {
   },
 } as const
 
+const ui = {
+  zh: {
+    more: '更多',
+    moreNav: '更多功能',
+    close: '关闭',
+    togglePassword: '显示或隐藏密码',
+    brandCaption: '镜像加速与管理',
+    loginSubtitle: 'Registry 管理控制台',
+    settingsTitle: '参数设置',
+    settingsDescription: '调整并持久化运行参数、缓存策略和账户信息。部署说明已移至独立页面。',
+    unitLabel: '{{label}}的单位',
+  },
+  en: {
+    more: 'More',
+    moreNav: 'More features',
+    close: 'Close',
+    togglePassword: 'Show or hide password',
+    brandCaption: 'REGISTRY ACCELERATION',
+    loginSubtitle: 'Registry control plane',
+    settingsTitle: 'Settings',
+    settingsDescription: 'Tune and persist runtime parameters, cache policy, and account information. Deployment guidance has its own page.',
+    unitLabel: 'Unit for {{label}}',
+  },
+} as const
+
+const imageToolLabels = {
+  zh: {
+    content: '内容',
+    export: '离线包',
+    copy: '复制',
+    schedules: '同步',
+    tasks: '任务',
+    status: { pending: '等待中', running: '进行中', completed: '已完成', skipped: '已跳过', failed: '失败', cancelled: '已取消' },
+    kind: { export: '离线导出', extract: '内容提取', copy: '镜像复制' },
+    stageName: { queued: '等待执行', resolving: '解析镜像', downloading: '下载内容', archiving: '生成归档', extracting: '提取文件', copying: '复制镜像', recovered: '恢复任务', completed: '已完成', skipped: '已跳过', failed: '失败', cancelled: '已取消' },
+    fileKind: { directory: '目录', file: '文件', symlink: '符号链接' },
+    auth: { basic: 'Basic 认证', bearer: 'Bearer / Access Token' },
+    tokenCredential: '令牌',
+  },
+  en: {
+    content: 'Content',
+    export: 'Archive',
+    copy: 'Copy',
+    schedules: 'Sync',
+    tasks: 'Tasks',
+    status: { pending: 'Pending', running: 'Running', completed: 'Completed', skipped: 'Skipped', failed: 'Failed', cancelled: 'Cancelled' },
+    kind: { export: 'Offline export', extract: 'Content extraction', copy: 'Image copy' },
+    stageName: { queued: 'Queued', resolving: 'Resolving image', downloading: 'Downloading content', archiving: 'Building archive', extracting: 'Extracting files', copying: 'Copying image', recovered: 'Recovered', completed: 'Completed', skipped: 'Skipped', failed: 'Failed', cancelled: 'Cancelled' },
+    fileKind: { directory: 'Directory', file: 'File', symlink: 'Symbolic link' },
+    auth: { basic: 'Basic authentication', bearer: 'Bearer / access token' },
+    tokenCredential: 'Token',
+  },
+} as const
+
 const resources = {
   zh: {
     translation: {
       concurrencyHelp: concurrencyHelp.zh,
+      ui: ui.zh,
       routeFeedback: { keyInUse: '路由键已被其他命名空间使用', prefixInUse: '路径前缀已被其他命名空间使用', conflict: '路由键、路径前缀或默认设置与现有命名空间冲突，请检查后重试' },
       nav: { overview: '概览', nodes: '加速节点', nodesShort: '节点', cache: '缓存', domain: '域名加速', domainShort: '转换', imageTools: '镜像工具', imageToolsShort: '工具', settings: '参数设置', settingsShort: '设置', deployment: '部署帮助', deploymentShort: '部署', about: '关于' },
       deployment: { title: '部署帮助', description: 'Docker daemon 配置、镜像地址用法和客户端一键设置。' },
@@ -42,6 +97,7 @@ const resources = {
   en: {
     translation: {
       concurrencyHelp: concurrencyHelp.en,
+      ui: ui.en,
       routeFeedback: { keyInUse: 'Another namespace already uses this route key', prefixInUse: 'Another namespace already uses this path prefix', conflict: 'The route key, path prefix, or default setting conflicts with another namespace. Review the form and try again.' },
       nav: { overview: 'Overview', nodes: 'Upstreams', nodesShort: 'Nodes', cache: 'Cache', domain: 'DomainFold', domainShort: 'Convert', imageTools: 'Image tools', imageToolsShort: 'Tools', settings: 'Settings', settingsShort: 'Settings', deployment: 'Deployment help', deploymentShort: 'Deploy', about: 'About' },
       deployment: { title: 'Deployment help', description: 'Docker daemon setup, image references, and client commands.' },
@@ -60,6 +116,9 @@ const resources = {
     },
   },
 } as const
+
+Object.assign(resources.zh.translation.imageTools, imageToolLabels.zh)
+Object.assign(resources.en.translation.imageTools, imageToolLabels.en)
 
 const initialLanguage = localStorage.getItem('donkey-language') ?? (navigator.language.startsWith('zh') ? 'zh' : 'en')
 document.documentElement.lang = initialLanguage === 'zh' ? 'zh-CN' : 'en'

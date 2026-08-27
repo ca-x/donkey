@@ -18,7 +18,7 @@ export function SettingsPage() {
   if (runtime.error) return <ErrorState error={runtime.error} retry={() => void runtime.refetch()} />
   const config = runtime.data!
   return <Stack gap={24}>
-    <PageHeader title={t('settings.title')} description={t('settings.description')} />
+    <PageHeader title={t('ui.settingsTitle')} description={t('ui.settingsDescription')} />
     <Tabs value={tab} onChange={setTab} variant="default"><Tabs.List><Tabs.Tab value="runtime">{t('settings.runtimeTitle')}</Tabs.Tab><Tabs.Tab value="account">{t('settings.profileTitle')}</Tabs.Tab></Tabs.List><Tabs.Panel value="runtime" pt="lg"><RuntimeSettingsEditor config={config} /></Tabs.Panel><Tabs.Panel value="account" pt="lg"><AccountSettings /></Tabs.Panel></Tabs>
   </Stack>
 }
@@ -29,7 +29,7 @@ function AccountSettings() {
   const client = useQueryClient()
   const form = useForm({ initialValues: { display_name: user.display_name, username: user.username, current_password: '', new_password: '' } })
   const save = useMutation({ mutationFn: () => api.updateProfile({ display_name: form.values.display_name, username: user.local_password ? form.values.username : undefined, current_password: form.values.current_password || undefined, new_password: form.values.new_password || undefined }), onSuccess: (updated) => { client.setQueryData(['auth-me'], updated); form.setFieldValue('current_password', ''); form.setFieldValue('new_password', ''); notifications.show({ color: 'green', message: t('settings.profileSaved') }) } })
-  return <SettingsPanel icon={<IconSettings size={19} />} title={t('settings.profileTitle')}><SimpleGrid cols={{ base: 1, md: 2 }}><TextInput label={t('settings.displayName')} required {...form.getInputProps('display_name')} />{user.local_password && <TextInput label={t('settings.loginName')} required {...form.getInputProps('username')} />}</SimpleGrid>{user.local_password && <SimpleGrid cols={{ base: 1, md: 2 }}><PasswordInput label={t('settings.currentPassword')} {...form.getInputProps('current_password')} /><PasswordInput label={t('settings.newPassword')} description={t('settings.passwordHint')} {...form.getInputProps('new_password')} /></SimpleGrid>}<Group justify="flex-end"><Button onClick={() => save.mutate()} loading={save.isPending}>{t('common.save')}</Button></Group></SettingsPanel>
+  return <SettingsPanel icon={<IconSettings size={19} />} title={t('settings.profileTitle')}><SimpleGrid cols={{ base: 1, md: 2 }}><TextInput label={t('settings.displayName')} required {...form.getInputProps('display_name')} />{user.local_password && <TextInput label={t('settings.loginName')} required {...form.getInputProps('username')} />}</SimpleGrid>{user.local_password && <SimpleGrid cols={{ base: 1, md: 2 }}><PasswordInput label={t('settings.currentPassword')} visibilityToggleButtonProps={{ 'aria-label': t('ui.togglePassword') }} {...form.getInputProps('current_password')} /><PasswordInput label={t('settings.newPassword')} description={t('settings.passwordHint')} visibilityToggleButtonProps={{ 'aria-label': t('ui.togglePassword') }} {...form.getInputProps('new_password')} /></SimpleGrid>}<Group justify="flex-end"><Button onClick={() => save.mutate()} loading={save.isPending}>{t('common.save')}</Button></Group></SettingsPanel>
 }
 
 function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeConfig }) {
@@ -101,9 +101,10 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
 function formatSettingBytes(value: number) { if (value >= 1024 ** 3) return `${Math.round(value / 1024 ** 3)} GB`; return `${Math.round(value / 1024 ** 2)} MB` }
 
 function UnitInput({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {
+  const { t } = useTranslation()
   const units = [{ label: 'KB', multiplier: 1024 }, { label: 'MB', multiplier: 1024 ** 2 }, { label: 'GB', multiplier: 1024 ** 3 }]
   const selected = [...units].reverse().find((unit) => value >= unit.multiplier) ?? units[0]!
-  return <Group align="flex-end" gap="xs" wrap="nowrap"><NumberInput label={label} min={1} value={Math.max(1, Math.round(value / selected!.multiplier))} onChange={(next) => { const numeric = typeof next === 'number' ? next : Number(next); if (Number.isFinite(numeric)) onChange(Math.round(numeric * selected!.multiplier)) }} style={{ flex: 1 }} /><Select aria-label={`${label} unit`} data={units.map((unit) => unit.label)} value={selected!.label} onChange={(next) => { const unit = units.find((item) => item.label === next) ?? selected!; onChange(Math.round((value / selected!.multiplier) * unit.multiplier)) }} w={84} /></Group>
+  return <Group align="flex-end" gap="xs" wrap="nowrap"><NumberInput label={label} min={1} value={Math.max(1, Math.round(value / selected!.multiplier))} onChange={(next) => { const numeric = typeof next === 'number' ? next : Number(next); if (Number.isFinite(numeric)) onChange(Math.round(numeric * selected!.multiplier)) }} style={{ flex: 1 }} /><Select aria-label={t('ui.unitLabel', { label })} data={units.map((unit) => unit.label)} value={selected!.label} onChange={(next) => { const unit = units.find((item) => item.label === next) ?? selected!; onChange(Math.round((value / selected!.multiplier) * unit.multiplier)) }} w={84} /></Group>
 }
 
 function SettingsPanel({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) { return <Paper className="panel settings-panel"><Group mb="lg" gap="sm"><Box c="dimmed" aria-hidden="true">{icon}</Box><Title order={2}>{title}</Title></Group><Stack gap="sm">{children}</Stack></Paper> }

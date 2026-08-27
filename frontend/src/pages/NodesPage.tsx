@@ -268,9 +268,9 @@ function NodeDialog({ opened, value, initialRouteId, routes, close }: { opened: 
                 if (mode === 'basic' && form.values.url.includes('1ms.run') && !form.values.auth_username) form.setFieldValue('auth_username', '1ms')
               }}
             />
-            {form.values.auth_mode === 'basic' && <TextInput label={t('nodes.username')} description={form.values.url.includes('1ms.run') ? t('nodes.oneMsUser') : undefined} {...form.getInputProps('auth_username')} />}
+            {form.values.auth_mode === 'basic' && <TextInput label={t('nodes.username')} {...form.getInputProps('auth_username')} />}
             {form.values.auth_mode === 'header' && <TextInput label={t('nodes.headerName')} {...form.getInputProps('auth_header')} />}
-            {form.values.auth_mode !== 'none' && <PasswordInput label={t(editing?.auth_configured ? 'nodes.newSecret' : 'nodes.secret')} description={t('nodes.secretDesc')} autoComplete="new-password" {...form.getInputProps('auth_secret')} />}
+            {form.values.auth_mode !== 'none' && <PasswordInput label={t(editing?.auth_configured ? 'nodes.newSecret' : 'nodes.secret')} description={t('nodes.secretDesc')} autoComplete="new-password" visibilityToggleButtonProps={{ 'aria-label': t('ui.togglePassword') }} {...form.getInputProps('auth_secret')} />}
             <Group justify="space-between" mt="sm">
               {editing ? <Button type="button" color="red" variant="subtle" leftSection={<IconTrash size={17} />} onClick={() => setConfirmDelete(true)}>{t('common.delete')}</Button> : <span />}
               <Group>

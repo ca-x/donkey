@@ -29,7 +29,7 @@ export function App() {
       '/cache': 'cache.title',
       '/domainfold': 'domain.title',
       '/image-tools': 'imageTools.title',
-      '/settings': 'settings.title',
+      '/settings': 'ui.settingsTitle',
       '/login': 'login.title',
       '/about': 'about.title',
       '/deployment': 'deployment.title',
