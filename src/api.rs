@@ -310,6 +310,7 @@ struct RuntimeConfig {
     tls_enabled: bool,
     private_upstreams: bool,
     chunk_size: u64,
+    adaptive_chunking_enabled: bool,
     chunk_concurrency: usize,
     parallel_threshold: u64,
     resumable_threshold: u64,
@@ -347,6 +348,7 @@ async fn runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeConfig>
 #[derive(Clone, Serialize, Deserialize)]
 struct RuntimeSettingsInput {
     chunk_size: u64,
+    adaptive_chunking_enabled: bool,
     chunk_concurrency: usize,
     parallel_threshold: u64,
     resumable_threshold: u64,
@@ -430,6 +432,7 @@ async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<Runtime
         version: 1,
         settings: Some(RuntimeSettingsInput {
             chunk_size: config.chunk_size,
+            adaptive_chunking_enabled: config.adaptive_chunking_enabled,
             chunk_concurrency: config.chunk_concurrency,
             parallel_threshold: config.parallel_threshold,
             resumable_threshold: config.resumable_threshold,
@@ -778,6 +781,10 @@ async fn persist_runtime(state: &AppState, input: &RuntimeSettingsInput) -> ApiR
 fn runtime_setting_values(input: &RuntimeSettingsInput) -> Vec<(String, String)> {
     vec![
         ("chunk_size", input.chunk_size.to_string()),
+        (
+            "adaptive_chunking_enabled",
+            input.adaptive_chunking_enabled.to_string(),
+        ),
         ("chunk_concurrency", input.chunk_concurrency.to_string()),
         ("parallel_threshold", input.parallel_threshold.to_string()),
         ("resumable_threshold", input.resumable_threshold.to_string()),
@@ -847,6 +854,7 @@ fn runtime_config(
         tls_enabled: config.tls_cert.is_some(),
         private_upstreams: config.allow_private_upstreams,
         chunk_size: config.chunk_size,
+        adaptive_chunking_enabled: config.adaptive_chunking_enabled,
         chunk_concurrency: config.chunk_concurrency,
         parallel_threshold: config.parallel_threshold,
         resumable_threshold: config.resumable_threshold,

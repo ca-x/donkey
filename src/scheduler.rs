@@ -34,6 +34,7 @@ pub struct Scheduler {
 #[derive(Clone, Copy)]
 struct SchedulerRuntimeConfig {
     chunk_size: u64,
+    adaptive_chunking_enabled: bool,
     parallel_threshold: u64,
     resumable_threshold: u64,
     chunk_concurrency: usize,
@@ -83,6 +84,7 @@ impl Scheduler {
         Self {
             runtime: Arc::new(RwLock::new(SchedulerRuntimeConfig {
                 chunk_size: config.chunk_size,
+                adaptive_chunking_enabled: config.adaptive_chunking_enabled,
                 parallel_threshold: config.parallel_threshold,
                 resumable_threshold: config.resumable_threshold,
                 chunk_concurrency: config.chunk_concurrency,
@@ -103,6 +105,7 @@ impl Scheduler {
     pub async fn update_runtime(&self, config: &Config) {
         let mut runtime = self.runtime.write().await;
         runtime.chunk_size = config.chunk_size;
+        runtime.adaptive_chunking_enabled = config.adaptive_chunking_enabled;
         runtime.parallel_threshold = config.parallel_threshold;
         runtime.resumable_threshold = config.resumable_threshold;
         runtime.chunk_concurrency = config.chunk_concurrency;
@@ -124,10 +127,14 @@ impl Scheduler {
             .collect()
     }
 
-    pub async fn stream_download_config(&self) -> StreamDownloadConfig {
+    pub async fn stream_download_config(
+        &self,
+        total_size: u64,
+        node_capacity: usize,
+    ) -> StreamDownloadConfig {
         let runtime = *self.runtime.read().await;
         StreamDownloadConfig {
-            chunk_size: runtime.chunk_size,
+            chunk_size: effective_chunk_size(runtime, total_size, node_capacity),
             concurrency: runtime.chunk_concurrency,
             parallel_threshold: runtime.parallel_threshold,
         }
@@ -174,7 +181,7 @@ impl Scheduler {
         expected_digest: Option<&str>,
         nodes: &[NodeView],
     ) -> ApiResult<CachedObject> {
-        let runtime = *self.runtime.read().await;
+        let mut runtime = *self.runtime.read().await;
         let capability_key = format!("{}:{}", nodes[0].node.url, request_path);
         let capabilities = if let Some(value) = self.capabilities.get(&capability_key).await {
             value
@@ -187,6 +194,11 @@ impl Scheduler {
                 .await;
             detected
         };
+        let node_capacity = nodes
+            .iter()
+            .map(|node| usize::from(node.max_concurrency))
+            .sum();
+        runtime.chunk_size = effective_chunk_size(runtime, capabilities.size, node_capacity);
 
         let partial_dir = self.cache.temp_dir().join(key);
         tokio::fs::create_dir_all(&partial_dir).await?;
@@ -689,6 +701,28 @@ fn capacity_backoff() -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_millis(250))
 }
 
+fn effective_chunk_size(
+    runtime: SchedulerRuntimeConfig,
+    total_size: u64,
+    node_capacity: usize,
+) -> u64 {
+    if !runtime.adaptive_chunking_enabled {
+        return runtime.chunk_size;
+    }
+    const MIB: u64 = 1024 * 1024;
+    const MIN_CHUNK: u64 = 2 * MIB;
+    const MAX_CHUNK: u64 = 8 * MIB;
+    const TARGET_WAVES: u64 = 4;
+    let parallelism = runtime.chunk_concurrency.min(node_capacity.max(1)).max(1) as u64;
+    let target_chunks = parallelism.saturating_mul(TARGET_WAVES);
+    let ideal = total_size.saturating_add(target_chunks.saturating_sub(1)) / target_chunks;
+    ideal
+        .saturating_add(MIB - 1)
+        .div_euclid(MIB)
+        .saturating_mul(MIB)
+        .clamp(MIN_CHUNK, MAX_CHUNK)
+}
+
 fn capabilities_from_head(response: &reqwest::Response) -> Option<BlobCapabilities> {
     Some(BlobCapabilities {
         size: positive_content_length(response.headers())?,
@@ -868,12 +902,47 @@ async fn verify_file(path: &Path, expected_digest: &str) -> ApiResult<()> {
 mod tests {
     use super::*;
 
+    fn test_runtime(adaptive: bool) -> SchedulerRuntimeConfig {
+        SchedulerRuntimeConfig {
+            chunk_size: 512 * 1024,
+            adaptive_chunking_enabled: adaptive,
+            parallel_threshold: 1024 * 1024,
+            resumable_threshold: 1024 * 1024,
+            chunk_concurrency: 4,
+            scheduler_policy: SchedulerPolicy::Balanced,
+            stream_fallback_timeout: std::time::Duration::from_secs(1),
+        }
+    }
+
     #[test]
     fn splits_without_gaps_or_overlap() {
         let parts = chunks(11, 4);
         assert_eq!(
             parts.iter().map(|p| (p.start, p.end)).collect::<Vec<_>>(),
             vec![(0, 3), (4, 7), (8, 10)]
+        );
+    }
+
+    #[test]
+    fn adaptive_chunk_size_stays_between_two_and_eight_mib() {
+        let runtime = test_runtime(true);
+        assert_eq!(
+            effective_chunk_size(runtime, 8 * 1024 * 1024, 4),
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            effective_chunk_size(runtime, 1024 * 1024 * 1024, 4),
+            8 * 1024 * 1024
+        );
+        let medium = effective_chunk_size(runtime, 64 * 1024 * 1024, 4);
+        assert!((2 * 1024 * 1024..=8 * 1024 * 1024).contains(&medium));
+    }
+
+    #[test]
+    fn disabled_adaptive_chunking_uses_exact_configured_size() {
+        assert_eq!(
+            effective_chunk_size(test_runtime(false), 1024 * 1024 * 1024, 16),
+            512 * 1024
         );
     }
 

@@ -32,6 +32,7 @@ pub struct Config {
     pub allow_private_upstreams: bool,
     pub allow_insecure_upstreams: bool,
     pub chunk_size: u64,
+    pub adaptive_chunking_enabled: bool,
     pub chunk_concurrency: usize,
     pub parallel_threshold: u64,
     pub resumable_threshold: u64,
@@ -173,6 +174,7 @@ impl Config {
                 256 * 1024,
                 32 * 1024 * 1024,
             )?,
+            adaptive_chunking_enabled: bool_env("DONKEY_ADAPTIVE_CHUNKING_ENABLED", true)?,
             chunk_concurrency: usize_env("DONKEY_CHUNK_CONCURRENCY", 8, 1, 64)?,
             parallel_threshold: u64_env(
                 "DONKEY_PARALLEL_THRESHOLD",
@@ -255,6 +257,7 @@ impl Config {
             allow_private_upstreams: true,
             allow_insecure_upstreams: true,
             chunk_size: 512 * 1024,
+            adaptive_chunking_enabled: false,
             chunk_concurrency: 4,
             parallel_threshold: 1024 * 1024,
             resumable_threshold: 8 * 1024 * 1024,
@@ -285,6 +288,9 @@ impl Config {
         for setting in settings {
             match setting.key.as_str() {
                 "chunk_size" => self.chunk_size = setting.value.parse()?,
+                "adaptive_chunking_enabled" => {
+                    self.adaptive_chunking_enabled = setting.value.parse()?
+                }
                 "chunk_concurrency" => self.chunk_concurrency = setting.value.parse()?,
                 "parallel_threshold" => self.parallel_threshold = setting.value.parse()?,
                 "resumable_threshold" => self.resumable_threshold = setting.value.parse()?,

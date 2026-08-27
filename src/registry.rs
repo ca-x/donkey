@@ -232,7 +232,16 @@ async fn stream_blob(
         let Some(window) = stream_window(&upstream) else {
             return Ok(to_response(upstream));
         };
-        let stream_config = state.scheduler.stream_download_config().await;
+        let stream_config = state
+            .scheduler
+            .stream_download_config(
+                window.total,
+                nodes
+                    .iter()
+                    .map(|node| usize::from(node.max_concurrency))
+                    .sum(),
+            )
+            .await;
         let parallel = (nodes.len() > 1
             && window.start == 0
             && window.end.checked_add(1) == Some(window.total)
