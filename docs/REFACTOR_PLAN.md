@@ -1,6 +1,14 @@
 # Donkey 全量重构计划
 
-> 状态：规划阶段。所有阶段确定并获得确认后再开始实现。
+> 状态：实施中（阶段一核心正确性已完成，阶段二运行时配置与调度重构进行中）。
+
+## 当前进度
+
+- 任务所有权与 fencing 写入已落地，并覆盖陈旧 worker 回归测试。
+- 配置快照导入增加 scoped 文件支持与导入前预校验；事务化写入仍在推进。
+- Scheduler、CacheStore、UpstreamService、ImageTools 已支持运行时参数热更新。
+- Blob digest 校验、缓存对账和前端账户能力字段已补齐。
+- 每个增量提交均经过 Rust 全量测试、Clippy 与前端 lint/build 验证；暂不创建版本 tag。
 
 ## 总目标
 
