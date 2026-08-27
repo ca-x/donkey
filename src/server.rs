@@ -15,6 +15,7 @@ use crate::{Config, api, connect, registry, state::AppState};
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let state = AppState::new(config).await?;
+    let cancellation = tokio_util::sync::CancellationToken::new();
     if state.config.admin_addr.ip().is_unspecified()
         && !state.config.admin_external_tls
         && !state.config.admin_external_loopback
@@ -23,13 +24,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             "admin listener is not loopback and external TLS is not declared; expose port 5003 only on a trusted loopback binding"
         );
     }
-    state.image_tools.clone().spawn();
+    let image_worker = state.image_tools.clone().spawn(cancellation.clone());
     let admin = admin_router(state.clone());
     let registry = registry_router(state.clone());
 
     let health_state = state.clone();
-    tokio::spawn(async move {
+    let health_cancellation = cancellation.clone();
+    let health_worker = tokio::spawn(async move {
         loop {
+            if health_cancellation.is_cancelled() {
+                break;
+            }
             health_state.nodes.probe_all().await;
             if let Err(error) = health_state.cache.cleanup_expired().await {
                 tracing::warn!(?error, "cache TTL cleanup failed");
@@ -37,7 +42,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             if let Err(error) = health_state.auth.cleanup_expired().await {
                 tracing::warn!(?error, "expired admin session cleanup failed");
             }
-            tokio::time::sleep(health_state.nodes.health_interval().await).await;
+            tokio::select! {
+                _ = health_cancellation.cancelled() => break,
+                _ = tokio::time::sleep(health_state.nodes.health_interval().await) => {},
+            }
         }
     });
 
@@ -65,12 +73,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         Ok::<_, anyhow::Error>(())
     };
 
-    tokio::select! {
-        result = admin_server => result?,
-        result = registry_server => result?,
-        _ = shutdown_signal() => tracing::info!("shutdown signal received"),
-    }
-    Ok(())
+    let result = tokio::select! {
+        result = admin_server => result.map_err(Into::into),
+        result = registry_server => result,
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received");
+            Ok(())
+        },
+    };
+    cancellation.cancel();
+    let _ = health_worker.await;
+    let _ = image_worker.await;
+    result
 }
 
 pub fn admin_router(state: AppState) -> Router {

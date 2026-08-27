@@ -398,18 +398,25 @@ impl ImageTools {
         router.with_state(self)
     }
 
-    pub fn spawn(self) {
+    pub fn spawn(
+        self,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
+                if cancellation.is_cancelled() {
+                    break;
+                }
                 if let Err(error) = self.tick().await {
                     tracing::error!(?error, "image tools worker tick failed");
                 }
                 tokio::select! {
+                    _ = cancellation.cancelled() => break,
                     _ = self.wake.notified() => {},
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {},
                 }
             }
-        });
+        })
     }
 
     async fn tick(&self) -> ApiResult<()> {
@@ -2825,6 +2832,18 @@ mod tests {
             .unwrap();
         assert_eq!(live.status, JobStatus::Running.as_str());
         assert_eq!(live.lease_until, Some(now + chrono::Duration::minutes(5)));
+    }
+
+    #[tokio::test]
+    async fn worker_stops_after_cancellation() {
+        let (_directory, service) = test_service().await;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let worker = service.spawn(cancellation.clone());
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
