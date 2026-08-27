@@ -25,6 +25,7 @@ pub struct UpstreamService {
     timeout: Arc<RwLock<Duration>>,
     nodes: NodeService,
     tokens: Cache<String, TokenEntry>,
+    transports: Cache<String, NodeTransport>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -38,6 +39,12 @@ pub enum RangeMode {
 struct TokenEntry {
     value: Arc<str>,
     expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct NodeTransport {
+    base: security::ValidatedUpstream,
+    client: reqwest::Client,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +77,10 @@ impl UpstreamService {
             config,
             nodes,
             tokens: Cache::builder().max_capacity(2_000).build(),
+            transports: Cache::builder()
+                .max_capacity(512)
+                .time_to_live(Duration::from_secs(5 * 60))
+                .build(),
         }
     }
 
@@ -89,8 +100,9 @@ impl UpstreamService {
         headers: &HeaderMap,
         range: RangeMode,
     ) -> ApiResult<Response> {
-        let upstream = security::validate_upstream(&node.node.url, &self.config).await?;
-        let url = upstream
+        let transport = self.node_transport(node).await?;
+        let url = transport
+            .base
             .url
             .join(request_path.trim_start_matches('/'))
             .map_err(AppError::internal)?;
@@ -105,6 +117,7 @@ impl UpstreamService {
                     bearer: None,
                     apply_node_auth: true,
                 },
+                &transport.client,
             )
             .await?;
 
@@ -124,6 +137,7 @@ impl UpstreamService {
                         bearer: Some(&token),
                         apply_node_auth: node.node.auth_mode == "header",
                     },
+                    &transport.client,
                 )
                 .await?;
         }
@@ -159,13 +173,14 @@ impl UpstreamService {
         Ok(response)
     }
 
-    async fn send_once(&self, node: &NodeView, spec: RequestSpec<'_>) -> ApiResult<Response> {
-        let mut validated = security::validate_target_url(spec.url.as_str(), &self.config).await?;
-        self.apply_connect_ip(node, &mut validated)?;
-        let timeout = *self.timeout.read().await;
-        let client = security::client_for(&validated, timeout)?;
+    async fn send_once(
+        &self,
+        node: &NodeView,
+        spec: RequestSpec<'_>,
+        client: &reqwest::Client,
+    ) -> ApiResult<Response> {
         let mut request = forward_headers(
-            client.request(spec.method, validated.url),
+            client.request(spec.method, spec.url),
             spec.headers,
             spec.range,
         );
@@ -179,6 +194,25 @@ impl UpstreamService {
             .send()
             .await
             .map_err(|error| AppError::Upstream(error.to_string()))
+    }
+
+    async fn node_transport(&self, node: &NodeView) -> ApiResult<NodeTransport> {
+        let timeout = *self.timeout.read().await;
+        let key = format!(
+            "{}:{}:{}",
+            node.node.id,
+            node.node.updated_at.timestamp_millis(),
+            timeout.as_millis()
+        );
+        if let Some(transport) = self.transports.get(&key).await {
+            return Ok(transport);
+        }
+        let mut base = security::validate_upstream(&node.node.url, &self.config).await?;
+        self.apply_connect_ip(node, &mut base)?;
+        let client = security::client_for(&base, timeout)?;
+        let transport = NodeTransport { base, client };
+        self.transports.insert(key, transport.clone()).await;
+        Ok(transport)
     }
 
     async fn token(&self, node: &NodeView, challenge: &BearerChallenge) -> ApiResult<Arc<str>> {

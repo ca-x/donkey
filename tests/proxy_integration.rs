@@ -36,12 +36,15 @@ mod proxy_integration {
         WrongContentRange,
         CorruptChunk,
         DropAfterPrefix,
+        ThrottledRange,
     }
 
     #[derive(Default)]
     struct FixtureStats {
         head_count: AtomicUsize,
         get_count: AtomicUsize,
+        active_requests: AtomicUsize,
+        max_active_requests: AtomicUsize,
         ranges: Mutex<Vec<Option<String>>>,
         uris: Mutex<Vec<String>>,
         route_auth: Mutex<Vec<Option<String>>>,
@@ -105,6 +108,17 @@ mod proxy_integration {
         async fn route_auth(&self) -> Vec<Option<String>> {
             self.state.stats.route_auth.lock().await.clone()
         }
+
+        fn max_active_requests(&self) -> usize {
+            self.state.stats.max_active_requests.load(Ordering::Relaxed)
+        }
+
+        fn reset_max_active_requests(&self) {
+            self.state
+                .stats
+                .max_active_requests
+                .store(0, Ordering::Relaxed);
+        }
     }
 
     impl Drop for Fixture {
@@ -140,6 +154,7 @@ mod proxy_integration {
                             | FixtureBehavior::WrongContentRange
                             | FixtureBehavior::CorruptChunk
                             | FixtureBehavior::DropAfterPrefix
+                            | FixtureBehavior::ThrottledRange
                     ),
                     None,
                 )
@@ -227,6 +242,9 @@ mod proxy_integration {
                         }
                         response
                     }
+                    FixtureBehavior::ThrottledRange => {
+                        throttled_ranged_or_whole(&state.bytes, requested_range, &state.stats).await
+                    }
                 }
             }
             _ => fixture_response(StatusCode::METHOD_NOT_ALLOWED, &[], false, None),
@@ -272,6 +290,73 @@ mod proxy_integration {
             *first ^= 0xff;
         }
         corrupt
+    }
+
+    async fn throttled_ranged_or_whole(
+        bytes: &[u8],
+        requested_range: Option<String>,
+        stats: &FixtureStats,
+    ) -> Response {
+        const NETWORK_CHUNK: usize = 256 * 1024;
+        const CHUNK_DELAY: std::time::Duration = std::time::Duration::from_millis(40);
+
+        let (start, end, status) = requested_range
+            .as_deref()
+            .and_then(parse_range)
+            .map(|(start, end)| {
+                (
+                    start,
+                    end.min(bytes.len().saturating_sub(1) as u64),
+                    StatusCode::PARTIAL_CONTENT,
+                )
+            })
+            .unwrap_or((0, bytes.len().saturating_sub(1) as u64, StatusCode::OK));
+        let body = bytes[start as usize..=end as usize].to_vec();
+        let simulated_chunks = body.len().div_ceil(NETWORK_CHUNK) as u32;
+        let response_body = if status == StatusCode::PARTIAL_CONTENT {
+            let active = stats.active_requests.fetch_add(1, Ordering::Relaxed) + 1;
+            stats
+                .max_active_requests
+                .fetch_max(active, Ordering::Relaxed);
+            tokio::time::sleep(CHUNK_DELAY * simulated_chunks).await;
+            stats.active_requests.fetch_sub(1, Ordering::Relaxed);
+            Body::from(body)
+        } else {
+            let chunks = body
+                .chunks(NETWORK_CHUNK)
+                .map(bytes::Bytes::copy_from_slice)
+                .collect::<Vec<_>>();
+            Body::from_stream(futures_util::stream::unfold(
+                chunks.into_iter(),
+                |mut chunks| async move {
+                    let chunk = chunks.next()?;
+                    tokio::time::sleep(CHUNK_DELAY).await;
+                    Some((Ok::<_, std::io::Error>(chunk), chunks))
+                },
+            ))
+        };
+        let mut response = Response::new(response_body);
+        *response.status_mut() = status;
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            (end - start + 1).to_string().parse().unwrap(),
+        );
+        response
+            .headers_mut()
+            .insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        if status == StatusCode::PARTIAL_CONTENT {
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{}", bytes.len())
+                    .parse()
+                    .unwrap(),
+            );
+        }
+        response
     }
 
     fn parse_range(value: &str) -> Option<(u64, u64)> {
@@ -891,6 +976,137 @@ mod proxy_integration {
                 .filter(|count| *count > 0)
                 .count();
             assert_eq!(used, 3);
+        }
+
+        #[tokio::test]
+        async fn streaming_parallelizes_one_blob_across_range_nodes() {
+            let bytes = b"0123456789abcdef".to_vec();
+            let first = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
+            let second = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.parallel_threshold = 1;
+            config.chunk_size = 4;
+            config.chunk_concurrency = 4;
+            let state = AppState::new(config).await.unwrap();
+            for (index, fixture) in [&first, &second].into_iter().enumerate() {
+                state
+                    .nodes
+                    .create(NodeInput {
+                        name: format!("parallel-stream-{index}"),
+                        url: fixture.url(),
+                        registry_route_id: DOCKER_HUB_ROUTE_ID,
+                        enabled: true,
+                        priority: index as i32,
+                        max_concurrency: 2,
+                        cf_preferred: false,
+                        connect_ip: None,
+                        auth_mode: "none".into(),
+                        auth_username: None,
+                        auth_header: None,
+                        auth_secret: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert!(first.ranges().await.iter().any(Option::is_some));
+            assert!(second.ranges().await.iter().any(Option::is_some));
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+        }
+
+        #[tokio::test]
+        #[ignore = "manual controlled performance diagnostic; not part of CI"]
+        async fn diagnostic_parallel_streaming_vs_single_upstream() {
+            let bytes = vec![b's'; 2 * 1024 * 1024];
+            let first = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;
+            let second = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;
+
+            let direct_started = std::time::Instant::now();
+            let direct = reqwest::get(format!(
+                "{}v2/{REPOSITORY}/blobs/{}",
+                first.url(),
+                digest(&bytes)
+            ))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+            let direct_elapsed = direct_started.elapsed();
+            assert_eq!(direct.as_ref(), bytes);
+            first.reset_max_active_requests();
+            second.reset_max_active_requests();
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.parallel_threshold = 1;
+            config.chunk_size = 256 * 1024;
+            config.chunk_concurrency = 4;
+            let state = AppState::new(config).await.unwrap();
+            for (index, fixture) in [&first, &second].into_iter().enumerate() {
+                state
+                    .nodes
+                    .create(NodeInput {
+                        name: format!("performance-stream-{index}"),
+                        url: fixture.url(),
+                        registry_route_id: DOCKER_HUB_ROUTE_ID,
+                        enabled: true,
+                        priority: index as i32,
+                        max_concurrency: 2,
+                        cf_preferred: false,
+                        connect_ip: None,
+                        auth_mode: "none".into(),
+                        auth_username: None,
+                        auth_header: None,
+                        auth_secret: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let parallel_started = std::time::Instant::now();
+            let response = request(
+                registry_router(state),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            let parallel = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let parallel_elapsed = parallel_started.elapsed();
+            assert_eq!(parallel.as_ref(), bytes);
+            assert!(
+                first.ranges().await.iter().any(Option::is_some)
+                    && second.ranges().await.iter().any(Option::is_some)
+            );
+            eprintln!(
+                "parallel={parallel_elapsed:?}, direct={direct_elapsed:?}, active=({}, {}), first={:?}, second={:?}",
+                first.max_active_requests(),
+                second.max_active_requests(),
+                first.ranges().await,
+                second.ranges().await
+            );
+            assert!(
+                parallel_elapsed < direct_elapsed,
+                "parallel={parallel_elapsed:?}, direct={direct_elapsed:?}"
+            );
         }
     }
 

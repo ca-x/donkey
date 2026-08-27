@@ -180,6 +180,16 @@ async fn stream_blob(
         let Some(window) = stream_window(&upstream) else {
             return Ok(to_response(upstream));
         };
+        let stream_config = state.scheduler.stream_download_config().await;
+        let parallel = (nodes.len() > 1
+            && window.start == 0
+            && window.end.checked_add(1) == Some(window.total)
+            && window.total >= stream_config.parallel_threshold
+            && response_headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.eq_ignore_ascii_case("bytes")))
+        .then_some(stream_config);
         let media_type = response_headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -209,6 +219,7 @@ async fn stream_blob(
             expected_digest: expected,
             _lease: lease,
             node_service: state.nodes.clone(),
+            parallel,
         };
         tokio::spawn(async move {
             let errors = tx.clone();
@@ -255,6 +266,7 @@ struct StreamRelay {
     expected_digest: Option<String>,
     _lease: CacheLease,
     node_service: crate::nodes::NodeService,
+    parallel: Option<crate::scheduler::StreamDownloadConfig>,
 }
 
 struct ResumeRequest<'a> {
@@ -320,6 +332,7 @@ async fn relay_stream_blob(
         expected_digest,
         _lease,
         node_service,
+        parallel,
     } = relay;
     let complete_blob = window.start == 0 && window.end.checked_add(1) == Some(window.total);
     let stable_partial_dir = cache.temp_dir().join(&key);
@@ -352,7 +365,7 @@ async fn relay_stream_blob(
     }
     let mut hasher = Sha256::new();
     let mut offset = window.start;
-    let mut response = response;
+    let mut response = Some(response);
 
     if complete_blob && existing > 0 {
         let mut saved = tokio::fs::File::open(&partial).await?;
@@ -382,7 +395,7 @@ async fn relay_stream_blob(
             })
             .await?;
             current_node = next_node;
-            response = next_response;
+            response = Some(next_response);
         }
     }
 
@@ -392,10 +405,35 @@ async fn relay_stream_blob(
         .open(&partial)
         .await?;
 
+    if let Some(config) = parallel
+        && offset <= window.end
+    {
+        response.take();
+        relay_parallel_ranges(ParallelRelay {
+            upstream: &upstream,
+            nodes: &nodes,
+            node_service: &node_service,
+            path: &path,
+            headers: &headers,
+            start: offset,
+            end: window.end,
+            total: window.total,
+            config,
+            file: &mut file,
+            hasher: &mut hasher,
+            tx: &tx,
+        })
+        .await?;
+        offset = window.end + 1;
+    }
+
     while offset <= window.end {
+        let current_response = response
+            .take()
+            .ok_or_else(|| AppError::Upstream("Blob stream response is missing".into()))?;
         let started = std::time::Instant::now();
         let mut transferred = 0_u64;
-        let mut body = response.bytes_stream();
+        let mut body = current_response.bytes_stream();
         let mut stream_error = None;
         while let Some(chunk) = body.next().await {
             match chunk {
@@ -453,7 +491,7 @@ async fn relay_stream_blob(
         })
         .await?;
         current_node = next_node;
-        response = next_response;
+        response = Some(next_response);
     }
 
     file.flush().await?;
@@ -530,6 +568,170 @@ async fn resume_stream_response(
     Err(AppError::Upstream(last_error.unwrap_or_else(|| {
         "all nodes failed to resume the Blob stream".into()
     })))
+}
+
+#[derive(Clone, Copy)]
+struct StreamChunk {
+    sequence: usize,
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+struct ParallelRelay<'a> {
+    upstream: &'a crate::upstream::UpstreamService,
+    nodes: &'a [crate::nodes::NodeView],
+    node_service: &'a crate::nodes::NodeService,
+    path: &'a str,
+    headers: &'a HeaderMap,
+    start: u64,
+    end: u64,
+    total: u64,
+    config: crate::scheduler::StreamDownloadConfig,
+    file: &'a mut tokio::fs::File,
+    hasher: &'a mut Sha256,
+    tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+}
+
+struct ParallelChunkRequest {
+    upstream: crate::upstream::UpstreamService,
+    nodes: std::sync::Arc<Vec<crate::nodes::NodeView>>,
+    permits: std::sync::Arc<Vec<std::sync::Arc<tokio::sync::Semaphore>>>,
+    node_service: crate::nodes::NodeService,
+    path: std::sync::Arc<str>,
+    headers: std::sync::Arc<HeaderMap>,
+    chunk: StreamChunk,
+}
+
+async fn relay_parallel_ranges(relay: ParallelRelay<'_>) -> ApiResult<()> {
+    let nodes = std::sync::Arc::new(relay.nodes.to_vec());
+    let permits = std::sync::Arc::new(
+        relay
+            .nodes
+            .iter()
+            .map(|node| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(usize::from(
+                    node.max_concurrency,
+                )))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let path: std::sync::Arc<str> = relay.path.to_owned().into();
+    let headers = std::sync::Arc::new(relay.headers.clone());
+    let mut chunks = Vec::new();
+    let mut start = relay.start;
+    while start <= relay.end {
+        let end = start
+            .saturating_add(relay.config.chunk_size.saturating_sub(1))
+            .min(relay.end);
+        chunks.push(StreamChunk {
+            sequence: chunks.len(),
+            start,
+            end,
+            total: relay.total,
+        });
+        start = end + 1;
+    }
+    let concurrency = relay.config.concurrency.min(chunks.len()).max(1);
+    let mut results = futures_util::stream::iter(chunks)
+        .map(|chunk| {
+            fetch_parallel_chunk(ParallelChunkRequest {
+                upstream: relay.upstream.clone(),
+                nodes: nodes.clone(),
+                permits: permits.clone(),
+                node_service: relay.node_service.clone(),
+                path: path.clone(),
+                headers: headers.clone(),
+                chunk,
+            })
+        })
+        .buffered(concurrency);
+
+    while let Some(result) = results.next().await {
+        let chunk = result?;
+        relay.hasher.update(&chunk);
+        relay.file.write_all(&chunk).await?;
+        relay.tx.send(Ok(chunk)).await.map_err(|_| {
+            AppError::Upstream("client disconnected during parallel Blob stream".into())
+        })?;
+    }
+    Ok(())
+}
+
+async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes> {
+    use backoff::backoff::Backoff;
+
+    let expected = request.chunk.end - request.chunk.start + 1;
+    let mut policy = backoff::ExponentialBackoffBuilder::new()
+        .with_initial_interval(std::time::Duration::from_millis(50))
+        .with_max_interval(std::time::Duration::from_secs(1))
+        .with_max_elapsed_time(Some(std::time::Duration::from_secs(15)))
+        .build();
+    let mut last_error = None;
+    loop {
+        let mut attempted = false;
+        for step in 0..request.nodes.len() {
+            let index = (request.chunk.sequence + step) % request.nodes.len();
+            let Ok(permit) = request.permits[index].clone().try_acquire_owned() else {
+                continue;
+            };
+            attempted = true;
+            let started = std::time::Instant::now();
+            let result = async {
+                let response = request
+                    .upstream
+                    .send(
+                        &request.nodes[index],
+                        Method::GET,
+                        &request.path,
+                        &request.headers,
+                        crate::upstream::RangeMode::Exact(request.chunk.start, request.chunk.end),
+                    )
+                    .await?;
+                if response.status() != StatusCode::PARTIAL_CONTENT
+                    || !stream_window(&response).is_some_and(|window| {
+                        window.start == request.chunk.start
+                            && window.end == request.chunk.end
+                            && window.total == request.chunk.total
+                    })
+                {
+                    return Err(AppError::Integrity);
+                }
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|error| AppError::Upstream(error.to_string()))?;
+                if bytes.len() as u64 != expected {
+                    return Err(AppError::Integrity);
+                }
+                Ok(bytes)
+            }
+            .await;
+            drop(permit);
+            request
+                .node_service
+                .record_transfer(
+                    request.nodes[index].node.id,
+                    result.as_ref().map_or(0, |bytes| bytes.len() as u64),
+                    started.elapsed(),
+                    result.is_ok(),
+                )
+                .await;
+            match result {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if !attempted {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        let Some(delay) = policy.next_backoff() else {
+            break;
+        };
+        tokio::time::sleep(delay).await;
+    }
+    Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed a stream chunk".into())))
 }
 
 async fn serve_cached(

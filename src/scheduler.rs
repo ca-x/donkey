@@ -42,6 +42,13 @@ struct SchedulerRuntimeConfig {
     stream_fallback_timeout: std::time::Duration,
 }
 
+#[derive(Clone, Copy)]
+pub struct StreamDownloadConfig {
+    pub chunk_size: u64,
+    pub concurrency: usize,
+    pub parallel_threshold: u64,
+}
+
 #[derive(Clone, Debug)]
 struct BlobCapabilities {
     size: u64,
@@ -117,6 +124,15 @@ impl Scheduler {
             .into_iter()
             .cloned()
             .collect()
+    }
+
+    pub async fn stream_download_config(&self) -> StreamDownloadConfig {
+        let runtime = *self.runtime.read().await;
+        StreamDownloadConfig {
+            chunk_size: runtime.chunk_size,
+            concurrency: runtime.chunk_concurrency,
+            parallel_threshold: runtime.parallel_threshold,
+        }
     }
 
     pub async fn fetch_blob(
