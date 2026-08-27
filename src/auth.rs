@@ -81,6 +81,10 @@ pub struct AuthPrincipal {
     pub display_name: String,
     pub role: String,
     pub legacy: bool,
+    #[serde(rename = "local_password")]
+    pub local_password: bool,
+    #[serde(skip)]
+    pub session_token_hash: Option<String>,
 }
 
 impl AuthPrincipal {
@@ -209,7 +213,9 @@ impl AuthService {
             active.last_seen_at = Set(Utc::now());
             active.update(&self.db).await?;
         }
-        Ok(principal(account))
+        let mut principal = principal(account);
+        principal.session_token_hash = Some(token_hash);
+        Ok(principal)
     }
 
     pub fn authenticate_legacy_basic(&self, headers: &HeaderMap) -> Option<AuthPrincipal> {
@@ -232,6 +238,8 @@ impl AuthService {
             display_name: username.to_owned(),
             role: "admin".into(),
             legacy: true,
+            local_password: false,
+            session_token_hash: None,
         })
     }
 
@@ -607,6 +615,7 @@ async fn update_profile(
         .one(&service.db)
         .await?
         .ok_or(AppError::Unauthorized)?;
+    let password_changed = input.new_password.is_some();
     let changing_credentials = input.username.is_some() || input.new_password.is_some();
     if changing_credentials {
         let Some(hash) = account.password_hash.clone() else {
@@ -646,6 +655,15 @@ async fn update_profile(
         .into_active_model()
         .update(&service.db)
         .await?;
+    if password_changed
+        && let Some(current_token_hash) = current_user.session_token_hash.as_deref()
+    {
+        admin_session::Entity::delete_many()
+            .filter(admin_session::Column::UserId.eq(id))
+            .filter(admin_session::Column::TokenHash.ne(current_token_hash))
+            .exec(&service.db)
+            .await?;
+    }
     Ok(Json(principal(updated)))
 }
 
@@ -742,6 +760,8 @@ fn principal(account: user::Model) -> AuthPrincipal {
         display_name: account.display_name,
         role: account.role,
         legacy: false,
+        local_password: account.password_hash.is_some(),
+        session_token_hash: None,
     }
 }
 

@@ -7,6 +7,7 @@ export interface AuthUser {
   display_name: string
   role: 'admin' | 'member'
   legacy: boolean
+  local_password: boolean
 }
 
 export interface AuthConfig {
