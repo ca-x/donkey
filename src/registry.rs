@@ -104,8 +104,9 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
             // Keep the verified/cache-aware path for normal-sized blobs. If
             // it cannot produce a response promptly (large/slow layers),
             // switch to a streaming retry so Docker receives headers quickly.
+            let stream_fallback_timeout = state.scheduler.stream_fallback_timeout().await;
             match tokio::time::timeout(
-                state.config.stream_fallback_timeout,
+                stream_fallback_timeout,
                 state.scheduler.fetch_blob(
                     &upstream_path,
                     request.headers(),

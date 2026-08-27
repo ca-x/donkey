@@ -39,6 +39,7 @@ struct SchedulerRuntimeConfig {
     resumable_threshold: u64,
     chunk_concurrency: usize,
     scheduler_policy: SchedulerPolicy,
+    stream_fallback_timeout: std::time::Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +81,7 @@ impl Scheduler {
                 resumable_threshold: config.resumable_threshold,
                 chunk_concurrency: config.chunk_concurrency,
                 scheduler_policy: config.scheduler_policy,
+                stream_fallback_timeout: config.stream_fallback_timeout,
             })),
             nodes,
             cache,
@@ -100,6 +102,11 @@ impl Scheduler {
         runtime.resumable_threshold = config.resumable_threshold;
         runtime.chunk_concurrency = config.chunk_concurrency;
         runtime.scheduler_policy = config.scheduler_policy;
+        runtime.stream_fallback_timeout = config.stream_fallback_timeout;
+    }
+
+    pub async fn stream_fallback_timeout(&self) -> std::time::Duration {
+        self.runtime.read().await.stream_fallback_timeout
     }
 
     pub async fn fetch_blob(
