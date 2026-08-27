@@ -240,6 +240,8 @@ struct RuntimeConfig {
     stream_fallback_timeout_seconds: u64,
     partial_ttl_seconds: u64,
     health_interval_seconds: u64,
+    max_export_bytes: u64,
+    export_ttl_seconds: u64,
     scheduler_policy: String,
     max_cache_bytes: u64,
     cache_used_bytes: u64,
@@ -248,8 +250,6 @@ struct RuntimeConfig {
     cache_high_watermark: f64,
     cache_low_watermark: f64,
     cache_ttl_seconds: Option<u64>,
-    max_export_bytes: u64,
-    export_ttl_seconds: u64,
     admin_external_tls: bool,
     admin_external_loopback: bool,
     registry_external_tls: bool,
@@ -280,6 +280,8 @@ struct RuntimeSettingsInput {
     cache_low_watermark: f64,
     cache_ttl_seconds: Option<u64>,
     health_interval_seconds: u64,
+    max_export_bytes: u64,
+    export_ttl_seconds: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -359,6 +361,8 @@ async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<Runtime
             cache_low_watermark: config.cache_low_watermark,
             cache_ttl_seconds: config.cache_ttl.map(|value| value.as_secs()),
             health_interval_seconds: config.health_interval.as_secs(),
+            max_export_bytes: config.max_export_bytes,
+            export_ttl_seconds: config.export_ttl.as_secs(),
         },
         registry_routes: state.registry_routes.list().await?.into_iter().collect(),
         nodes,
@@ -468,6 +472,8 @@ async fn persist_runtime(state: &AppState, input: &RuntimeSettingsInput) -> ApiR
         || !(0.1..=0.99).contains(&input.cache_low_watermark)
         || input.cache_low_watermark >= input.cache_high_watermark
         || !(1..=86400).contains(&input.health_interval_seconds)
+        || input.max_export_bytes < 64 * 1024 * 1024
+        || !(60..=365 * 24 * 3600).contains(&input.export_ttl_seconds)
     {
         return Err(crate::error::AppError::bad_request(
             "runtime settings are out of range",
@@ -510,6 +516,8 @@ async fn persist_runtime(state: &AppState, input: &RuntimeSettingsInput) -> ApiR
             "health_interval_seconds",
             input.health_interval_seconds.to_string(),
         ),
+        ("max_export_bytes", input.max_export_bytes.to_string()),
+        ("export_ttl_seconds", input.export_ttl_seconds.to_string()),
     ];
     let values = values
         .into_iter()
@@ -547,6 +555,8 @@ fn runtime_config(
         stream_fallback_timeout_seconds: config.stream_fallback_timeout.as_secs(),
         partial_ttl_seconds: config.partial_ttl.as_secs(),
         health_interval_seconds: config.health_interval.as_secs(),
+        max_export_bytes: config.max_export_bytes,
+        export_ttl_seconds: config.export_ttl.as_secs(),
         scheduler_policy: config.scheduler_policy.to_string(),
         max_cache_bytes: config.max_cache_bytes,
         cache_used_bytes: cache.bytes,
@@ -555,8 +565,6 @@ fn runtime_config(
         cache_high_watermark: config.cache_high_watermark,
         cache_low_watermark: config.cache_low_watermark,
         cache_ttl_seconds: config.cache_ttl.map(|value| value.as_secs()),
-        max_export_bytes: config.max_export_bytes,
-        export_ttl_seconds: config.export_ttl.as_secs(),
         admin_external_tls: config.admin_external_tls,
         admin_external_loopback: config.admin_external_loopback,
         registry_external_tls: config.registry_external_tls,

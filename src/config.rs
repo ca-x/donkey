@@ -313,6 +313,10 @@ impl Config {
                 "health_interval_seconds" => {
                     self.health_interval = Duration::from_secs(setting.value.parse()?)
                 }
+                "max_export_bytes" => self.max_export_bytes = setting.value.parse()?,
+                "export_ttl_seconds" => {
+                    self.export_ttl = Duration::from_secs(setting.value.parse()?)
+                }
                 _ => {}
             }
         }
@@ -327,7 +331,8 @@ impl Config {
                 || self.upstream_timeout.is_zero()
                 || self.stream_fallback_timeout.is_zero()
                 || self.partial_ttl.is_zero()
-                || self.max_cache_bytes < 64 * 1024 * 1024)
+                || self.max_cache_bytes < 64 * 1024 * 1024
+                || self.max_export_bytes < 64 * 1024 * 1024)
         {
             anyhow::bail!("persisted runtime settings are out of range")
         }

@@ -48,7 +48,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
     partial_ttl_seconds: config.partial_ttl_seconds,
     cache_policy: config.cache_policy, cache_high_watermark: config.cache_high_watermark,
     cache_low_watermark: config.cache_low_watermark, cache_ttl_seconds: config.cache_ttl_seconds ?? 0,
-    health_interval_seconds: config.health_interval_seconds,
+    health_interval_seconds: config.health_interval_seconds, max_export_bytes: config.max_export_bytes, export_ttl_seconds: config.export_ttl_seconds,
   } })
   const save = useMutation({ mutationFn: () => api.updateRuntime(form.values), onSuccess: () => { void client.invalidateQueries({ queryKey: ['runtime'] }) } })
   const exportSettings = useMutation({ mutationFn: api.exportRuntime, onSuccess: setPendingExport })
@@ -60,7 +60,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
     resumable_threshold: 8 * 1024 * 1024, scheduler_policy: 'balanced', upstream_timeout_seconds: 30,
     stream_fallback_timeout_seconds: 10, partial_ttl_seconds: 3600, max_cache_bytes: 50 * 1024 ** 3,
     cache_policy: 'balanced', cache_high_watermark: 0.9, cache_low_watermark: 0.8,
-    cache_ttl_seconds: 0, health_interval_seconds: 60,
+    cache_ttl_seconds: 0, health_interval_seconds: 60, max_export_bytes: 20 * 1024 ** 3, export_ttl_seconds: 7 * 86400,
   })
   return <SettingsPanel icon={<IconSettings size={19} />} title={t('settings.runtimeTitle')}>
     <Text size="sm" c="dimmed">{t('settings.runtimeDescription')}</Text>
