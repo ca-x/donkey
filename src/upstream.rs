@@ -92,6 +92,39 @@ impl UpstreamService {
         *self.timeout.read().await
     }
 
+    pub async fn send_public_url(
+        &self,
+        method: Method,
+        mut url: Url,
+        headers: &HeaderMap,
+    ) -> ApiResult<Response> {
+        for redirect_count in 0..=3 {
+            let validated = security::validate_target_url(url.as_str(), &self.config).await?;
+            let client = security::client_for(&validated, self.timeout().await)?;
+            let response = forward_headers(
+                client.request(method.clone(), validated.url),
+                headers,
+                RangeMode::ForwardClient,
+            )
+            .send()
+            .await
+            .map_err(|error| AppError::Upstream(error.to_string()))?;
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            if redirect_count == 3 {
+                return Err(AppError::Upstream("too many upstream redirects".into()));
+            }
+            let location = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| AppError::Upstream("upstream redirect has no Location".into()))?;
+            url = url.join(location).map_err(AppError::internal)?;
+        }
+        Err(AppError::Upstream("too many upstream redirects".into()))
+    }
+
     pub async fn send(
         &self,
         node: &NodeView,

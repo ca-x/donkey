@@ -14,7 +14,6 @@ use uuid::Uuid;
 use crate::{
     db::{self, domain_mapping},
     error::{ApiResult, AppError},
-    security,
     state::AppState,
 };
 
@@ -213,66 +212,34 @@ pub async fn proxy_if_mapping(
 async fn send_domain_request(
     state: &AppState,
     method: Method,
-    mut url: Url,
+    url: Url,
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
-    for redirect_count in 0..=3 {
-        let validated = security::validate_target_url(url.as_str(), &state.config).await?;
-        let client = security::client_for(&validated, state.upstream.timeout().await)?;
-        let mut builder = client.request(method.clone(), validated.url);
-        for name in [
-            header::ACCEPT,
-            header::RANGE,
-            header::IF_NONE_MATCH,
-            header::IF_MODIFIED_SINCE,
-        ] {
-            if let Some(value) = headers.get(&name) {
-                builder = builder.header(name, value);
-            }
+    let upstream = state.upstream.send_public_url(method, url, headers).await?;
+    let status = upstream.status();
+    let response_headers = upstream.headers().clone();
+    let body = Body::from_stream(
+        upstream
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other)),
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::CONTENT_RANGE,
+        header::CONTENT_DISPOSITION,
+        header::ACCEPT_RANGES,
+        header::ETAG,
+        header::LAST_MODIFIED,
+        header::CACHE_CONTROL,
+    ] {
+        if let Some(value) = response_headers.get(&name) {
+            response.headers_mut().insert(name, value.clone());
         }
-        let upstream = builder
-            .header(header::ACCEPT_ENCODING, "identity")
-            .send()
-            .await
-            .map_err(|error| AppError::Upstream(error.to_string()))?;
-        if upstream.status().is_redirection() {
-            if redirect_count == 3 {
-                return Err(AppError::Upstream("too many DomainFold redirects".into()));
-            }
-            let location = upstream
-                .headers()
-                .get(header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| AppError::Upstream("DomainFold redirect has no Location".into()))?;
-            url = url.join(location).map_err(AppError::internal)?;
-            continue;
-        }
-        let status = upstream.status();
-        let response_headers = upstream.headers().clone();
-        let body = Body::from_stream(
-            upstream
-                .bytes_stream()
-                .map(|chunk| chunk.map_err(std::io::Error::other)),
-        );
-        let mut response = Response::new(body);
-        *response.status_mut() = status;
-        for name in [
-            header::CONTENT_TYPE,
-            header::CONTENT_LENGTH,
-            header::CONTENT_RANGE,
-            header::CONTENT_DISPOSITION,
-            header::ACCEPT_RANGES,
-            header::ETAG,
-            header::LAST_MODIFIED,
-            header::CACHE_CONTROL,
-        ] {
-            if let Some(value) = response_headers.get(&name) {
-                response.headers_mut().insert(name, value.clone());
-            }
-        }
-        return Ok(response);
     }
-    Err(AppError::Upstream("DomainFold request failed".into()))
+    Ok(response)
 }
 
 fn validate(mut input: MappingInput) -> ApiResult<MappingInput> {
