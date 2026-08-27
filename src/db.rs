@@ -7,6 +7,7 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub mod registry_route {
@@ -596,14 +597,35 @@ async fn apply_pending_migrations(
     )
     .await?;
 
+    let has_checksum = transaction
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA table_info(donkey_schema_migrations)".to_owned(),
+        ))
+        .await?
+        .iter()
+        .any(|row| row.try_get::<String>("", "name").is_ok_and(|name| name == "checksum"));
+    if !has_checksum {
+        transaction
+            .execute_unprepared(
+                "ALTER TABLE donkey_schema_migrations ADD COLUMN checksum TEXT NOT NULL DEFAULT ''",
+            )
+            .await?;
+    }
+
     let applied_versions = transaction
         .query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT version FROM donkey_schema_migrations ORDER BY version".to_owned(),
+            "SELECT version, checksum FROM donkey_schema_migrations ORDER BY version".to_owned(),
         ))
         .await?
         .into_iter()
-        .map(|row| row.try_get::<i64>("", "version"))
+        .map(|row| -> Result<(i64, String), DbErr> {
+            Ok((
+                row.try_get::<i64>("", "version")?,
+                row.try_get::<String>("", "checksum").unwrap_or_default(),
+            ))
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     let latest_known = migrations
@@ -613,7 +635,7 @@ async fn apply_pending_migrations(
         .unwrap_or(0);
     if let Some(unknown) = applied_versions
         .iter()
-        .copied()
+        .map(|(version, _)| *version)
         .find(|version| *version > latest_known)
     {
         return Err(DbErr::Custom(format!(
@@ -622,19 +644,39 @@ async fn apply_pending_migrations(
     }
 
     for migration in migrations {
-        if applied_versions.contains(&migration.version) {
+        if let Some((_, checksum)) = applied_versions
+            .iter()
+            .find(|(version, _)| *version == migration.version)
+        {
+            if !checksum.is_empty() && checksum.as_str() != migration_checksum(migration) {
+                return Err(DbErr::Custom(format!(
+                    "migration {} checksum mismatch",
+                    migration.version
+                )));
+            }
             continue;
         }
         apply_migration(transaction, *migration).await?;
         transaction
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO donkey_schema_migrations(version, name, applied_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                [migration.version.into(), migration.name.into()],
+                "INSERT INTO donkey_schema_migrations(version, name, applied_at, checksum) VALUES (?, ?, CURRENT_TIMESTAMP, ?)",
+                [migration.version.into(), migration.name.into(), migration_checksum(migration).into()],
             ))
             .await?;
     }
     Ok(())
+}
+
+fn migration_checksum(migration: &Migration) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(migration.name.as_bytes());
+    let MigrationAction::Statements(statements) = migration.action;
+    for statement in statements {
+        hasher.update([0]);
+        hasher.update(statement.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 async fn apply_migration(
@@ -1417,6 +1459,18 @@ mod tests {
                 .to_string()
                 .contains("newer than this binary supports")
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_modified_applied_migration() {
+        let db = connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared(
+            "UPDATE donkey_schema_migrations SET checksum = 'tampered' WHERE version = 1",
+        )
+        .await
+        .unwrap();
+        let error = run_migrations(&db).await.unwrap_err();
+        assert!(error.to_string().contains("migration 1 checksum mismatch"));
     }
 
     #[tokio::test]
