@@ -283,6 +283,8 @@ impl Scheduler {
         request_headers: &HeaderMap,
     ) -> ApiResult<BlobCapabilities> {
         let mut last_error = None;
+        let mut baseline: Option<BlobCapabilities> = None;
+        let mut all_compatible = true;
         for node in nodes {
             let started = Instant::now();
             let result = async {
@@ -299,34 +301,49 @@ impl Scheduler {
                 if response.status().is_success()
                     && let Some(capabilities) = capabilities_from_head(&response)
                 {
-                    return Ok(capabilities);
+                    Ok(capabilities)
+                } else {
+                    let probe = self
+                        .upstream
+                        .send(
+                            node,
+                            http::Method::GET,
+                            request_path,
+                            request_headers,
+                            RangeMode::Exact(0, 0),
+                        )
+                        .await?;
+                    capabilities_from_probe(&probe).ok_or_else(|| {
+                        AppError::Upstream(format!(
+                            "{} does not expose Blob length or Range metadata",
+                            node.node.name
+                        ))
+                    })
                 }
-
-                let probe = self
-                    .upstream
-                    .send(
-                        node,
-                        http::Method::GET,
-                        request_path,
-                        request_headers,
-                        RangeMode::Exact(0, 0),
-                    )
-                    .await?;
-                capabilities_from_probe(&probe).ok_or_else(|| {
-                    AppError::Upstream(format!(
-                        "{} does not expose Blob length or Range metadata",
-                        node.node.name
-                    ))
-                })
             }
             .await;
             self.nodes
                 .record_transfer(node.node.id, 0, started.elapsed(), result.is_ok())
                 .await;
             match result {
-                Ok(value) => return Ok(value),
-                Err(error) => last_error = Some(error),
+                Ok(value) => {
+                    if let Some(previous) = &baseline {
+                        all_compatible &= previous.size == value.size
+                            && previous.media_type == value.media_type
+                            && previous.supports_range == value.supports_range;
+                    } else {
+                        baseline = Some(value);
+                    }
+                }
+                Err(error) => {
+                    all_compatible = false;
+                    last_error = Some(error)
+                }
             }
+        }
+        if let Some(mut capabilities) = baseline {
+            capabilities.supports_range &= all_compatible;
+            return Ok(capabilities);
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("capability detection failed".into())))
     }
