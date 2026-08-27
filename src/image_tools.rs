@@ -36,6 +36,7 @@ use tokio::{
     fs::File,
     io::AsyncWriteExt,
     sync::{Mutex, Notify},
+    sync::RwLock,
 };
 use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
@@ -55,6 +56,7 @@ use crate::{
 #[derive(Clone)]
 pub struct ImageTools {
     config: Arc<Config>,
+    runtime: Arc<RwLock<ImageToolsRuntimeConfig>>,
     db: DatabaseConnection,
     nodes: NodeService,
     upstream: UpstreamService,
@@ -64,6 +66,12 @@ pub struct ImageTools {
     last_cleanup: Arc<Mutex<Instant>>,
     worker_id: Uuid,
     active_attempts: Arc<DashMap<Uuid, i64>>,
+}
+
+#[derive(Clone, Copy)]
+struct ImageToolsRuntimeConfig {
+    max_export_bytes: u64,
+    export_ttl: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,6 +350,10 @@ impl ImageTools {
         let service = Self {
             cipher: CredentialCipher::from_config(&config)?,
             upstream: UpstreamService::new(config.clone(), nodes.clone()),
+            runtime: Arc::new(RwLock::new(ImageToolsRuntimeConfig {
+                max_export_bytes: config.max_export_bytes,
+                export_ttl: config.export_ttl,
+            })),
             config,
             db,
             nodes,
@@ -353,6 +365,12 @@ impl ImageTools {
         };
         service.recover_abandoned_jobs(Utc::now()).await?;
         Ok(service)
+    }
+
+    pub async fn update_runtime(&self, config: &Config) {
+        let mut runtime = self.runtime.write().await;
+        runtime.max_export_bytes = config.max_export_bytes;
+        runtime.export_ttl = config.export_ttl;
     }
 
     pub fn router(self) -> Router {
@@ -602,7 +620,8 @@ impl ImageTools {
             .map(|layer| layer.size.max(0) as u64)
             .sum::<u64>()
             .saturating_add(manifest.config.size.max(0) as u64);
-        if total_bytes > self.config.max_export_bytes {
+        let max_export_bytes = self.runtime.read().await.max_export_bytes;
+        if total_bytes > max_export_bytes {
             return Err(AppError::bad_request(
                 "image exceeds DONKEY_MAX_EXPORT_BYTES",
             ));
@@ -726,7 +745,8 @@ impl ImageTools {
             .map(|layer| layer.size.max(0) as u64)
             .sum::<u64>()
             .saturating_add(manifest.config.size.max(0) as u64);
-        if total_bytes > self.config.max_export_bytes {
+        let max_export_bytes = self.runtime.read().await.max_export_bytes;
+        if total_bytes > max_export_bytes {
             return Err(AppError::bad_request(
                 "image exceeds DONKEY_MAX_EXPORT_BYTES",
             ));
@@ -1443,8 +1463,9 @@ impl ImageTools {
             }
             *last_cleanup = Instant::now();
         }
+        let runtime = *self.runtime.read().await;
         let cutoff = Utc::now()
-            - chrono::Duration::from_std(self.config.export_ttl).map_err(AppError::internal)?;
+            - chrono::Duration::from_std(runtime.export_ttl).map_err(AppError::internal)?;
         let terminal = ["completed", "failed", "cancelled", "skipped"];
         let expired = image_job::Entity::find()
             .filter(image_job::Column::Status.is_in(terminal))
@@ -1460,7 +1481,7 @@ impl ImageTools {
 
         self.gc_shared_blobs().await?;
         let mut used = storage_usage(self.root.clone()).await?;
-        if used <= self.config.max_export_bytes {
+        if used <= runtime.max_export_bytes {
             return Ok(());
         }
 
@@ -1476,7 +1497,7 @@ impl ImageTools {
             self.remove_job_storage(job.id).await?;
             self.gc_shared_blobs().await?;
             used = storage_usage(self.root.clone()).await?;
-            if used <= self.config.max_export_bytes {
+            if used <= runtime.max_export_bytes {
                 break;
             }
         }
@@ -1485,7 +1506,8 @@ impl ImageTools {
 
     async fn enforce_storage_quota(&self, job_id: Uuid) -> ApiResult<()> {
         self.cleanup_storage(Some(job_id)).await?;
-        if storage_usage(self.root.clone()).await? <= self.config.max_export_bytes {
+        let max_export_bytes = self.runtime.read().await.max_export_bytes;
+        if storage_usage(self.root.clone()).await? <= max_export_bytes {
             return Ok(());
         }
         self.remove_job_storage(job_id).await?;
