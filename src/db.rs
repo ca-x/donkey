@@ -136,6 +136,28 @@ pub mod cache_entry {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod pull_event {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "pull_events")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub registry_route_id: Uuid,
+        pub repository: String,
+        pub reference: String,
+        pub resolved_digest: Option<String>,
+        pub status_code: i32,
+        pub created_at: DateTime<Utc>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod domain_mapping {
     use super::*;
 
@@ -530,6 +552,15 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_image_jobs_status_finished ON image_jobs(status, finished_at)",
             "CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at)",
             "CREATE INDEX IF NOT EXISTS idx_oidc_login_states_expires ON oidc_login_states(expires_at)",
+        ]),
+    },
+    Migration {
+        version: 7,
+        name: "pull history",
+        action: MigrationAction::Statements(&[
+            "CREATE TABLE IF NOT EXISTS pull_events (id BLOB PRIMARY KEY NOT NULL, registry_route_id BLOB NOT NULL, repository TEXT NOT NULL, reference TEXT NOT NULL, resolved_digest TEXT, status_code INTEGER NOT NULL, created_at TEXT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_pull_events_created_at ON pull_events(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_pull_events_route_repository ON pull_events(registry_route_id, repository, created_at)",
         ]),
     },
 ];
@@ -927,6 +958,32 @@ pub async fn clear_cache_entries(db: &DatabaseConnection) -> Result<u64, DbErr> 
         .rows_affected)
 }
 
+pub async fn insert_pull_event(
+    db: &DatabaseConnection,
+    event: pull_event::Model,
+) -> Result<(), DbErr> {
+    event.into_active_model().insert(db).await?;
+    Ok(())
+}
+
+pub async fn list_pull_events(
+    db: &DatabaseConnection,
+    limit: u64,
+) -> Result<Vec<pull_event::Model>, DbErr> {
+    pull_event::Entity::find()
+        .order_by_desc(pull_event::Column::CreatedAt)
+        .limit(limit.min(10_000))
+        .all(db)
+        .await
+}
+
+pub async fn clear_pull_events(db: &DatabaseConnection) -> Result<u64, DbErr> {
+    Ok(pull_event::Entity::delete_many()
+        .exec(db)
+        .await?
+        .rows_affected)
+}
+
 pub async fn claim_image_job(
     db: &DatabaseConnection,
     job_id: Uuid,
@@ -1242,6 +1299,8 @@ mod tests {
         ("image_sync_rules", "idx_image_sync_rules_enabled_next_run"),
         ("admin_sessions", "idx_admin_sessions_expires"),
         ("oidc_login_states", "idx_oidc_login_states_expires"),
+        ("pull_events", "idx_pull_events_created_at"),
+        ("pull_events", "idx_pull_events_route_repository"),
     ];
 
     async fn create_v0_database(url: &str) {
@@ -1400,7 +1459,7 @@ mod tests {
         let db = connect("sqlite::memory:").await.unwrap();
         assert_eq!(
             migration_versions(&db).await,
-            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
+            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1)]
         );
         assert_expected_indexes(&db).await;
         let routes = registry_route::Entity::find().all(&db).await.unwrap();
@@ -1436,7 +1495,7 @@ mod tests {
     #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_version() {
         const FAILING_MIGRATION: &[Migration] = &[Migration {
-            version: 7,
+            version: 8,
             name: "rollback test",
             action: MigrationAction::Statements(&[
                 "CREATE TABLE migration_rollback_marker (id INTEGER PRIMARY KEY)",
@@ -1457,7 +1516,7 @@ mod tests {
         assert!(marker.is_empty());
         assert_eq!(
             migration_versions(&db).await,
-            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
+            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1)]
         );
     }
 

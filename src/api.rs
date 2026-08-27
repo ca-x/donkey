@@ -36,6 +36,10 @@ pub fn router() -> Router<AppState> {
         .route("/cache", get(list_cache))
         .route("/cache/clear", axum::routing::delete(clear_cache))
         .route("/cache/{key}", axum::routing::delete(delete_cache))
+        .route(
+            "/pull-events",
+            get(list_pull_events).delete(clear_pull_events),
+        )
         .route("/mappings", get(list_mappings).post(create_mapping))
         .route("/mappings/{id}", put(update_mapping).delete(delete_mapping))
         .route("/domainfold/convert", post(convert_url))
@@ -187,6 +191,49 @@ async fn clear_cache(State(state): State<AppState>) -> ApiResult<Json<serde_json
     Ok(Json(serde_json::json!({ "freed_bytes": freed })))
 }
 
+#[derive(Serialize)]
+struct PullEventView {
+    id: Uuid,
+    registry_route_id: Uuid,
+    repository: String,
+    reference: String,
+    resolved_digest: Option<String>,
+    status_code: i32,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<db::pull_event::Model> for PullEventView {
+    fn from(event: db::pull_event::Model) -> Self {
+        Self {
+            id: event.id,
+            registry_route_id: event.registry_route_id,
+            repository: event.repository,
+            reference: event.reference,
+            resolved_digest: event.resolved_digest,
+            status_code: event.status_code,
+            created_at: event.created_at,
+        }
+    }
+}
+
+async fn list_pull_events(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<Vec<PullEventView>>> {
+    Ok(Json(
+        db::list_pull_events(&state.db, query.limit)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    ))
+}
+
+async fn clear_pull_events(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let deleted = db::clear_pull_events(&state.db).await?;
+    Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
 async fn list_mappings(
     State(state): State<AppState>,
 ) -> ApiResult<Json<Vec<domain_mapping::Model>>> {
@@ -254,6 +301,7 @@ struct RuntimeConfig {
     admin_external_loopback: bool,
     registry_external_tls: bool,
     registry_auth_enabled: bool,
+    pull_logging_enabled: bool,
 }
 
 async fn runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeConfig>> {
@@ -282,6 +330,7 @@ struct RuntimeSettingsInput {
     health_interval_seconds: u64,
     max_export_bytes: u64,
     export_ttl_seconds: u64,
+    pull_logging_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -320,6 +369,7 @@ async fn update_runtime(
     state.cache.update_runtime(&effective).await;
     state.upstream.update_runtime(&effective).await;
     state.nodes.update_runtime(&effective).await;
+    state.runtime_flags.update(&effective);
     let cache = state.cache.stats().await?;
     Ok(Json(runtime_config(&effective, cache)))
 }
@@ -365,6 +415,7 @@ async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<Runtime
             health_interval_seconds: config.health_interval.as_secs(),
             max_export_bytes: config.max_export_bytes,
             export_ttl_seconds: config.export_ttl.as_secs(),
+            pull_logging_enabled: config.pull_logging_enabled,
         }),
         registry_routes: state.registry_routes.list().await?.into_iter().collect(),
         nodes,
@@ -465,6 +516,7 @@ async fn import_runtime(
     state.cache.update_runtime(&effective).await;
     state.upstream.update_runtime(&effective).await;
     state.nodes.update_runtime(&effective).await;
+    state.runtime_flags.update(&effective);
     let cache = state.cache.stats().await?;
     Ok(Json(runtime_config(&effective, cache)))
 }
@@ -579,6 +631,10 @@ async fn persist_runtime(state: &AppState, input: &RuntimeSettingsInput) -> ApiR
         ),
         ("max_export_bytes", input.max_export_bytes.to_string()),
         ("export_ttl_seconds", input.export_ttl_seconds.to_string()),
+        (
+            "pull_logging_enabled",
+            input.pull_logging_enabled.to_string(),
+        ),
     ];
     let values = values
         .into_iter()
@@ -630,5 +686,6 @@ fn runtime_config(
         admin_external_loopback: config.admin_external_loopback,
         registry_external_tls: config.registry_external_tls,
         registry_auth_enabled: config.registry_auth.is_some(),
+        pull_logging_enabled: config.pull_logging_enabled,
     }
 }

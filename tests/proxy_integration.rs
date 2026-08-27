@@ -1260,5 +1260,76 @@ mod proxy_integration {
             assert_eq!(ghcr.head_count(), 0);
             assert_eq!(ghcr.get_count(), 0);
         }
+
+        #[tokio::test]
+        async fn successful_tag_manifest_requests_are_recorded_without_credentials() {
+            let fixture = Fixture::start(
+                FixtureBehavior::RangeUnsupported,
+                br#"{"schemaVersion":2}"#.to_vec(),
+            )
+            .await;
+            let (state, _directory) = proxy_state(&[&fixture]).await;
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                "/v2/team/widget/manifests/latest",
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let events = donkey::db::list_pull_events(&state.db, 10).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].repository, "team/widget");
+            assert_eq!(events[0].reference, "latest");
+            assert_eq!(events[0].registry_route_id, DOCKER_HUB_ROUTE_ID);
+            assert_eq!(events[0].status_code, 200);
+            let serialized = serde_json::to_string(&events[0]).unwrap();
+            assert!(!serialized.to_ascii_lowercase().contains("authorization"));
+        }
+
+        #[tokio::test]
+        async fn pull_history_can_be_disabled() {
+            let fixture = Fixture::start(
+                FixtureBehavior::RangeUnsupported,
+                br#"{"schemaVersion":2}"#.to_vec(),
+            )
+            .await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.pull_logging_enabled = false;
+            let state = AppState::new(config).await.unwrap();
+            state
+                .nodes
+                .create(NodeInput {
+                    name: "history-disabled".into(),
+                    url: fixture.url(),
+                    registry_route_id: DOCKER_HUB_ROUTE_ID,
+                    enabled: true,
+                    priority: 0,
+                    max_concurrency: 4,
+                    cf_preferred: false,
+                    connect_ip: None,
+                    auth_mode: "none".into(),
+                    auth_username: None,
+                    auth_header: None,
+                    auth_secret: None,
+                })
+                .await
+                .unwrap();
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                "/v2/team/widget/manifests/latest",
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                donkey::db::list_pull_events(&state.db, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }

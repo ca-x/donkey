@@ -47,6 +47,7 @@ pub struct Config {
     pub cache_ttl: Option<Duration>,
     pub max_export_bytes: u64,
     pub export_ttl: Duration,
+    pub pull_logging_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +206,7 @@ impl Config {
                 u64::MAX,
             )?,
             export_ttl: duration_env("DONKEY_EXPORT_TTL", "7d")?,
+            pull_logging_enabled: bool_env("DONKEY_PULL_LOGGING_ENABLED", true)?,
         };
 
         if config.admin_addr.ip().is_unspecified()
@@ -264,6 +266,7 @@ impl Config {
             cache_ttl: None,
             max_export_bytes: 1024 * 1024 * 1024,
             export_ttl: Duration::from_secs(7 * 24 * 60 * 60),
+            pull_logging_enabled: true,
         }
     }
 
@@ -317,6 +320,7 @@ impl Config {
                 "export_ttl_seconds" => {
                     self.export_ttl = Duration::from_secs(setting.value.parse()?)
                 }
+                "pull_logging_enabled" => self.pull_logging_enabled = setting.value.parse()?,
                 _ => {}
             }
         }

@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use sea_orm::DatabaseConnection;
 
@@ -19,6 +22,29 @@ pub struct AppState {
     pub scheduler: Scheduler,
     pub image_tools: crate::image_tools::ImageTools,
     pub traffic: crate::traffic::TrafficMetrics,
+    pub runtime_flags: RuntimeFlags,
+}
+
+#[derive(Clone)]
+pub struct RuntimeFlags {
+    pull_logging_enabled: Arc<AtomicBool>,
+}
+
+impl RuntimeFlags {
+    fn new(config: &Config) -> Self {
+        Self {
+            pull_logging_enabled: Arc::new(AtomicBool::new(config.pull_logging_enabled)),
+        }
+    }
+
+    pub fn update(&self, config: &Config) {
+        self.pull_logging_enabled
+            .store(config.pull_logging_enabled, Ordering::Release);
+    }
+
+    pub fn pull_logging_enabled(&self) -> bool {
+        self.pull_logging_enabled.load(Ordering::Acquire)
+    }
 }
 
 impl AppState {
@@ -53,6 +79,7 @@ impl AppState {
         let image_tools =
             crate::image_tools::ImageTools::new(config.clone(), db.clone(), nodes.clone()).await?;
         let traffic = crate::traffic::TrafficMetrics::default();
+        let runtime_flags = RuntimeFlags::new(&config);
         Ok(Self {
             config,
             db,
@@ -64,6 +91,7 @@ impl AppState {
             scheduler,
             image_tools,
             traffic,
+            runtime_flags,
         })
     }
 }

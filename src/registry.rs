@@ -136,7 +136,47 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
     }
     let method = request.method().clone();
     let headers = request.headers().clone();
-    proxy_passthrough(&state, method, upstream_path, headers, nodes).await
+    let pull_subject = (method == Method::GET && state.runtime_flags.pull_logging_enabled())
+        .then(|| manifest_pull_subject(&upstream_path))
+        .flatten();
+    let response = proxy_passthrough(&state, method, upstream_path, headers, nodes).await?;
+    if let Some((repository, reference)) = pull_subject
+        && response.status().is_success()
+    {
+        let resolved_digest = response
+            .headers()
+            .get("docker-content-digest")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let event = crate::db::pull_event::Model {
+            id: uuid::Uuid::new_v4(),
+            registry_route_id,
+            repository,
+            reference,
+            resolved_digest,
+            status_code: i32::from(response.status().as_u16()),
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(error) = crate::db::insert_pull_event(&state.db, event).await {
+            tracing::warn!(?error, "failed to record image pull event");
+        }
+    }
+    Ok(response)
+}
+
+fn manifest_pull_subject(path: &str) -> Option<(String, String)> {
+    let path = path.split('?').next()?;
+    let path = path.strip_prefix("/v2/")?;
+    let (repository, reference) = path.rsplit_once("/manifests/")?;
+    if repository.is_empty()
+        || reference.is_empty()
+        || repository.len() > 1024
+        || reference.len() > 256
+        || valid_sha256_digest(reference)
+    {
+        return None;
+    }
+    Some((repository.to_owned(), reference.to_owned()))
 }
 
 async fn stream_blob(
