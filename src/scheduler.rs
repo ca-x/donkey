@@ -109,6 +109,16 @@ impl Scheduler {
         self.runtime.read().await.stream_fallback_timeout
     }
 
+    pub async fn ordered_stream_nodes(&self, nodes: &[NodeView], path: &str) -> Vec<NodeView> {
+        let digest = Sha256::digest(path.as_bytes());
+        let sequence = u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix")) as usize;
+        let policy = self.runtime.read().await.scheduler_policy;
+        self.ordered_nodes(nodes, sequence, policy)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     pub async fn fetch_blob(
         &self,
         request_path: &str,

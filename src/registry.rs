@@ -8,12 +8,12 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http_content_range::ContentRange;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
 use crate::{
-    cache::{CacheStore, CachedObject},
+    cache::{CacheLease, CacheStore, CachedObject},
     db::registry_route,
     error::{ApiResult, AppError},
     registry_routes::RepositoryMode,
@@ -146,6 +146,7 @@ async fn stream_blob(
     expected_digest: Option<&str>,
     nodes: Vec<crate::nodes::NodeView>,
 ) -> ApiResult<Response> {
+    let nodes = state.scheduler.ordered_stream_nodes(&nodes, path).await;
     let mut last_error = None;
     for (node_index, node) in nodes.iter().enumerate() {
         let upstream = match state
@@ -192,6 +193,7 @@ async fn stream_blob(
                 .get(header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok()),
         );
+        let lease = cache.lock(&key).await;
         let expected = expected_digest.map(str::to_owned);
         let relay = StreamRelay {
             upstream: state.upstream.clone(),
@@ -205,6 +207,7 @@ async fn stream_blob(
             key,
             media_type,
             expected_digest: expected,
+            _lease: lease,
         };
         tokio::spawn(async move {
             let errors = tx.clone();
@@ -249,6 +252,7 @@ struct StreamRelay {
     key: String,
     media_type: String,
     expected_digest: Option<String>,
+    _lease: CacheLease,
 }
 
 struct ResumeRequest<'a> {
@@ -312,16 +316,78 @@ async fn relay_stream_blob(
         key,
         media_type,
         expected_digest,
+        _lease,
     } = relay;
-    let temp = tempfile::Builder::new()
-        .prefix("donkey-stream-")
-        .tempdir_in(cache.temp_dir())?;
-    let partial = temp.path().join("object.partial");
-    let mut file = tokio::fs::File::create(&partial).await?;
     let complete_blob = window.start == 0 && window.end.checked_add(1) == Some(window.total);
+    let stable_partial_dir = cache.temp_dir().join(&key);
+    let temporary_range = if complete_blob {
+        None
+    } else {
+        Some(
+            tempfile::Builder::new()
+                .prefix("donkey-range-")
+                .tempdir_in(cache.temp_dir())?,
+        )
+    };
+    let partial = if let Some(temporary_range) = temporary_range.as_ref() {
+        temporary_range.path().join("object.partial")
+    } else {
+        tokio::fs::create_dir_all(&stable_partial_dir).await?;
+        stable_partial_dir.join("object.partial")
+    };
+    let mut existing = if complete_blob {
+        tokio::fs::metadata(&partial)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if existing > window.total {
+        tokio::fs::remove_file(&partial).await?;
+        existing = 0;
+    }
     let mut hasher = Sha256::new();
     let mut offset = window.start;
     let mut response = response;
+
+    if complete_blob && existing > 0 {
+        let mut saved = tokio::fs::File::open(&partial).await?;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = saved.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            let chunk = Bytes::copy_from_slice(&buffer[..read]);
+            hasher.update(&chunk);
+            offset += read as u64;
+            tx.send(Ok(chunk))
+                .await
+                .map_err(|_| AppError::Upstream("client disconnected during Blob replay".into()))?;
+        }
+        if offset <= window.end {
+            let (next_node, next_response) = resume_stream_response(ResumeRequest {
+                upstream: &upstream,
+                nodes: &nodes,
+                current_node,
+                path: &path,
+                headers: &headers,
+                start: offset,
+                end: window.end,
+                total: window.total,
+            })
+            .await?;
+            current_node = next_node;
+            response = next_response;
+        }
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&partial)
+        .await?;
 
     while offset <= window.end {
         let mut body = response.bytes_stream();
@@ -386,6 +452,7 @@ async fn relay_stream_blob(
         cache
             .admit(&key, &partial, &media_type, expected_digest)
             .await?;
+        let _ = tokio::fs::remove_dir(&stable_partial_dir).await;
     }
     Ok(())
 }

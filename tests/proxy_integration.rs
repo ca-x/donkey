@@ -771,6 +771,127 @@ mod proxy_integration {
             }));
             assert_eq!(state.cache.stats().await.unwrap().entries, 1);
         }
+
+        #[tokio::test]
+        async fn streaming_reuses_partial_bytes_after_client_reconnects() {
+            let bytes = vec![b'p'; 1024 * 1024 + 31];
+            let failing = Fixture::start(FixtureBehavior::DropAfterPrefix, bytes.clone()).await;
+            let healthy = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            let state = AppState::new(config).await.unwrap();
+            state
+                .nodes
+                .create(NodeInput {
+                    name: "disconnecting-stream".into(),
+                    url: failing.url(),
+                    registry_route_id: DOCKER_HUB_ROUTE_ID,
+                    enabled: true,
+                    priority: 0,
+                    max_concurrency: 4,
+                    cf_preferred: false,
+                    connect_ip: None,
+                    auth_mode: "none".into(),
+                    auth_username: None,
+                    auth_header: None,
+                    auth_secret: None,
+                })
+                .await
+                .unwrap();
+            let path = blob_path(&digest(&bytes));
+
+            let abandoned = request(registry_router(state.clone()), Method::GET, &path, None).await;
+            drop(abandoned);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            state
+                .nodes
+                .create(NodeInput {
+                    name: "resume-stream".into(),
+                    url: healthy.url(),
+                    registry_route_id: DOCKER_HUB_ROUTE_ID,
+                    enabled: true,
+                    priority: 1,
+                    max_concurrency: 4,
+                    cf_preferred: false,
+                    connect_ip: None,
+                    auth_mode: "none".into(),
+                    auth_username: None,
+                    auth_header: None,
+                    auth_secret: None,
+                })
+                .await
+                .unwrap();
+
+            let resumed = request(registry_router(state.clone()), Method::GET, &path, None).await;
+            assert_eq!(
+                to_bytes(resumed.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert!(healthy.ranges().await.iter().any(|range| {
+                range
+                    .as_deref()
+                    .and_then(parse_range)
+                    .is_some_and(|(start, _)| start > 0)
+            }));
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+        }
+
+        #[tokio::test]
+        async fn streaming_spreads_distinct_blobs_across_balanced_nodes() {
+            let bytes = b"balanced-stream-body".to_vec();
+            let first = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
+            let second = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
+            let third = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            let state = AppState::new(config).await.unwrap();
+            for (index, fixture) in [&first, &second, &third].into_iter().enumerate() {
+                state
+                    .nodes
+                    .create(NodeInput {
+                        name: format!("balanced-stream-{index}"),
+                        url: fixture.url(),
+                        registry_route_id: DOCKER_HUB_ROUTE_ID,
+                        enabled: true,
+                        priority: index as i32,
+                        max_concurrency: 4,
+                        cf_preferred: false,
+                        connect_ip: None,
+                        auth_mode: "none".into(),
+                        auth_username: None,
+                        auth_header: None,
+                        auth_secret: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let digest = digest(&bytes);
+            let router = registry_router(state.clone());
+            for repository in 0..12 {
+                state.cache.clear_all().await.unwrap();
+                let path = format!("/v2/team/widget-{repository}/blobs/{digest}");
+                let response = request(router.clone(), Method::GET, &path, None).await;
+                assert_eq!(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    bytes
+                );
+            }
+
+            let used = [first.get_count(), second.get_count(), third.get_count()]
+                .into_iter()
+                .filter(|count| *count > 0)
+                .count();
+            assert_eq!(used, 3);
+        }
     }
 
     mod routes {
