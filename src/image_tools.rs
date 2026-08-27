@@ -54,6 +54,12 @@ use crate::{
     upstream::{RangeMode, UpstreamService},
 };
 
+mod archive;
+
+use archive::{ArchiveInput, build_archive};
+#[cfg(test)]
+use archive::{build_docker_archive, build_oci_archive};
+
 #[derive(Clone)]
 pub struct ImageTools {
     config: Arc<Config>,
@@ -1023,26 +1029,10 @@ impl ImageTools {
                 layout: image.layout.clone(),
             }
         };
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            match archive {
-                ArchiveInput::Docker {
-                    config_json,
-                    reference,
-                    layers,
-                    media_types,
-                } => build_docker_archive(
-                    &output_clone,
-                    &config_json,
-                    reference,
-                    &layers,
-                    &media_types,
-                ),
-                ArchiveInput::Oci { layout } => build_oci_archive(&output_clone, &layout),
-            }
-        })
-        .await
-        .map_err(AppError::internal)?
-        .map_err(AppError::internal)?;
+        tokio::task::spawn_blocking(move || build_archive(&output_clone, archive))
+            .await
+            .map_err(AppError::internal)?
+            .map_err(AppError::internal)?;
         self.set_artifact(job.id, &output, &name).await
     }
 
@@ -1592,18 +1582,6 @@ struct PreparedImage {
     layout: PathBuf,
     layer_paths: Vec<PathBuf>,
     total_bytes: u64,
-}
-
-enum ArchiveInput {
-    Docker {
-        config_json: String,
-        reference: String,
-        layers: Vec<PathBuf>,
-        media_types: Vec<String>,
-    },
-    Oci {
-        layout: PathBuf,
-    },
 }
 
 enum JobOutcome {
@@ -2352,34 +2330,6 @@ async fn write_layout(layout: &Path, manifest: &OciImageManifest) -> ApiResult<(
         br#"{"imageLayoutVersion":"1.0.0"}"#,
     )
     .await?;
-    Ok(())
-}
-
-fn build_docker_archive(
-    output: &Path,
-    config_json: &str,
-    reference: String,
-    layers: &[PathBuf],
-    media_types: &[String],
-) -> anyhow::Result<()> {
-    let config = oci_spec_builder::image::ImageConfiguration::from_reader(config_json.as_bytes())
-        .map_err(|error| anyhow::anyhow!("invalid image config: {error}"))?;
-    let file = std::fs::File::create(output)?;
-    let mut builder = oci_tar_builder::Builder::default();
-    builder.add_config(config, reference);
-    for (path, media_type) in layers.iter().zip(media_types) {
-        builder.add_layer_with_media_type(path, media_type.clone());
-    }
-    builder.build(file)
-}
-
-fn build_oci_archive(output: &Path, layout: &Path) -> anyhow::Result<()> {
-    let file = std::fs::File::create(output)?;
-    let mut builder = tar::Builder::new(file);
-    builder.append_path_with_name(layout.join("oci-layout"), "oci-layout")?;
-    builder.append_path_with_name(layout.join("index.json"), "index.json")?;
-    builder.append_dir_all("blobs", layout.join("blobs"))?;
-    builder.finish()?;
     Ok(())
 }
 
