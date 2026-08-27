@@ -17,6 +17,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use oci_client::{
     Client, Reference, RegistryOperation,
@@ -36,7 +37,6 @@ use tokio::{
     io::AsyncWriteExt,
     sync::{Mutex, Notify},
 };
-use dashmap::DashMap;
 use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
@@ -1252,6 +1252,9 @@ impl ImageTools {
     }
 
     async fn ensure_job_owner(&self, id: Uuid) -> ApiResult<()> {
+        let Some(expected_attempt) = self.active_attempts.get(&id).map(|value| *value) else {
+            return Ok(());
+        };
         let Some((worker, attempt)) = db::image_job_owner(&self.db, id).await? else {
             return Err(AppError::Conflict("image job ownership is missing".into()));
         };
@@ -1259,7 +1262,7 @@ impl ImageTools {
             || self
                 .active_attempts
                 .get(&id)
-                .is_none_or(|expected| *expected != attempt)
+                .is_none_or(|expected| *expected != expected_attempt || *expected != attempt)
         {
             return Err(AppError::Conflict("image job ownership has changed".into()));
         }
