@@ -1286,6 +1286,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_database_schema_newer_than_binary() {
+        let db = connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared(
+            "INSERT INTO donkey_schema_migrations(version, name, applied_at) VALUES (999, 'future', CURRENT_TIMESTAMP)",
+        )
+        .await
+        .unwrap();
+        let error = apply_migrations(&db, MIGRATIONS).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("newer than this binary supports")
+        );
+    }
+
+    #[tokio::test]
     async fn route_and_node_database_invariants_are_enforced() {
         let db = connect("sqlite::memory:").await.unwrap();
         let now = Utc::now();
