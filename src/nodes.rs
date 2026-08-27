@@ -141,7 +141,12 @@ impl NodeService {
         for node in db::list_nodes(&self.db).await? {
             views.push(self.view(node).await?);
         }
-        views.sort_by(|a, b| b.score.total_cmp(&a.score));
+        views.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.node.priority.cmp(&b.node.priority))
+                .then_with(|| a.node.url.cmp(&b.node.url))
+        });
         Ok(views)
     }
 
