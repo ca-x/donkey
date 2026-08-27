@@ -538,32 +538,7 @@ fn validate_runtime_settings(input: &RuntimeSettingsInput) -> ApiResult<()> {
 }
 
 async fn persist_runtime(state: &AppState, input: &RuntimeSettingsInput) -> ApiResult<()> {
-    if !(256 * 1024..=32 * 1024 * 1024).contains(&input.chunk_size)
-        || !(1..=64).contains(&input.chunk_concurrency)
-        || !(1024 * 1024..=u64::MAX).contains(&input.parallel_threshold)
-        || !(1024 * 1024..=u64::MAX).contains(&input.resumable_threshold)
-        || !(1..=3600).contains(&input.upstream_timeout_seconds)
-        || !(1..=3600).contains(&input.stream_fallback_timeout_seconds)
-        || !(60..=7 * 24 * 3600).contains(&input.partial_ttl_seconds)
-        || !(64 * 1024 * 1024..=u64::MAX).contains(&input.max_cache_bytes)
-        || !(0.5..=1.0).contains(&input.cache_high_watermark)
-        || !(0.1..=0.99).contains(&input.cache_low_watermark)
-        || input.cache_low_watermark >= input.cache_high_watermark
-        || !(1..=86400).contains(&input.health_interval_seconds)
-        || input.max_export_bytes < 64 * 1024 * 1024
-        || !(60..=365 * 24 * 3600).contains(&input.export_ttl_seconds)
-    {
-        return Err(crate::error::AppError::bad_request(
-            "runtime settings are out of range",
-        ));
-    }
-    if !matches!(input.scheduler_policy.as_str(), "balanced" | "speed-first")
-        || !matches!(input.cache_policy.as_str(), "balanced" | "lru" | "lfu")
-    {
-        return Err(crate::error::AppError::bad_request(
-            "runtime settings contain an invalid policy",
-        ));
-    }
+    validate_runtime_settings(input)?;
     let values = vec![
         ("chunk_size", input.chunk_size.to_string()),
         ("chunk_concurrency", input.chunk_concurrency.to_string()),
