@@ -1341,7 +1341,7 @@ impl ImageTools {
             artifact_path: None,
             artifact_name: None,
             error: None,
-            idempotency_key,
+            idempotency_key: idempotency_key.clone(),
             cancel_requested: false,
             lease_until: None,
             created_at: now,
@@ -1349,7 +1349,20 @@ impl ImageTools {
             started_at: None,
             finished_at: None,
         };
-        let model = model.into_active_model().insert(&self.db).await?;
+        let model = match model.into_active_model().insert(&self.db).await {
+            Ok(model) => model,
+            Err(error) if idempotency_key.is_some() => {
+                if let Some(existing) = image_job::Entity::find()
+                    .filter(image_job::Column::IdempotencyKey.eq(idempotency_key.clone()))
+                    .one(&self.db)
+                    .await?
+                {
+                    return Ok(existing);
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         self.wake.notify_one();
         Ok(model)
     }
