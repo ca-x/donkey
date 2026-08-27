@@ -208,6 +208,7 @@ async fn stream_blob(
             media_type,
             expected_digest: expected,
             _lease: lease,
+            node_service: state.nodes.clone(),
         };
         tokio::spawn(async move {
             let errors = tx.clone();
@@ -253,6 +254,7 @@ struct StreamRelay {
     media_type: String,
     expected_digest: Option<String>,
     _lease: CacheLease,
+    node_service: crate::nodes::NodeService,
 }
 
 struct ResumeRequest<'a> {
@@ -317,6 +319,7 @@ async fn relay_stream_blob(
         media_type,
         expected_digest,
         _lease,
+        node_service,
     } = relay;
     let complete_blob = window.start == 0 && window.end.checked_add(1) == Some(window.total);
     let stable_partial_dir = cache.temp_dir().join(&key);
@@ -390,6 +393,8 @@ async fn relay_stream_blob(
         .await?;
 
     while offset <= window.end {
+        let started = std::time::Instant::now();
+        let mut transferred = 0_u64;
         let mut body = response.bytes_stream();
         let mut stream_error = None;
         while let Some(chunk) = body.next().await {
@@ -404,6 +409,7 @@ async fn relay_stream_blob(
                     }
                     file.write_all(&chunk).await?;
                     offset += chunk.len() as u64;
+                    transferred += chunk.len() as u64;
                     tx.send(Ok(chunk)).await.map_err(|_| {
                         AppError::Upstream("client disconnected during Blob stream".into())
                     })?;
@@ -414,7 +420,16 @@ async fn relay_stream_blob(
                 }
             }
         }
-        if offset > window.end {
+        let completed = offset > window.end;
+        node_service
+            .record_transfer(
+                nodes[current_node].node.id,
+                transferred,
+                started.elapsed(),
+                completed,
+            )
+            .await;
+        if completed {
             break;
         }
         tracing::warn!(
