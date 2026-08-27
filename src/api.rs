@@ -502,7 +502,9 @@ async fn validate_import_snapshot(
             )));
         }
         if !keys.contains(node.registry_route.as_str())
-            && !existing.iter().any(|route| route.key == node.registry_route)
+            && !existing
+                .iter()
+                .any(|route| route.key == node.registry_route)
         {
             return Err(crate::error::AppError::bad_request(format!(
                 "unknown Registry route '{}'",
@@ -529,12 +531,16 @@ fn validate_runtime_settings(input: &RuntimeSettingsInput) -> ApiResult<()> {
         || input.max_export_bytes < 64 * 1024 * 1024
         || !(60..=365 * 24 * 3600).contains(&input.export_ttl_seconds)
     {
-        return Err(crate::error::AppError::bad_request("runtime settings are out of range"));
+        return Err(crate::error::AppError::bad_request(
+            "runtime settings are out of range",
+        ));
     }
     if !matches!(input.scheduler_policy.as_str(), "balanced" | "speed-first")
         || !matches!(input.cache_policy.as_str(), "balanced" | "lru" | "lfu")
     {
-        return Err(crate::error::AppError::bad_request("runtime settings contain an invalid policy"));
+        return Err(crate::error::AppError::bad_request(
+            "runtime settings contain an invalid policy",
+        ));
     }
     Ok(())
 }

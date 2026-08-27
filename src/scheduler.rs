@@ -400,7 +400,9 @@ impl Scheduler {
             .iter()
             .map(|node| usize::from(node.max_concurrency))
             .sum::<usize>();
-        let concurrency = request.runtime.chunk_concurrency
+        let concurrency = request
+            .runtime
+            .chunk_concurrency
             .min(node_capacity.max(1))
             .min(chunks.len())
             .max(1);

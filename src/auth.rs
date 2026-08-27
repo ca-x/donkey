@@ -655,8 +655,7 @@ async fn update_profile(
         .into_active_model()
         .update(&service.db)
         .await?;
-    if password_changed
-        && let Some(current_token_hash) = current_user.session_token_hash.as_deref()
+    if password_changed && let Some(current_token_hash) = current_user.session_token_hash.as_deref()
     {
         admin_session::Entity::delete_many()
             .filter(admin_session::Column::UserId.eq(id))

@@ -35,8 +35,8 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::File,
     io::AsyncWriteExt,
-    sync::{Mutex, Notify},
     sync::RwLock,
+    sync::{Mutex, Notify},
 };
 use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
@@ -2424,8 +2424,8 @@ fn oci_error(error: OciDistributionError) -> AppError {
 mod tests {
     use super::*;
     use httpmock::prelude::*;
-    use secrecy::SecretString;
     use sea_orm::ConnectionTrait;
+    use secrecy::SecretString;
 
     async fn test_service() -> (tempfile::TempDir, ImageTools) {
         let directory = tempfile::tempdir().unwrap();

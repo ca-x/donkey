@@ -607,7 +607,10 @@ async fn apply_pending_migrations(
         ))
         .await?
         .iter()
-        .any(|row| row.try_get::<String>("", "name").is_ok_and(|name| name == "checksum"));
+        .any(|row| {
+            row.try_get::<String>("", "name")
+                .is_ok_and(|name| name == "checksum")
+        });
     if !has_checksum {
         transaction
             .execute_unprepared(
@@ -1419,8 +1422,8 @@ mod tests {
                 ("chunk_concurrency".into(), "8".into()),
             ],
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         replace_runtime_settings(&db, &[("resumable_threshold".into(), "4194304".into())])
             .await
             .unwrap();
