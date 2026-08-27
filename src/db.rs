@@ -4,7 +4,8 @@ use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectOptions, ConnectionTrait, Database,
     DatabaseConnection, DatabaseTransaction, DbBackend, DbErr, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Statement, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, SqliteTransactionMode,
+    Statement, TransactionOptions, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1000,7 +1001,12 @@ pub async fn claim_image_job(
     now: DateTime<Utc>,
     lease_until: DateTime<Utc>,
 ) -> Result<Option<i64>, DbErr> {
-    let transaction = db.begin().await?;
+    let transaction = db
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await?;
     let attempt = transaction
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
