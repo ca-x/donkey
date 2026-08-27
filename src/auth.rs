@@ -29,7 +29,7 @@ use openidconnect::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, Set,
+    PaginatorTrait, QueryFilter, Set, SqliteTransactionMode, TransactionOptions, TransactionTrait,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -62,7 +62,6 @@ pub struct AuthService {
     config: Arc<Config>,
     db: DatabaseConnection,
     oidc: Option<Arc<OidcRuntime>>,
-    provision_lock: Arc<Mutex<()>>,
     failed_logins: Cache<String, Arc<Mutex<VecDeque<Instant>>>>,
     dummy_password_hash: Arc<String>,
 }
@@ -162,7 +161,6 @@ impl AuthService {
             config,
             db,
             oidc,
-            provision_lock: Arc::new(Mutex::new(())),
             failed_logins: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_idle(Duration::from_secs(60 * 60))
@@ -252,12 +250,19 @@ impl AuthService {
         };
         validate_username(username)?;
         validate_password(password.expose_secret())?;
-        let _guard = self.provision_lock.lock().await;
-        if user::Entity::find().count(&self.db).await? > 0 {
-            return Ok(());
-        }
         let password_hash = hash_password(password.clone()).await?;
         let now = Utc::now();
+        let transaction = self
+            .db
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..Default::default()
+            })
+            .await?;
+        if user::Entity::find().count(&transaction).await? > 0 {
+            transaction.commit().await?;
+            return Ok(());
+        }
         user::Model {
             id: Uuid::new_v4(),
             identity_key: local_identity_key(username),
@@ -274,8 +279,9 @@ impl AuthService {
             last_login_at: None,
         }
         .into_active_model()
-        .insert(&self.db)
+        .insert(&transaction)
         .await?;
+        transaction.commit().await?;
         tracing::info!(username, "initial local administrator created");
         Ok(())
     }
@@ -485,21 +491,29 @@ impl AuthService {
         email: Option<String>,
     ) -> ApiResult<user::Model> {
         let identity_key = oidc_identity_key(issuer, subject);
-        let _guard = self.provision_lock.lock().await;
+        let transaction = self
+            .db
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..Default::default()
+            })
+            .await?;
         if let Some(account) = user::Entity::find()
             .filter(user::Column::IdentityKey.eq(&identity_key))
-            .one(&self.db)
+            .one(&transaction)
             .await?
         {
             return if account.enabled {
+                transaction.commit().await?;
                 Ok(account)
             } else {
+                transaction.rollback().await?;
                 Err(AppError::Forbidden)
             };
         }
-        let first = user::Entity::find().count(&self.db).await? == 0;
+        let first = user::Entity::find().count(&transaction).await? == 0;
         let now = Utc::now();
-        Ok(user::Model {
+        let account = user::Model {
             id: Uuid::new_v4(),
             identity_key,
             username: None,
@@ -515,8 +529,10 @@ impl AuthService {
             last_login_at: None,
         }
         .into_active_model()
-        .insert(&self.db)
-        .await?)
+        .insert(&transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(account)
     }
 
     fn session_cookie(&self, token: &str) -> ApiResult<HeaderValue> {
@@ -851,6 +867,32 @@ mod tests {
         left.unwrap();
         right.unwrap();
         let accounts = user::Entity::find().all(&db).await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(
+            accounts.iter().filter(|user| user.role == "admin").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_connections_serialize_first_oidc_admin_assignment() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Arc::new(Config::for_test(directory.path().to_owned()));
+        let first_db = crate::db::connect(&config.database_url).await.unwrap();
+        let second_db = crate::db::connect(&config.database_url).await.unwrap();
+        let first = AuthService::new(config.clone(), first_db.clone())
+            .await
+            .unwrap();
+        let second = AuthService::new(config, second_db).await.unwrap();
+
+        let (left, right) = tokio::join!(
+            first.provision_oidc_user("https://issuer.example", "connection-a", None),
+            second.provision_oidc_user("https://issuer.example", "connection-b", None)
+        );
+        left.unwrap();
+        right.unwrap();
+
+        let accounts = user::Entity::find().all(&first_db).await.unwrap();
         assert_eq!(accounts.len(), 2);
         assert_eq!(
             accounts.iter().filter(|user| user.role == "admin").count(),
