@@ -207,6 +207,7 @@ impl Scheduler {
         destination: &Path,
     ) -> ApiResult<()> {
         let mut last_error = None;
+        let mut attempted = false;
         for node in self.ordered_nodes(nodes, 0) {
             let offset = tokio::fs::metadata(destination).await?.len();
             if offset >= total_size {
@@ -216,6 +217,7 @@ impl Scheduler {
                 continue;
             }
             let lease = self.acquire(node.node.id, node.max_concurrency).await;
+            attempted = true;
             let started = Instant::now();
             let result = async {
                 let response = self
@@ -259,6 +261,17 @@ impl Scheduler {
                     last_error = Some(error)
                 }
             }
+        }
+        if !attempted {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            return Box::pin(self.download_resume(
+                nodes,
+                request_path,
+                request_headers,
+                total_size,
+                destination,
+            ))
+            .await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed resume".into())))
     }
@@ -386,11 +399,13 @@ impl Scheduler {
         destination: &Path,
     ) -> ApiResult<()> {
         let mut last_error = None;
+        let mut attempted = false;
         for node in self.ordered_nodes(nodes, chunk.index) {
             if self.at_capacity(node.node.id, node.max_concurrency) {
                 continue;
             }
             let lease = self.acquire(node.node.id, node.max_concurrency).await;
+            attempted = true;
             let started = Instant::now();
             let result = async {
                 let existing = tokio::fs::metadata(destination)
@@ -461,6 +476,17 @@ impl Scheduler {
                     last_error = Some(error)
                 }
             }
+        }
+        if !attempted {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            return Box::pin(self.download_chunk(
+                nodes,
+                request_path,
+                request_headers,
+                chunk,
+                destination,
+            ))
+            .await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed a chunk".into())))
     }
