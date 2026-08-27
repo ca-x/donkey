@@ -513,6 +513,13 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE TABLE IF NOT EXISTS node_limits (node_id TEXT PRIMARY KEY NOT NULL, max_concurrency INTEGER NOT NULL DEFAULT 4)",
         ]),
     },
+    Migration {
+        version: 5,
+        name: "image job ownership",
+        action: MigrationAction::Statements(&[
+            "CREATE TABLE IF NOT EXISTS image_job_owners (job_id TEXT PRIMARY KEY NOT NULL, worker_id TEXT NOT NULL, attempt INTEGER NOT NULL, claimed_at TEXT NOT NULL)",
+        ]),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -846,6 +853,120 @@ pub async fn clear_cache_entries(db: &DatabaseConnection) -> Result<u64, DbErr> 
         .rows_affected)
 }
 
+pub async fn claim_image_job(
+    db: &DatabaseConnection,
+    job_id: Uuid,
+    worker_id: Uuid,
+    now: DateTime<Utc>,
+    lease_until: DateTime<Utc>,
+) -> Result<Option<i64>, DbErr> {
+    let transaction = db.begin().await?;
+    let attempt = transaction
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT attempt FROM image_job_owners WHERE job_id = ?",
+            [job_id.to_string().into()],
+        ))
+        .await?
+        .and_then(|row| row.try_get::<i64>("", "attempt").ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    let changed = image_job::Entity::update_many()
+        .col_expr(image_job::Column::Status, Expr::value("running"))
+        .col_expr(image_job::Column::Stage, Expr::value("resolving"))
+        .col_expr(
+            image_job::Column::LeaseUntil,
+            Expr::value(Some(lease_until)),
+        )
+        .col_expr(image_job::Column::StartedAt, Expr::value(Some(now)))
+        .col_expr(image_job::Column::UpdatedAt, Expr::value(now))
+        .filter(image_job::Column::Id.eq(job_id))
+        .filter(image_job::Column::Status.eq("pending"))
+        .exec(&transaction)
+        .await?;
+    if changed.rows_affected != 1 {
+        transaction.commit().await?;
+        return Ok(None);
+    }
+    transaction
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO image_job_owners(job_id, worker_id, attempt, claimed_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(job_id) DO UPDATE SET worker_id = excluded.worker_id, attempt = excluded.attempt, claimed_at = excluded.claimed_at",
+            [
+                job_id.to_string().into(),
+                worker_id.to_string().into(),
+                attempt.into(),
+                now.to_rfc3339().into(),
+            ],
+        ))
+        .await?;
+    transaction.commit().await?;
+    Ok(Some(attempt))
+}
+
+pub async fn image_job_owner(
+    db: &DatabaseConnection,
+    job_id: Uuid,
+) -> Result<Option<(Uuid, i64)>, DbErr> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT worker_id, attempt FROM image_job_owners WHERE job_id = ?",
+            [job_id.to_string().into()],
+        ))
+        .await?;
+    Ok(row.and_then(|row| {
+        let worker = row.try_get::<String>("", "worker_id").ok()?.parse().ok()?;
+        let attempt = row.try_get::<i64>("", "attempt").ok()?;
+        Some((worker, attempt))
+    }))
+}
+
+pub async fn clear_image_job_owner(db: &DatabaseConnection, job_id: Uuid) -> Result<(), DbErr> {
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM image_job_owners WHERE job_id = ?",
+        [job_id.to_string().into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+pub struct ImageJobFinish<'a> {
+    pub job_id: Uuid,
+    pub worker_id: Uuid,
+    pub attempt: i64,
+    pub status: &'a str,
+    pub error: Option<&'a str>,
+    pub now: DateTime<Utc>,
+    pub cancel_requested: bool,
+}
+
+pub async fn finish_image_job_owned(
+    db: &DatabaseConnection,
+    finish: ImageJobFinish<'_>,
+) -> Result<bool, DbErr> {
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE image_jobs SET status = ?, error = ?, lease_until = NULL, finished_at = ?, updated_at = ? WHERE id = ? AND status = 'running' AND cancel_requested = ? AND EXISTS (SELECT 1 FROM image_job_owners WHERE job_id = ? AND worker_id = ? AND attempt = ?)",
+            [
+                finish.status.into(),
+                finish.error.map(str::to_owned).into(),
+                finish.now.into(),
+                finish.now.into(),
+                finish.job_id.into(),
+                finish.cancel_requested.into(),
+                finish.job_id.to_string().into(),
+                finish.worker_id.to_string().into(),
+                finish.attempt.into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub async fn list_mappings(db: &DatabaseConnection) -> Result<Vec<domain_mapping::Model>, DbErr> {
     domain_mapping::Entity::find()
         .order_by_asc(domain_mapping::Column::SourceHost)
@@ -1057,7 +1178,7 @@ mod tests {
         let db = connect("sqlite::memory:").await.unwrap();
         assert_eq!(
             migration_versions(&db).await,
-            vec![(1, 1), (2, 1), (3, 1), (4, 1)]
+            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
         );
         assert_expected_indexes(&db).await;
         let routes = registry_route::Entity::find().all(&db).await.unwrap();
@@ -1083,7 +1204,7 @@ mod tests {
     #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_version() {
         const FAILING_MIGRATION: &[Migration] = &[Migration {
-            version: 5,
+            version: 6,
             name: "rollback test",
             action: MigrationAction::Statements(&[
                 "CREATE TABLE migration_rollback_marker (id INTEGER PRIMARY KEY)",
@@ -1104,7 +1225,7 @@ mod tests {
         assert!(marker.is_empty());
         assert_eq!(
             migration_versions(&db).await,
-            vec![(1, 1), (2, 1), (3, 1), (4, 1)]
+            vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
         );
     }
 

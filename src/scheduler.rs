@@ -252,7 +252,12 @@ impl Scheduler {
                 .await;
             match result {
                 Ok(()) => return Ok(()),
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    if matches!(&error, AppError::Integrity) {
+                        let _ = tokio::fs::remove_file(destination).await;
+                    }
+                    last_error = Some(error)
+                }
             }
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed resume".into())))
@@ -449,7 +454,12 @@ impl Scheduler {
                 .await;
             match result {
                 Ok(()) => return Ok(()),
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    if matches!(&error, AppError::Integrity) {
+                        let _ = tokio::fs::remove_file(destination).await;
+                    }
+                    last_error = Some(error)
+                }
             }
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed a chunk".into())))

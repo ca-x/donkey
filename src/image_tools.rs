@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     crypto::CredentialCipher,
-    db::{image_job, image_sync_rule, registry_credential},
+    db::{self, image_job, image_sync_rule, registry_credential},
     error::{ApiResult, AppError},
     nodes::{NodeService, NodeView},
     upstream::{RangeMode, UpstreamService},
@@ -61,6 +61,7 @@ pub struct ImageTools {
     root: Arc<PathBuf>,
     wake: Arc<Notify>,
     last_cleanup: Arc<Mutex<Instant>>,
+    worker_id: Uuid,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,6 +331,7 @@ impl ImageTools {
             root: Arc::new(root),
             wake: Arc::new(Notify::new()),
             last_cleanup: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
+            worker_id: Uuid::new_v4(),
         };
         service.recover_abandoned_jobs(Utc::now()).await?;
         Ok(service)
@@ -379,9 +381,14 @@ impl ImageTools {
         let Some(job) = self.claim_next_job().await? else {
             return Ok(());
         };
+        let attempt = db::image_job_owner(&self.db, job.id)
+            .await?
+            .filter(|(worker, _)| *worker == self.worker_id)
+            .map(|(_, attempt)| attempt)
+            .ok_or_else(|| AppError::Conflict("image job ownership was lost".into()))?;
 
         let result = self.process_job(&job).await;
-        self.finish_job(job.id, result).await
+        self.finish_job(job.id, attempt, result).await
     }
 
     async fn claim_next_job(&self) -> ApiResult<Option<image_job::Model>> {
@@ -401,18 +408,36 @@ impl ImageTools {
     }
 
     async fn claim_selected_job(&self, id: Uuid) -> ApiResult<Option<image_job::Model>> {
-        let claimed = transition_update(JobStatus::Pending, JobStatus::Running, Utc::now(), None)?
-            .filter(image_job::Column::Id.eq(id))
-            .exec(&self.db)
-            .await?;
-        if claimed.rows_affected != 1 {
+        let now = Utc::now();
+        let claimed = db::claim_image_job(
+            &self.db,
+            id,
+            self.worker_id,
+            now,
+            now + chrono::Duration::minutes(JOB_LEASE_MINUTES),
+        )
+        .await?;
+        if claimed.is_none() {
             return Ok(None);
         }
 
         Ok(image_job::Entity::find_by_id(id).one(&self.db).await?)
     }
 
-    async fn finish_job(&self, id: Uuid, result: ApiResult<JobOutcome>) -> ApiResult<()> {
+    async fn finish_job(
+        &self,
+        id: Uuid,
+        attempt: i64,
+        result: ApiResult<JobOutcome>,
+    ) -> ApiResult<()> {
+        if db::image_job_owner(&self.db, id)
+            .await?
+            .is_none_or(|(worker, current_attempt)| {
+                worker != self.worker_id || current_attempt != attempt
+            })
+        {
+            return Err(AppError::Conflict("image job ownership has changed".into()));
+        }
         let current = image_job::Entity::find_by_id(id)
             .one(&self.db)
             .await?
@@ -426,12 +451,21 @@ impl ImageTools {
                 Err(error) => (JobStatus::Failed, Some(safe_error(&error))),
             }
         };
-        let finished = transition_update(JobStatus::Running, target, Utc::now(), error)?
-            .filter(image_job::Column::Id.eq(id))
-            .filter(image_job::Column::CancelRequested.eq(current.cancel_requested))
-            .exec(&self.db)
-            .await?;
-        if finished.rows_affected == 1 {
+        let finished = db::finish_image_job_owned(
+            &self.db,
+            db::ImageJobFinish {
+                job_id: id,
+                worker_id: self.worker_id,
+                attempt,
+                status: target.as_str(),
+                error: error.as_deref(),
+                now: Utc::now(),
+                cancel_requested: current.cancel_requested,
+            },
+        )
+        .await?;
+        if finished {
+            db::clear_image_job_owner(&self.db, id).await?;
             return Ok(());
         }
 
