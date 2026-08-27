@@ -245,6 +245,14 @@ impl CacheStore {
             }
         }
         db::clear_cache_entries(&self.db).await?;
+        // Remove orphaned object files and stale partials that are not present
+        // in the index. Active downloads remain protected by the partial TTL.
+        let _ = remove_orphan_files(&self.root.join("objects"), None, &self.active_flights).await;
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(self.config.partial_ttl)
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let _ =
+            remove_orphan_files(&self.root.join("tmp"), Some(cutoff), &self.active_flights).await;
         Ok(freed)
     }
 
@@ -326,6 +334,38 @@ impl CacheStore {
         }
         Ok(())
     }
+}
+
+async fn remove_orphan_files(
+    root: &std::path::Path,
+    older_than: Option<std::time::SystemTime>,
+    protected: &DashMap<String, ()>,
+) -> std::io::Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let mut entries = tokio::fs::read_dir(&path).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let child = entry.path();
+            let metadata = entry.metadata().await?;
+            if metadata.is_dir() {
+                pending.push(child);
+            } else if !protected.contains_key(
+                &child
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            ) && older_than
+                .is_none_or(|cutoff| metadata.modified().is_ok_and(|modified| modified < cutoff))
+            {
+                let _ = tokio::fs::remove_file(child).await;
+            }
+        }
+        if path != root {
+            let _ = tokio::fs::remove_dir(&path).await;
+        }
+    }
+    Ok(())
 }
 
 async fn cleanup_partial_files(root: &std::path::Path, ttl: std::time::Duration) {
