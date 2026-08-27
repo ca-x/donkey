@@ -159,6 +159,18 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
         };
         if let Err(error) = crate::db::insert_pull_event(&state.db, event).await {
             tracing::warn!(?error, "failed to record image pull event");
+        } else {
+            let cutoff = chrono::Utc::now()
+                - chrono::Duration::days(state.runtime_flags.pull_log_retention_days() as i64);
+            if let Err(error) = crate::db::prune_pull_events(
+                &state.db,
+                cutoff,
+                state.runtime_flags.pull_log_max_entries(),
+            )
+            .await
+            {
+                tracing::warn!(?error, "failed to prune image pull events");
+            }
         }
     }
     Ok(response)

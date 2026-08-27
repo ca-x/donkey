@@ -306,6 +306,8 @@ struct RuntimeConfig {
     registry_external_tls: bool,
     registry_auth_enabled: bool,
     pull_logging_enabled: bool,
+    pull_log_retention_days: u64,
+    pull_log_max_entries: u64,
 }
 
 async fn runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeConfig>> {
@@ -335,6 +337,8 @@ struct RuntimeSettingsInput {
     max_export_bytes: u64,
     export_ttl_seconds: u64,
     pull_logging_enabled: bool,
+    pull_log_retention_days: u64,
+    pull_log_max_entries: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -416,6 +420,8 @@ async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<Runtime
             max_export_bytes: config.max_export_bytes,
             export_ttl_seconds: config.export_ttl.as_secs(),
             pull_logging_enabled: config.pull_logging_enabled,
+            pull_log_retention_days: config.pull_log_retention_days,
+            pull_log_max_entries: config.pull_log_max_entries,
         }),
         registry_routes: state.registry_routes.list().await?.into_iter().collect(),
         nodes,
@@ -720,6 +726,8 @@ fn validate_runtime_settings(input: &RuntimeSettingsInput) -> ApiResult<()> {
         || !(1..=86400).contains(&input.health_interval_seconds)
         || input.max_export_bytes < 64 * 1024 * 1024
         || !(60..=365 * 24 * 3600).contains(&input.export_ttl_seconds)
+        || !(1..=3650).contains(&input.pull_log_retention_days)
+        || !(100..=1_000_000).contains(&input.pull_log_max_entries)
     {
         return Err(crate::error::AppError::bad_request(
             "runtime settings are out of range",
@@ -778,6 +786,14 @@ fn runtime_setting_values(input: &RuntimeSettingsInput) -> Vec<(String, String)>
             "pull_logging_enabled",
             input.pull_logging_enabled.to_string(),
         ),
+        (
+            "pull_log_retention_days",
+            input.pull_log_retention_days.to_string(),
+        ),
+        (
+            "pull_log_max_entries",
+            input.pull_log_max_entries.to_string(),
+        ),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_owned(), value))
@@ -827,6 +843,8 @@ fn runtime_config(
         registry_external_tls: config.registry_external_tls,
         registry_auth_enabled: config.registry_auth.is_some(),
         pull_logging_enabled: config.pull_logging_enabled,
+        pull_log_retention_days: config.pull_log_retention_days,
+        pull_log_max_entries: config.pull_log_max_entries,
     }
 }
 

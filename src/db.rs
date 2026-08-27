@@ -4,8 +4,8 @@ use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectOptions, ConnectionTrait, Database,
     DatabaseConnection, DatabaseTransaction, DbBackend, DbErr, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, SqliteTransactionMode,
-    Statement, TransactionOptions, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, SqliteTransactionMode, Statement,
+    TransactionOptions, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -994,6 +994,33 @@ pub async fn clear_pull_events(db: &DatabaseConnection) -> Result<u64, DbErr> {
         .rows_affected)
 }
 
+pub async fn prune_pull_events(
+    db: &DatabaseConnection,
+    cutoff: DateTime<Utc>,
+    max_entries: u64,
+) -> Result<u64, DbErr> {
+    let transaction = db.begin().await?;
+    let offset = std::cmp::min(max_entries, i64::MAX as u64) as i64;
+    let expired = transaction
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM pull_events WHERE created_at < ?",
+            [cutoff.into()],
+        ))
+        .await?
+        .rows_affected();
+    let overflow = transaction
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM pull_events WHERE id IN (SELECT id FROM pull_events ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?)",
+            [offset.into()],
+        ))
+        .await?
+        .rows_affected();
+    transaction.commit().await?;
+    Ok(expired.saturating_add(overflow))
+}
+
 pub async fn claim_image_job(
     db: &DatabaseConnection,
     job_id: Uuid,
@@ -1766,6 +1793,41 @@ mod tests {
                 bytes: 12,
                 hits: 7,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_event_pruning_enforces_age_and_count_bounds() {
+        let db = connect("sqlite::memory:").await.unwrap();
+        let now = Utc::now();
+        for days_ago in [90_i64, 4, 3, 2, 1] {
+            insert_pull_event(
+                &db,
+                pull_event::Model {
+                    id: Uuid::new_v4(),
+                    registry_route_id: crate::registry_routes::DOCKER_HUB_ROUTE_ID,
+                    repository: "library/redis".into(),
+                    reference: "latest".into(),
+                    resolved_digest: None,
+                    status_code: 200,
+                    created_at: now - chrono::Duration::days(days_ago),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            prune_pull_events(&db, now - chrono::Duration::days(30), 2)
+                .await
+                .unwrap(),
+            3
+        );
+        let remaining = list_pull_events(&db, 10).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            remaining
+                .iter()
+                .all(|event| { event.created_at >= now - chrono::Duration::days(2) })
         );
     }
 }

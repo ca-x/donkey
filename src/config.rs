@@ -48,6 +48,8 @@ pub struct Config {
     pub max_export_bytes: u64,
     pub export_ttl: Duration,
     pub pull_logging_enabled: bool,
+    pub pull_log_retention_days: u64,
+    pub pull_log_max_entries: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +209,8 @@ impl Config {
             )?,
             export_ttl: duration_env("DONKEY_EXPORT_TTL", "7d")?,
             pull_logging_enabled: bool_env("DONKEY_PULL_LOGGING_ENABLED", true)?,
+            pull_log_retention_days: u64_env("DONKEY_PULL_LOG_RETENTION_DAYS", 30, 1, 3650)?,
+            pull_log_max_entries: u64_env("DONKEY_PULL_LOG_MAX_ENTRIES", 10_000, 100, 1_000_000)?,
         };
 
         if config.admin_addr.ip().is_unspecified()
@@ -267,6 +271,8 @@ impl Config {
             max_export_bytes: 1024 * 1024 * 1024,
             export_ttl: Duration::from_secs(7 * 24 * 60 * 60),
             pull_logging_enabled: true,
+            pull_log_retention_days: 30,
+            pull_log_max_entries: 10_000,
         }
     }
 
@@ -321,6 +327,10 @@ impl Config {
                     self.export_ttl = Duration::from_secs(setting.value.parse()?)
                 }
                 "pull_logging_enabled" => self.pull_logging_enabled = setting.value.parse()?,
+                "pull_log_retention_days" => {
+                    self.pull_log_retention_days = setting.value.parse()?
+                }
+                "pull_log_max_entries" => self.pull_log_max_entries = setting.value.parse()?,
                 _ => {}
             }
         }
@@ -336,7 +346,9 @@ impl Config {
                 || self.stream_fallback_timeout.is_zero()
                 || self.partial_ttl.is_zero()
                 || self.max_cache_bytes < 64 * 1024 * 1024
-                || self.max_export_bytes < 64 * 1024 * 1024)
+                || self.max_export_bytes < 64 * 1024 * 1024
+                || !(1..=3650).contains(&self.pull_log_retention_days)
+                || !(100..=1_000_000).contains(&self.pull_log_max_entries))
         {
             anyhow::bail!("persisted runtime settings are out of range")
         }

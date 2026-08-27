@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use sea_orm::DatabaseConnection;
@@ -28,22 +28,38 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct RuntimeFlags {
     pull_logging_enabled: Arc<AtomicBool>,
+    pull_log_retention_days: Arc<AtomicU64>,
+    pull_log_max_entries: Arc<AtomicU64>,
 }
 
 impl RuntimeFlags {
     fn new(config: &Config) -> Self {
         Self {
             pull_logging_enabled: Arc::new(AtomicBool::new(config.pull_logging_enabled)),
+            pull_log_retention_days: Arc::new(AtomicU64::new(config.pull_log_retention_days)),
+            pull_log_max_entries: Arc::new(AtomicU64::new(config.pull_log_max_entries)),
         }
     }
 
     pub fn update(&self, config: &Config) {
         self.pull_logging_enabled
             .store(config.pull_logging_enabled, Ordering::Release);
+        self.pull_log_retention_days
+            .store(config.pull_log_retention_days, Ordering::Release);
+        self.pull_log_max_entries
+            .store(config.pull_log_max_entries, Ordering::Release);
     }
 
     pub fn pull_logging_enabled(&self) -> bool {
         self.pull_logging_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn pull_log_retention_days(&self) -> u64 {
+        self.pull_log_retention_days.load(Ordering::Acquire)
+    }
+
+    pub fn pull_log_max_entries(&self) -> u64 {
+        self.pull_log_max_entries.load(Ordering::Acquire)
     }
 }
 
