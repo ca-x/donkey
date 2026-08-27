@@ -4,6 +4,10 @@ use axum::{
     http::StatusCode,
     routing::{get, post, put},
 };
+use sea_orm::{
+    ActiveModelTrait, ConnectionTrait, DbBackend, EntityTrait, IntoActiveModel, Statement,
+    TransactionTrait,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -431,82 +435,7 @@ async fn import_runtime(
         validate_runtime_settings(settings)?;
     }
     validate_import_snapshot(&state, &export).await?;
-    let mut route_ids = HashMap::new();
-    for route in export.registry_routes {
-        let input = crate::registry_routes::RegistryRouteInput {
-            key: route.key.clone(),
-            name: route.name,
-            canonical_registry: route.canonical_registry,
-            path_prefix: route.path_prefix,
-            repository_mode: route.repository_mode,
-            is_default: route.is_default,
-            enabled: route.enabled,
-        };
-        let result = if let Some(existing) = state
-            .registry_routes
-            .list()
-            .await?
-            .into_iter()
-            .find(|item| item.key == route.key)
-        {
-            state.registry_routes.update(existing.id, input).await?
-        } else {
-            state.registry_routes.create(input).await?
-        };
-        route_ids.insert(result.key, result.id);
-    }
-    let available_routes = state.registry_routes.list().await?;
-    for node in export.nodes {
-        if node.auth_mode != "none" {
-            return Err(crate::error::AppError::bad_request(format!(
-                "node '{}' requires credentials after import",
-                node.name
-            )));
-        }
-        let route_id = route_ids
-            .get(&node.registry_route)
-            .copied()
-            .or_else(|| {
-                available_routes
-                    .iter()
-                    .find(|route| route.key == node.registry_route)
-                    .map(|route| route.id)
-            })
-            .ok_or_else(|| {
-                crate::error::AppError::bad_request(format!(
-                    "unknown Registry route '{}'",
-                    node.registry_route
-                ))
-            })?;
-        let input = NodeInput {
-            name: node.name.clone(),
-            url: node.url.clone(),
-            registry_route_id: route_id,
-            enabled: node.enabled,
-            priority: node.priority,
-            max_concurrency: node.max_concurrency,
-            cf_preferred: node.cf_preferred,
-            connect_ip: node.connect_ip,
-            auth_mode: "none".into(),
-            auth_username: None,
-            auth_header: None,
-            auth_secret: None,
-        };
-        let existing = state
-            .nodes
-            .list()
-            .await?
-            .into_iter()
-            .find(|item| item.node.url == node.url && item.node.registry_route_id == route_id);
-        if let Some(existing) = existing {
-            state.nodes.update(existing.node.id, input).await?;
-        } else {
-            state.nodes.create(input).await?;
-        }
-    }
-    if let Some(settings) = export.settings.as_ref() {
-        persist_runtime(&state, settings).await?;
-    }
+    apply_runtime_snapshot(&state, &export).await?;
     let effective = effective_config(&state).await?;
     state.apply_runtime_config(&effective).await;
     let cache = state.cache.stats().await?;
@@ -559,6 +488,223 @@ async fn validate_import_snapshot(
     Ok(())
 }
 
+struct PreparedRoute {
+    model: db::registry_route::Model,
+    exists: bool,
+}
+
+struct PreparedNode {
+    model: db::node::Model,
+    max_concurrency: u16,
+    exists: bool,
+}
+
+async fn apply_runtime_snapshot(state: &AppState, export: &RuntimeSettingsExport) -> ApiResult<()> {
+    let now = chrono::Utc::now();
+    let existing_routes = db::registry_route::Entity::find().all(&state.db).await?;
+    let mut route_ids = existing_routes
+        .iter()
+        .map(|route| (route.key.clone(), route.id))
+        .collect::<HashMap<_, _>>();
+    let mut routes = Vec::with_capacity(export.registry_routes.len());
+    for route in &export.registry_routes {
+        let normalized = crate::registry_routes::normalize_input(RegistryRouteInput {
+            key: route.key.clone(),
+            name: route.name.clone(),
+            canonical_registry: route.canonical_registry.clone(),
+            path_prefix: route.path_prefix.clone(),
+            repository_mode: route.repository_mode.clone(),
+            is_default: route.is_default,
+            enabled: route.enabled,
+        })?;
+        let existing = existing_routes
+            .iter()
+            .find(|candidate| candidate.key == normalized.key);
+        let id = existing.map_or_else(Uuid::new_v4, |route| route.id);
+        let created_at = existing.map_or(now, |route| route.created_at);
+        route_ids.insert(normalized.key.clone(), id);
+        routes.push(PreparedRoute {
+            model: db::registry_route::Model {
+                id,
+                key: normalized.key,
+                name: normalized.name,
+                canonical_registry: normalized.canonical_registry,
+                path_prefix: normalized.path_prefix,
+                repository_mode: normalized.repository_mode.as_str().to_owned(),
+                is_default: normalized.is_default,
+                enabled: normalized.enabled,
+                created_at,
+                updated_at: now,
+            },
+            exists: existing.is_some(),
+        });
+    }
+
+    let existing_nodes = db::list_nodes(&state.db).await?;
+    let mut nodes = Vec::with_capacity(export.nodes.len());
+    for node in &export.nodes {
+        let route_id = route_ids
+            .get(&node.registry_route)
+            .copied()
+            .ok_or_else(|| {
+                crate::error::AppError::bad_request(format!(
+                    "unknown Registry route '{}'",
+                    node.registry_route
+                ))
+            })?;
+        let input = NodeInput {
+            name: node.name.clone(),
+            url: node.url.clone(),
+            registry_route_id: route_id,
+            enabled: node.enabled,
+            priority: node.priority,
+            max_concurrency: node.max_concurrency,
+            cf_preferred: node.cf_preferred,
+            connect_ip: node.connect_ip.clone(),
+            auth_mode: "none".into(),
+            auth_username: None,
+            auth_header: None,
+            auth_secret: None,
+        };
+        crate::nodes::validate_input(&input)?;
+        if let Some(ip) = input.connect_ip.as_deref() {
+            ip.parse::<std::net::IpAddr>().map_err(|_| {
+                crate::error::AppError::bad_request("connect_ip must be an IP address")
+            })?;
+        }
+        let validated = crate::security::validate_upstream(&input.url, &state.config).await?;
+        let canonical = validated.url.to_string();
+        let existing = existing_nodes.iter().find(|candidate| {
+            candidate.registry_route_id == route_id && candidate.url == canonical
+        });
+        nodes.push(PreparedNode {
+            model: db::node::Model {
+                id: existing.map_or_else(Uuid::new_v4, |node| node.id),
+                name: input.name.trim().to_owned(),
+                url: canonical,
+                registry_route_id: route_id,
+                enabled: input.enabled,
+                priority: input.priority,
+                cf_preferred: input.cf_preferred,
+                connect_ip: input.connect_ip,
+                auth_mode: "none".into(),
+                auth_username: None,
+                auth_header: None,
+                auth_secret_enc: None,
+                created_at: existing.map_or(now, |node| node.created_at),
+                updated_at: now,
+            },
+            max_concurrency: input.max_concurrency,
+            exists: existing.is_some(),
+        });
+    }
+
+    let transaction = state.db.begin().await?;
+    let result =
+        apply_prepared_snapshot(&transaction, &routes, &nodes, export.settings.as_ref()).await;
+    match result {
+        Ok(()) => transaction.commit().await?,
+        Err(error) => {
+            transaction.rollback().await?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+async fn apply_prepared_snapshot(
+    transaction: &sea_orm::DatabaseTransaction,
+    routes: &[PreparedRoute],
+    nodes: &[PreparedNode],
+    settings: Option<&RuntimeSettingsInput>,
+) -> ApiResult<()> {
+    if routes.iter().any(|route| route.model.is_default) {
+        transaction
+            .execute_unprepared("UPDATE registry_routes SET is_default = 0")
+            .await?;
+    }
+    for route in routes {
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE registry_routes SET path_prefix = NULL WHERE id = ?",
+                [route.model.id.into()],
+            ))
+            .await?;
+    }
+    for route in routes {
+        if route.exists {
+            route
+                .model
+                .clone()
+                .into_active_model()
+                .update(transaction)
+                .await?;
+        } else {
+            route
+                .model
+                .clone()
+                .into_active_model()
+                .insert(transaction)
+                .await?;
+        }
+    }
+    for node in nodes {
+        if node.exists {
+            node.model
+                .clone()
+                .into_active_model()
+                .update(transaction)
+                .await?;
+        } else {
+            node.model
+                .clone()
+                .into_active_model()
+                .insert(transaction)
+                .await?;
+            db::node_metric::Model {
+                node_id: node.model.id,
+                healthy: true,
+                latency_ms: 0,
+                speed_bps: 0,
+                success_rate: 1.0,
+                current_bps: 0,
+                total_bytes: 0,
+                last_checked_at: None,
+                last_error: None,
+            }
+            .into_active_model()
+            .insert(transaction)
+            .await?;
+        }
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO node_limits(node_id, max_concurrency) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET max_concurrency = excluded.max_concurrency",
+                [
+                    node.model.id.to_string().into(),
+                    i64::from(node.max_concurrency).into(),
+                ],
+            ))
+            .await?;
+    }
+    if let Some(settings) = settings {
+        transaction
+            .execute_unprepared("DELETE FROM runtime_settings")
+            .await?;
+        for (key, value) in runtime_setting_values(settings) {
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO runtime_settings(key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    [key.into(), value.into()],
+                ))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_runtime_settings(input: &RuntimeSettingsInput) -> ApiResult<()> {
     if !(256 * 1024..=32 * 1024 * 1024).contains(&input.chunk_size)
         || !(1..=64).contains(&input.chunk_concurrency)
@@ -591,7 +737,12 @@ fn validate_runtime_settings(input: &RuntimeSettingsInput) -> ApiResult<()> {
 
 async fn persist_runtime(state: &AppState, input: &RuntimeSettingsInput) -> ApiResult<()> {
     validate_runtime_settings(input)?;
-    let values = vec![
+    db::replace_runtime_settings(&state.db, &runtime_setting_values(input)).await?;
+    Ok(())
+}
+
+fn runtime_setting_values(input: &RuntimeSettingsInput) -> Vec<(String, String)> {
+    vec![
         ("chunk_size", input.chunk_size.to_string()),
         ("chunk_concurrency", input.chunk_concurrency.to_string()),
         ("parallel_threshold", input.parallel_threshold.to_string()),
@@ -627,13 +778,10 @@ async fn persist_runtime(state: &AppState, input: &RuntimeSettingsInput) -> ApiR
             "pull_logging_enabled",
             input.pull_logging_enabled.to_string(),
         ),
-    ];
-    let values = values
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect::<Vec<_>>();
-    db::replace_runtime_settings(&state.db, &values).await?;
-    Ok(())
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value))
+    .collect()
 }
 
 async fn effective_config(
@@ -679,5 +827,85 @@ fn runtime_config(
         registry_external_tls: config.registry_external_tls,
         registry_auth_enabled: config.registry_auth.is_some(),
         pull_logging_enabled: config.pull_logging_enabled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_snapshot_rolls_back_all_writes_on_node_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(crate::Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let node = ExportNode {
+            name: "duplicate import".into(),
+            url: "http://127.0.0.1:5000/".into(),
+            registry_route: crate::registry_routes::DOCKER_HUB_ROUTE_KEY.into(),
+            enabled: true,
+            priority: 1,
+            max_concurrency: 4,
+            cf_preferred: false,
+            connect_ip: None,
+            auth_mode: "none".into(),
+            auth_username: None,
+            auth_header: None,
+        };
+        let export = RuntimeSettingsExport {
+            format: "donkey-runtime-settings".into(),
+            version: 1,
+            settings: None,
+            registry_routes: Vec::new(),
+            nodes: vec![node.clone(), node],
+        };
+
+        validate_import_snapshot(&state, &export).await.unwrap();
+        assert!(apply_runtime_snapshot(&state, &export).await.is_err());
+        assert!(db::list_nodes(&state.db).await.unwrap().is_empty());
+        assert!(
+            db::load_runtime_settings(&state.db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_commits_routes_nodes_and_settings_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(crate::Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let mut export = export_runtime(State(state.clone())).await.unwrap().0;
+        export.nodes.push(ExportNode {
+            name: "atomic node".into(),
+            url: "http://127.0.0.1:5001/".into(),
+            registry_route: crate::registry_routes::DOCKER_HUB_ROUTE_KEY.into(),
+            enabled: true,
+            priority: 2,
+            max_concurrency: 3,
+            cf_preferred: false,
+            connect_ip: None,
+            auth_mode: "none".into(),
+            auth_username: None,
+            auth_header: None,
+        });
+
+        validate_import_snapshot(&state, &export).await.unwrap();
+        apply_runtime_snapshot(&state, &export).await.unwrap();
+
+        let nodes = state.nodes.list().await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node.name, "atomic node");
+        assert_eq!(nodes[0].max_concurrency, 3);
+        assert_eq!(state.registry_routes.list().await.unwrap().len(), 2);
+        assert!(
+            !db::load_runtime_settings(&state.db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -588,7 +588,7 @@ fn empty_metric(node_id: Uuid) -> node_metric::Model {
     }
 }
 
-fn validate_input(input: &NodeInput) -> ApiResult<()> {
+pub(crate) fn validate_input(input: &NodeInput) -> ApiResult<()> {
     if input.name.trim().is_empty() || input.name.chars().count() > 80 {
         return Err(AppError::bad_request(
             "name must be between 1 and 80 characters",

@@ -303,17 +303,17 @@ fn map_route_write_error(error: DbErr) -> AppError {
     )
 }
 
-struct NormalizedRouteInput {
-    key: String,
-    name: String,
-    canonical_registry: String,
-    path_prefix: Option<String>,
-    repository_mode: RepositoryMode,
-    is_default: bool,
-    enabled: bool,
+pub(crate) struct NormalizedRouteInput {
+    pub key: String,
+    pub name: String,
+    pub canonical_registry: String,
+    pub path_prefix: Option<String>,
+    pub repository_mode: RepositoryMode,
+    pub is_default: bool,
+    pub enabled: bool,
 }
 
-fn normalize_input(input: RegistryRouteInput) -> ApiResult<NormalizedRouteInput> {
+pub(crate) fn normalize_input(input: RegistryRouteInput) -> ApiResult<NormalizedRouteInput> {
     let key = normalize_identifier(&input.key, "Registry route key")?;
     let name = input.name.trim().to_owned();
     if name.is_empty() || name.chars().count() > 80 {
