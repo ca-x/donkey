@@ -998,29 +998,40 @@ impl ImageTools {
         }
         let name = safe_artifact_name(&job.source_ref, format);
         let output = self.root.join("jobs").join(job.id.to_string()).join(&name);
-        let config =
-            oci_spec_builder::image::ImageConfiguration::from_reader(image.config_json.as_bytes())
-                .map_err(|error| {
-                    AppError::internal(anyhow::anyhow!("invalid image config: {error}"))
-                })?;
-        let layers = image.layer_paths.clone();
-        let media_types = image
-            .manifest
-            .layers
-            .iter()
-            .map(|layer| layer.media_type.clone())
-            .collect::<Vec<_>>();
-        let reference = job.source_ref.clone();
         let output_clone = output.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let file = std::fs::File::create(&output_clone)?;
-            let mut builder = oci_tar_builder::Builder::default();
-            builder.add_config(config, reference);
-            for (path, media_type) in layers.iter().zip(media_types) {
-                builder.add_layer_with_media_type(path, media_type);
+        let archive = if format == "docker" {
+            ArchiveInput::Docker {
+                config_json: image.config_json.clone(),
+                reference: job.source_ref.clone(),
+                layers: image.layer_paths.clone(),
+                media_types: image
+                    .manifest
+                    .layers
+                    .iter()
+                    .map(|layer| layer.media_type.clone())
+                    .collect(),
             }
-            builder.build(file)?;
-            Ok(())
+        } else {
+            ArchiveInput::Oci {
+                layout: image.layout.clone(),
+            }
+        };
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            match archive {
+                ArchiveInput::Docker {
+                    config_json,
+                    reference,
+                    layers,
+                    media_types,
+                } => build_docker_archive(
+                    &output_clone,
+                    &config_json,
+                    reference,
+                    &layers,
+                    &media_types,
+                ),
+                ArchiveInput::Oci { layout } => build_oci_archive(&output_clone, &layout),
+            }
         })
         .await
         .map_err(AppError::internal)?
@@ -1574,6 +1585,18 @@ struct PreparedImage {
     layout: PathBuf,
     layer_paths: Vec<PathBuf>,
     total_bytes: u64,
+}
+
+enum ArchiveInput {
+    Docker {
+        config_json: String,
+        reference: String,
+        layers: Vec<PathBuf>,
+        media_types: Vec<String>,
+    },
+    Oci {
+        layout: PathBuf,
+    },
 }
 
 enum JobOutcome {
@@ -2325,6 +2348,34 @@ async fn write_layout(layout: &Path, manifest: &OciImageManifest) -> ApiResult<(
     Ok(())
 }
 
+fn build_docker_archive(
+    output: &Path,
+    config_json: &str,
+    reference: String,
+    layers: &[PathBuf],
+    media_types: &[String],
+) -> anyhow::Result<()> {
+    let config = oci_spec_builder::image::ImageConfiguration::from_reader(config_json.as_bytes())
+        .map_err(|error| anyhow::anyhow!("invalid image config: {error}"))?;
+    let file = std::fs::File::create(output)?;
+    let mut builder = oci_tar_builder::Builder::default();
+    builder.add_config(config, reference);
+    for (path, media_type) in layers.iter().zip(media_types) {
+        builder.add_layer_with_media_type(path, media_type.clone());
+    }
+    builder.build(file)
+}
+
+fn build_oci_archive(output: &Path, layout: &Path) -> anyhow::Result<()> {
+    let file = std::fs::File::create(output)?;
+    let mut builder = tar::Builder::new(file);
+    builder.append_path_with_name(layout.join("oci-layout"), "oci-layout")?;
+    builder.append_path_with_name(layout.join("index.json"), "index.json")?;
+    builder.append_dir_all("blobs", layout.join("blobs"))?;
+    builder.finish()?;
+    Ok(())
+}
+
 async fn push_file(
     client: &Client,
     reference: &Reference,
@@ -2461,6 +2512,7 @@ mod tests {
     use httpmock::prelude::*;
     use sea_orm::ConnectionTrait;
     use secrecy::SecretString;
+    use std::{collections::HashMap, io::Read};
 
     async fn test_service() -> (tempfile::TempDir, ImageTools) {
         let directory = tempfile::tempdir().unwrap();
@@ -2598,6 +2650,80 @@ mod tests {
             assert_eq!(JobKind::parse(value), Some(kind));
             assert_eq!(kind.as_str(), value);
         }
+    }
+
+    #[test]
+    fn docker_archive_contains_loadable_manifest_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let layer = directory.path().join("layer.tar.gz");
+        std::fs::write(&layer, b"layer bytes").unwrap();
+        let output = directory.path().join("image-docker.tar");
+        let config = r#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"history":[],"config":{}}"#;
+        build_docker_archive(
+            &output,
+            config,
+            "docker.io/library/test:latest".into(),
+            &[layer],
+            &["application/vnd.oci.image.layer.v1.tar+gzip".into()],
+        )
+        .unwrap();
+
+        let mut files = HashMap::new();
+        let mut archive = tar::Archive::new(std::fs::File::open(output).unwrap());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            files.insert(path, bytes);
+        }
+        let manifest: Vec<serde_json::Value> =
+            serde_json::from_slice(files.get("manifest.json").unwrap()).unwrap();
+        let item = &manifest[0];
+        let config_path = item["Config"].as_str().unwrap();
+        assert!(files.contains_key(config_path));
+        assert_eq!(
+            item["RepoTags"].as_array().unwrap()[0].as_str(),
+            Some("docker.io/library/test:latest")
+        );
+        for layer in item["Layers"].as_array().unwrap() {
+            assert!(files.contains_key(layer.as_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn oci_archive_contains_only_oci_layout_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let layout = directory.path().join("layout");
+        std::fs::create_dir_all(layout.join("blobs/sha256")).unwrap();
+        std::fs::write(
+            layout.join("oci-layout"),
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(layout.join("index.json"), br#"{"schemaVersion":2}"#).unwrap();
+        std::fs::write(layout.join("blobs/sha256/abc"), b"blob").unwrap();
+        let output = directory.path().join("image-oci.tar");
+        build_oci_archive(&output, &layout).unwrap();
+
+        let mut archive = tar::Archive::new(std::fs::File::open(output).unwrap());
+        let paths = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(paths.iter().any(|path| path == "oci-layout"));
+        assert!(paths.iter().any(|path| path == "index.json"));
+        assert!(paths.iter().any(|path| path == "blobs/sha256/abc"));
+        assert!(!paths.iter().any(|path| path == "manifest.json"));
     }
 
     #[tokio::test]
