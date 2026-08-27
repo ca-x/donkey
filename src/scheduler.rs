@@ -60,6 +60,7 @@ pub struct SchedulerStats {
 struct SchedulerRuntimeConfig {
     chunk_size: u64,
     adaptive_chunking_enabled: bool,
+    automatic_concurrency_enabled: bool,
     parallel_threshold: u64,
     resumable_threshold: u64,
     chunk_concurrency: usize,
@@ -110,6 +111,7 @@ impl Scheduler {
             runtime: Arc::new(RwLock::new(SchedulerRuntimeConfig {
                 chunk_size: config.chunk_size,
                 adaptive_chunking_enabled: config.adaptive_chunking_enabled,
+                automatic_concurrency_enabled: config.automatic_concurrency_enabled,
                 parallel_threshold: config.parallel_threshold,
                 resumable_threshold: config.resumable_threshold,
                 chunk_concurrency: config.chunk_concurrency,
@@ -132,6 +134,7 @@ impl Scheduler {
         let mut runtime = self.runtime.write().await;
         runtime.chunk_size = config.chunk_size;
         runtime.adaptive_chunking_enabled = config.adaptive_chunking_enabled;
+        runtime.automatic_concurrency_enabled = config.automatic_concurrency_enabled;
         runtime.parallel_threshold = config.parallel_threshold;
         runtime.resumable_threshold = config.resumable_threshold;
         runtime.chunk_concurrency = config.chunk_concurrency;
@@ -161,7 +164,7 @@ impl Scheduler {
         let runtime = *self.runtime.read().await;
         StreamDownloadConfig {
             chunk_size: effective_chunk_size(runtime, total_size, node_capacity),
-            concurrency: runtime.chunk_concurrency,
+            concurrency: effective_concurrency(runtime, node_capacity),
             parallel_threshold: runtime.parallel_threshold,
         }
     }
@@ -491,10 +494,7 @@ impl Scheduler {
             .iter()
             .map(|node| usize::from(node.max_concurrency))
             .sum::<usize>();
-        let concurrency = request
-            .runtime
-            .chunk_concurrency
-            .min(node_capacity.max(1))
+        let concurrency = effective_concurrency(request.runtime, node_capacity)
             .min(chunks.len())
             .max(1);
         let results = stream::iter(chunks.clone())
@@ -770,7 +770,7 @@ fn effective_chunk_size(
     const MIN_CHUNK: u64 = 2 * MIB;
     const MAX_CHUNK: u64 = 8 * MIB;
     const TARGET_WAVES: u64 = 4;
-    let parallelism = runtime.chunk_concurrency.min(node_capacity.max(1)).max(1) as u64;
+    let parallelism = effective_concurrency(runtime, node_capacity) as u64;
     let target_chunks = parallelism.saturating_mul(TARGET_WAVES);
     let ideal = total_size.saturating_add(target_chunks.saturating_sub(1)) / target_chunks;
     ideal
@@ -778,6 +778,15 @@ fn effective_chunk_size(
         .div_euclid(MIB)
         .saturating_mul(MIB)
         .clamp(MIN_CHUNK, MAX_CHUNK)
+}
+
+fn effective_concurrency(runtime: SchedulerRuntimeConfig, node_capacity: usize) -> usize {
+    let node_capacity = node_capacity.max(1);
+    if runtime.automatic_concurrency_enabled {
+        node_capacity.min(64)
+    } else {
+        runtime.chunk_concurrency.min(node_capacity).max(1)
+    }
 }
 
 fn capabilities_from_head(response: &reqwest::Response) -> Option<BlobCapabilities> {
@@ -963,6 +972,7 @@ mod tests {
         SchedulerRuntimeConfig {
             chunk_size: 512 * 1024,
             adaptive_chunking_enabled: adaptive,
+            automatic_concurrency_enabled: false,
             parallel_threshold: 1024 * 1024,
             resumable_threshold: 1024 * 1024,
             chunk_concurrency: 4,
@@ -1001,6 +1011,23 @@ mod tests {
             effective_chunk_size(test_runtime(false), 1024 * 1024 * 1024, 16),
             512 * 1024
         );
+    }
+
+    #[test]
+    fn automatic_concurrency_sums_node_capacity_with_safety_cap() {
+        let mut runtime = test_runtime(true);
+        runtime.automatic_concurrency_enabled = true;
+        runtime.chunk_concurrency = 2;
+        assert_eq!(effective_concurrency(runtime, 24), 24);
+        assert_eq!(effective_concurrency(runtime, 80), 64);
+    }
+
+    #[test]
+    fn manual_concurrency_uses_configured_limit() {
+        let mut runtime = test_runtime(true);
+        runtime.chunk_concurrency = 12;
+        assert_eq!(effective_concurrency(runtime, 24), 12);
+        assert_eq!(effective_concurrency(runtime, 8), 8);
     }
 
     #[test]

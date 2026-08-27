@@ -136,7 +136,7 @@ fn default_priority() -> i32 {
 }
 
 fn default_max_concurrency() -> u16 {
-    4
+    8
 }
 
 impl NodeService {
@@ -747,6 +747,18 @@ mod tests {
             score(&base, &fast, SchedulerPolicy::SpeedFirst)
                 > score(&base, &slow, SchedulerPolicy::SpeedFirst)
         );
+    }
+
+    #[test]
+    fn node_input_defaults_to_eight_connections() {
+        let input: NodeInput = serde_json::from_value(serde_json::json!({
+            "name": "default concurrency",
+            "url": "https://registry.example/",
+            "registry_route_id": crate::registry_routes::DOCKER_HUB_ROUTE_ID,
+            "auth_mode": "none"
+        }))
+        .unwrap();
+        assert_eq!(input.max_concurrency, 8);
     }
 
     #[tokio::test]

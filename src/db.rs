@@ -822,7 +822,7 @@ pub async fn get_node_max_concurrency(db: &DatabaseConnection, id: Uuid) -> Resu
         .await?;
     Ok(row
         .and_then(|row| row.try_get::<i64>("", "max_concurrency").ok())
-        .unwrap_or(4)
+        .unwrap_or(8)
         .clamp(1, u16::MAX as i64) as u16)
 }
 

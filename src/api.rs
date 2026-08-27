@@ -322,6 +322,7 @@ struct RuntimeConfig {
     private_upstreams: bool,
     chunk_size: u64,
     adaptive_chunking_enabled: bool,
+    automatic_concurrency_enabled: bool,
     chunk_concurrency: usize,
     parallel_threshold: u64,
     resumable_threshold: u64,
@@ -360,6 +361,7 @@ async fn runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeConfig>
 struct RuntimeSettingsInput {
     chunk_size: u64,
     adaptive_chunking_enabled: bool,
+    automatic_concurrency_enabled: bool,
     chunk_concurrency: usize,
     parallel_threshold: u64,
     resumable_threshold: u64,
@@ -444,6 +446,7 @@ async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<Runtime
         settings: Some(RuntimeSettingsInput {
             chunk_size: config.chunk_size,
             adaptive_chunking_enabled: config.adaptive_chunking_enabled,
+            automatic_concurrency_enabled: config.automatic_concurrency_enabled,
             chunk_concurrency: config.chunk_concurrency,
             parallel_threshold: config.parallel_threshold,
             resumable_threshold: config.resumable_threshold,
@@ -796,6 +799,10 @@ fn runtime_setting_values(input: &RuntimeSettingsInput) -> Vec<(String, String)>
             "adaptive_chunking_enabled",
             input.adaptive_chunking_enabled.to_string(),
         ),
+        (
+            "automatic_concurrency_enabled",
+            input.automatic_concurrency_enabled.to_string(),
+        ),
         ("chunk_concurrency", input.chunk_concurrency.to_string()),
         ("parallel_threshold", input.parallel_threshold.to_string()),
         ("resumable_threshold", input.resumable_threshold.to_string()),
@@ -866,6 +873,7 @@ fn runtime_config(
         private_upstreams: config.allow_private_upstreams,
         chunk_size: config.chunk_size,
         adaptive_chunking_enabled: config.adaptive_chunking_enabled,
+        automatic_concurrency_enabled: config.automatic_concurrency_enabled,
         chunk_concurrency: config.chunk_concurrency,
         parallel_threshold: config.parallel_threshold,
         resumable_threshold: config.resumable_threshold,
