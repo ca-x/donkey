@@ -55,6 +55,8 @@ export function DashboardPage() {
         <MetricCard index={3} label={t('dashboard.mode')} value={t(enabledNodes.length > 1 ? 'dashboard.concurrent' : 'dashboard.fallback')} detail={t('dashboard.integrity')} icon={<IconRoute size={18} />} />
         <MetricCard index={4} label={t('dashboard.registryRequests')} value={data.registry_requests.toLocaleString()} detail={t('dashboard.registryRequestsDetail')} icon={<IconActivityHeartbeat size={18} />} />
         <MetricCard index={5} label={t('dashboard.registryBytes')} value={formatBytes(data.registry_bytes)} detail={t('dashboard.registryBytesDetail')} icon={<IconDatabase size={18} />} />
+        <MetricCard index={6} label={t('dashboard.concurrent')} value={data.parallel_blobs.toLocaleString()} detail={`${formatBytes(data.last_chunk_size)} · ${data.cooling_nodes} ${t('dashboard.waiting')}`} icon={<IconRoute size={18} />} />
+        <MetricCard index={7} label={t('imageTools.retry')} value={data.retry_attempts.toLocaleString()} detail={`${data.resume_attempts.toLocaleString()} · ${t('settings.resumableThreshold')}`} icon={<IconActivityHeartbeat size={18} />} />
       </SimpleGrid>
 
       <div className="dashboard-grid">

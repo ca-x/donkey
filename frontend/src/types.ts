@@ -129,6 +129,11 @@ export interface DashboardData {
   healthy_nodes: number
   registry_requests: number
   registry_bytes: number
+  parallel_blobs: number
+  resume_attempts: number
+  retry_attempts: number
+  last_chunk_size: number
+  cooling_nodes: number
 }
 
 export interface HealthData {
