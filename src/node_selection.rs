@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use backoff::backoff::Backoff;
 use dashmap::DashMap;
@@ -8,14 +12,66 @@ use crate::{config::SchedulerPolicy, nodes::NodeView};
 
 #[derive(Clone)]
 pub(crate) struct NodeSelector {
-    speeds: Arc<DashMap<Uuid, f64>>,
+    speeds: Arc<DashMap<Uuid, Arc<Mutex<SpeedWindow>>>>,
     active: Arc<DashMap<Uuid, usize>>,
     failures: Arc<DashMap<Uuid, FailureState>>,
+    recovered: Arc<DashMap<Uuid, Instant>>,
 }
 
 struct FailureState {
     backoff: backoff::ExponentialBackoff,
     cooldown_until: Instant,
+}
+
+const SPEED_WINDOW: Duration = Duration::from_secs(60);
+const MAX_SPEED_SAMPLES: usize = 8;
+
+#[derive(Default)]
+struct SpeedWindow {
+    samples: VecDeque<SpeedSample>,
+}
+
+struct SpeedSample {
+    at: Instant,
+    bps: f64,
+}
+
+impl SpeedWindow {
+    fn record(&mut self, now: Instant, bps: f64) {
+        self.samples.push_back(SpeedSample { at: now, bps });
+        self.prune(now);
+        while self.samples.len() > MAX_SPEED_SAMPLES {
+            self.samples.pop_front();
+        }
+    }
+
+    fn estimate(&mut self, now: Instant) -> Option<f64> {
+        self.prune(now);
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut values = self
+            .samples
+            .iter()
+            .map(|sample| sample.bps)
+            .collect::<Vec<_>>();
+        values.sort_by(f64::total_cmp);
+        if values.len() >= 5 {
+            values.remove(0);
+            values.pop();
+        }
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .samples
+            .front()
+            .is_some_and(|sample| now.duration_since(sample.at) > SPEED_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
 }
 
 impl NodeSelector {
@@ -24,6 +80,7 @@ impl NodeSelector {
             speeds: Arc::new(DashMap::new()),
             active: Arc::new(DashMap::new()),
             failures: Arc::new(DashMap::new()),
+            recovered: Arc::new(DashMap::new()),
         }
     }
 
@@ -47,7 +104,12 @@ impl NodeSelector {
         }
         match policy {
             SchedulerPolicy::Balanced => {
-                if !candidates.is_empty() {
+                let measured = candidates
+                    .iter()
+                    .any(|node| self.speeds.contains_key(&node.node.id));
+                if measured {
+                    self.weighted_balanced_order(&mut candidates, sequence);
+                } else if !candidates.is_empty() {
                     let offset = sequence % candidates.len();
                     candidates.rotate_left(offset);
                 }
@@ -60,6 +122,60 @@ impl NodeSelector {
             }),
         }
         candidates
+    }
+
+    fn weighted_balanced_order(&self, candidates: &mut Vec<&NodeView>, sequence: usize) {
+        let now = Instant::now();
+        if let Some(recovered) = candidates.iter().position(|node| {
+            self.recovered
+                .get(&node.node.id)
+                .is_some_and(|until| *until > now)
+        }) {
+            // Let a node that just recovered from a failure handle the next
+            // request before exploring an unmeasured node.
+            candidates.rotate_left(recovered);
+            return;
+        }
+        if let Some(unmeasured) = candidates
+            .iter()
+            .position(|node| !self.speeds.contains_key(&node.node.id))
+        {
+            // Give each node one bounded exploration request after a restart
+            // or when a new node is added.  Subsequent requests use measured
+            // weighted ordering, so slow nodes do not receive equal traffic.
+            candidates.rotate_left(unmeasured);
+            return;
+        }
+        candidates.sort_by(|left, right| {
+            self.available_capacity(right)
+                .total_cmp(&self.available_capacity(left))
+                .then_with(|| left.node.priority.cmp(&right.node.priority))
+                .then_with(|| left.node.url.cmp(&right.node.url))
+        });
+        let max_capacity = candidates
+            .iter()
+            .map(|node| self.available_capacity(node))
+            .fold(0.0, f64::max)
+            .max(1.0);
+        let weights = candidates
+            .iter()
+            .map(|node| {
+                (self.available_capacity(node) / max_capacity * 100.0)
+                    .round()
+                    .max(1.0) as u64
+            })
+            .collect::<Vec<_>>();
+        let total_weight = weights.iter().copied().sum::<u64>().max(1);
+        let ticket = sequence as u64 % total_weight;
+        let mut cumulative = 0_u64;
+        let selected = weights
+            .iter()
+            .position(|weight| {
+                cumulative = cumulative.saturating_add(*weight);
+                ticket < cumulative
+            })
+            .unwrap_or(0);
+        candidates.rotate_left(selected);
     }
 
     pub(crate) fn try_acquire(&self, node_id: Uuid, max_concurrency: u16) -> Option<NodeLease> {
@@ -89,17 +205,32 @@ impl NodeSelector {
         success: bool,
     ) {
         if success {
-            self.failures.remove(&node_id);
+            if self.failures.remove(&node_id).is_some() {
+                self.recovered
+                    .insert(node_id, Instant::now() + Duration::from_secs(30));
+            }
             if bytes > 0 && elapsed.as_secs_f64() > 0.0 {
                 let sample = bytes as f64 / elapsed.as_secs_f64();
-                self.speeds
+                let window = self
+                    .speeds
                     .entry(node_id)
-                    .and_modify(|value| *value = *value * 0.7 + sample * 0.3)
-                    .or_insert(sample);
+                    .or_insert_with(|| Arc::new(Mutex::new(SpeedWindow::default())))
+                    .clone();
+                if let Ok(mut window) = window.lock() {
+                    window.record(Instant::now(), sample);
+                }
             }
             return;
         }
-        self.speeds.entry(node_id).and_modify(|value| *value *= 0.5);
+        self.recovered.remove(&node_id);
+        let window = self
+            .speeds
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(Mutex::new(SpeedWindow::default())))
+            .clone();
+        if let Ok(mut window) = window.lock() {
+            window.record(Instant::now(), 0.0);
+        }
         let mut failure = self
             .failures
             .entry(node_id)
@@ -141,7 +272,7 @@ impl NodeSelector {
         let measured = self
             .speeds
             .get(&node.node.id)
-            .map(|value| *value)
+            .and_then(|window| window.lock().ok()?.estimate(Instant::now()))
             .unwrap_or(node.metric.speed_bps.max(0) as f64);
         let active = self
             .active
@@ -248,6 +379,45 @@ mod tests {
         let medium_idle = speed_first_capacity(2_000_000.0, 0.99, 0);
         assert!(fast_idle > medium_idle);
         assert!(medium_idle > fast_busy);
+    }
+
+    #[test]
+    fn speed_window_trims_outliers_and_expires_old_samples() {
+        let now = Instant::now();
+        let mut window = SpeedWindow::default();
+        for speed in [10.0, 11.0, 9.0, 10.0, 1_000.0] {
+            window.record(now, speed);
+        }
+        let estimate = window.estimate(now).unwrap();
+        assert!(estimate < 12.0);
+        assert!(
+            window
+                .estimate(now + SPEED_WINDOW + Duration::from_millis(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn balanced_prefers_measured_capacity_after_initial_exploration() {
+        let selector = NodeSelector::new();
+        let fast = node_view(Uuid::new_v4(), 1);
+        let slow = node_view(Uuid::new_v4(), 2);
+        selector.observe(
+            fast.node.id,
+            8 * 1024 * 1024,
+            std::time::Duration::from_secs(1),
+            true,
+        );
+        selector.observe(
+            slow.node.id,
+            256 * 1024,
+            std::time::Duration::from_secs(1),
+            true,
+        );
+
+        let nodes = [fast.clone(), slow];
+        let ordered = selector.order(&nodes, 1, SchedulerPolicy::Balanced);
+        assert_eq!(ordered[0].node.id, fast.node.id);
     }
 
     #[test]

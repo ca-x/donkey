@@ -648,6 +648,60 @@ mod proxy_integration {
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             assert_eq!(state.cache.stats().await.unwrap().entries, 0);
         }
+
+        #[tokio::test]
+        async fn retries_a_digest_mismatch_from_an_alternate_node() {
+            let bytes = vec![b'd'; 2 * 1024 * 1024];
+            let corrupt = Fixture::start(FixtureBehavior::CorruptChunk, bytes.clone()).await;
+            let healthy = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.parallel_threshold = 1;
+            config.chunk_size = 256 * 1024;
+            config.chunk_concurrency = 4;
+            config.scheduler_policy = donkey::config::SchedulerPolicy::SpeedFirst;
+            let state = AppState::new(config).await.unwrap();
+            for (index, fixture) in [&corrupt, &healthy].into_iter().enumerate() {
+                state
+                    .nodes
+                    .create(NodeInput {
+                        name: format!("digest-recovery-{index}"),
+                        url: fixture.url(),
+                        registry_route_id: DOCKER_HUB_ROUTE_ID,
+                        enabled: true,
+                        priority: index as i32,
+                        max_concurrency: 4,
+                        cf_preferred: false,
+                        connect_ip: None,
+                        auth_mode: "none".into(),
+                        auth_username: None,
+                        auth_header: None,
+                        auth_secret: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert!(corrupt.get_count() > 0);
+            assert!(healthy.get_count() > 0);
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+            assert!(state.scheduler.stats().parallel_blobs >= 1);
+        }
     }
 
     mod cache {

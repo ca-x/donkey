@@ -86,6 +86,10 @@ async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> 
     let nodes = state.nodes.list().await?;
     let cache = state.cache.stats().await?;
     let traffic = state.traffic.snapshot();
+    let node_live_bps = nodes
+        .iter()
+        .map(|node| node.live_bps)
+        .fold(0_u64, u64::saturating_add);
     let scheduler = state.scheduler.stats();
     Ok(Json(Dashboard {
         healthy_nodes: nodes
@@ -98,7 +102,7 @@ async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> 
         nodes,
         registry_requests: traffic.requests,
         registry_bytes: traffic.response_bytes,
-        registry_current_bps: traffic.current_bps,
+        registry_current_bps: traffic.current_bps.max(node_live_bps),
         parallel_blobs: scheduler.parallel_blobs,
         resume_attempts: scheduler.resume_attempts,
         retry_attempts: scheduler.retry_attempts,

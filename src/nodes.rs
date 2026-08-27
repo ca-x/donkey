@@ -74,7 +74,7 @@ impl RateWindow {
         };
         let window_start = now.checked_sub(LIVE_RATE_WINDOW).unwrap_or(now);
         let started_at = first.started_at.max(window_start);
-        let seconds = now.duration_since(started_at).as_secs_f64().max(0.001);
+        let seconds = now.duration_since(started_at).as_secs_f64().max(0.25);
         let bytes = self
             .samples
             .iter()
@@ -591,6 +591,22 @@ impl NodeService {
         }
     }
 
+    /// Record bytes as they arrive from an upstream response.  This is kept
+    /// entirely in memory so the proxy hot path never waits on SQLite.
+    pub(crate) fn record_live_bytes(&self, id: Uuid, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let window = self
+            .live_rates
+            .entry(id)
+            .or_insert_with(|| Arc::new(Mutex::new(RateWindow::default())))
+            .clone();
+        if let Ok(mut window) = window.lock() {
+            window.record(Instant::now(), bytes, Duration::ZERO);
+        }
+    }
+
     fn live_rate(&self, id: Uuid) -> u64 {
         self.live_rates
             .get(&id)
@@ -893,6 +909,29 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.max_concurrency, 8);
+    }
+
+    #[tokio::test]
+    async fn live_bytes_are_visible_before_a_transfer_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = db::connect(&config.database_url).await.unwrap();
+        let service = NodeService::new(Arc::new(config), db).unwrap();
+        let node = service
+            .create(plain_node_input(DOCKER_HUB_ROUTE_ID))
+            .await
+            .unwrap();
+
+        service.record_live_bytes(node.node.id, 2 * 1024 * 1024);
+        let current = service
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.node.id == node.node.id)
+            .unwrap()
+            .live_bps;
+        assert!(current > 0);
     }
 
     #[tokio::test]

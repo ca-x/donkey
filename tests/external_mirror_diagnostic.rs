@@ -21,29 +21,111 @@ const MULTI_SOURCE: &[&str] = &[
     "https://docker.m.daocloud.io/",
     "https://docker.xuanyuan.run/",
 ];
+const ALL_SOURCE: &[&str] = &[
+    "https://docker.1ms.run/",
+    "https://docker.1panel.live/",
+    "https://docker.m.daocloud.io/",
+    "https://docker.xuanyuan.run/",
+];
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json";
 
 struct ProbeResult {
     digest: String,
     bytes: usize,
     elapsed: Duration,
+    node_metrics: Vec<(String, u64, u64)>,
+    parallel_blobs: u64,
+    retries: u64,
+    chunk_size: u64,
 }
 
 #[tokio::test]
 #[ignore = "manual external mirror diagnostic; regional network access is not CI-stable"]
 async fn compare_single_1ms_with_multi_source_donkey() {
-    let baseline = probe(BASELINE).await;
-    let multi = probe(MULTI_SOURCE).await;
+    let baseline = probe("redis", "latest", BASELINE).await;
+    let multi = probe("redis", "latest", MULTI_SOURCE).await;
 
     eprintln!(
-        "redis:latest largest layer\nbaseline: digest={} bytes={} elapsed={:?}\nmulti:    digest={} bytes={} elapsed={:?}",
-        baseline.digest, baseline.bytes, baseline.elapsed, multi.digest, multi.bytes, multi.elapsed
+        "redis:latest largest layer\nbaseline: digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}\nmulti:    digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
+        baseline.digest,
+        baseline.bytes,
+        baseline.elapsed,
+        baseline.node_metrics,
+        baseline.parallel_blobs,
+        baseline.retries,
+        baseline.chunk_size,
+        multi.digest,
+        multi.bytes,
+        multi.elapsed,
+        multi.node_metrics,
+        multi.parallel_blobs,
+        multi.retries,
+        multi.chunk_size
     );
     assert_eq!(baseline.digest, multi.digest);
     assert_eq!(baseline.bytes, multi.bytes);
 }
 
-async fn probe(endpoints: &[&str]) -> ProbeResult {
+#[tokio::test]
+#[ignore = "manual external mirror diagnostic; regional network access is not CI-stable"]
+async fn compare_golang_single_1ms_with_multi_source_donkey() {
+    let baseline = probe("golang", "latest", BASELINE).await;
+    let multi = probe("golang", "latest", MULTI_SOURCE).await;
+
+    eprintln!(
+        "golang:latest largest layer\nbaseline: digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}\nmulti:    digest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
+        baseline.digest,
+        baseline.bytes,
+        baseline.elapsed,
+        baseline.node_metrics,
+        baseline.parallel_blobs,
+        baseline.retries,
+        baseline.chunk_size,
+        multi.digest,
+        multi.bytes,
+        multi.elapsed,
+        multi.node_metrics,
+        multi.parallel_blobs,
+        multi.retries,
+        multi.chunk_size
+    );
+    assert_eq!(baseline.digest, multi.digest);
+    assert_eq!(baseline.bytes, multi.bytes);
+}
+
+#[tokio::test]
+#[ignore = "manual external mirror diagnostic; regional network access is not CI-stable"]
+async fn probe_golang_multi_source_donkey() {
+    let multi = probe("golang", "latest", MULTI_SOURCE).await;
+    eprintln!(
+        "golang:latest multi-source largest layer\ndigest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
+        multi.digest,
+        multi.bytes,
+        multi.elapsed,
+        multi.node_metrics,
+        multi.parallel_blobs,
+        multi.retries,
+        multi.chunk_size
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual external mirror diagnostic; regional network access is not CI-stable"]
+async fn probe_golang_all_configured_sources_donkey() {
+    let multi = probe("golang", "latest", ALL_SOURCE).await;
+    eprintln!(
+        "golang:latest all-source largest layer\ndigest={} bytes={} elapsed={:?} nodes={:?} parallel={} retries={} chunk={}",
+        multi.digest,
+        multi.bytes,
+        multi.elapsed,
+        multi.node_metrics,
+        multi.parallel_blobs,
+        multi.retries,
+        multi.chunk_size
+    );
+}
+
+async fn probe(repository: &str, reference: &str, endpoints: &[&str]) -> ProbeResult {
     let directory = tempfile::tempdir().unwrap();
     let mut config = Config::for_test(directory.path().to_owned());
     config.chunk_size = 2 * 1024 * 1024;
@@ -72,8 +154,8 @@ async fn probe(endpoints: &[&str]) -> ProbeResult {
             .await
             .unwrap();
     }
-    let router = registry_router(state);
-    let index = manifest(router.clone(), "latest").await;
+    let router = registry_router(state.clone());
+    let index = manifest(router.clone(), repository, reference).await;
     let manifest = if let Some(manifests) = index.get("manifests").and_then(Value::as_array) {
         let descriptor = manifests
             .iter()
@@ -87,6 +169,7 @@ async fn probe(endpoints: &[&str]) -> ProbeResult {
             .expect("linux/amd64 descriptor");
         manifest(
             router.clone(),
+            repository,
             descriptor["digest"].as_str().expect("manifest digest"),
         )
         .await
@@ -105,28 +188,67 @@ async fn probe(endpoints: &[&str]) -> ProbeResult {
     let response = request(
         router,
         Method::GET,
-        &format!("/v2/library/redis/blobs/{digest}"),
+        &format!("/v2/library/{repository}/blobs/{digest}"),
         None,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!(
+                "Blob body failed: {error}; nodes={:?}",
+                state
+                    .nodes
+                    .list()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|node| {
+                        (
+                            node.node.name,
+                            node.metric.speed_bps,
+                            node.metric.total_bytes,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            );
+            panic!("Blob body failed: {error}");
+        }
+    };
     let elapsed = started.elapsed();
     assert_eq!(body.len(), expected);
+    let node_metrics = state
+        .nodes
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|node| {
+            (
+                node.node.name,
+                node.metric.speed_bps.max(0) as u64,
+                node.metric.total_bytes.max(0) as u64,
+            )
+        })
+        .collect();
+    let scheduler = state.scheduler.stats();
     ProbeResult {
         digest,
         bytes: body.len(),
         elapsed,
+        node_metrics,
+        parallel_blobs: scheduler.parallel_blobs,
+        retries: scheduler.retry_attempts,
+        chunk_size: scheduler.last_chunk_size,
     }
 }
 
-async fn manifest(router: Router, reference: &str) -> Value {
+async fn manifest(router: Router, repository: &str, reference: &str) -> Value {
     let response = request(
         router,
         Method::GET,
-        &format!("/v2/library/redis/manifests/{reference}"),
+        &format!("/v2/library/{repository}/manifests/{reference}"),
         Some(MANIFEST_ACCEPT),
     )
     .await;

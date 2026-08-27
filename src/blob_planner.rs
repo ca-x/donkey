@@ -52,6 +52,9 @@ pub struct PlannerConfig {
     pub max_chunk_size: u64,
     pub min_parallel_benefit: f64,
     pub max_concurrent_chunks: usize,
+    /// Test and explicitly forced low-threshold mode may parallelize before
+    /// measurements exist. Production configuration keeps this false.
+    pub allow_unmeasured_parallel: bool,
 }
 
 impl Default for PlannerConfig {
@@ -63,6 +66,7 @@ impl Default for PlannerConfig {
             max_chunk_size: 8 * MIB,
             min_parallel_benefit: 1.2,
             max_concurrent_chunks: 16,
+            allow_unmeasured_parallel: false,
         }
     }
 }
@@ -149,11 +153,16 @@ impl BlobPlanner {
         let chunk_size = self.chunk_size(blob.size, requested_concurrency);
         let num_chunks = blob.size.div_ceil(chunk_size) as usize;
         let benefit = estimated_benefit(blob.size, best_single, &range_nodes, chunk_size);
-        // Before throughput is observed, capability-based parallelism is the
-        // only evidence available.  Once every selected node has a sample,
-        // require a measured margin so parallelism does not add needless
-        // requests on equally fast sources.
-        if benefit.is_some_and(|value| value < self.config.min_parallel_benefit) {
+        // A multi-node plan without throughput observations is deliberately
+        // conservative: one full request teaches the scheduler the real
+        // bandwidth without spending the Blob on speculative ranges.  A
+        // single Range-capable node may still use its configured connection
+        // capacity because that does not duplicate the source across nodes.
+        if range_nodes.len() > 1
+            && !self.config.allow_unmeasured_parallel
+            && (benefit.is_none()
+                || benefit.is_some_and(|value| value < self.config.min_parallel_benefit))
+        {
             return Ok(single_plan(best_single));
         }
 
@@ -268,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_throughput_still_allows_capability_based_parallelism_for_large_blobs() {
+    fn unknown_multi_node_throughput_uses_a_conservative_single_request() {
         let blob = BlobMeta {
             digest: "sha256:abc".into(),
             size: 32 * 1024 * 1024,
@@ -280,7 +289,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             plan.strategy,
-            DownloadStrategy::MultiSourceChunked { .. }
+            DownloadStrategy::SingleRequest { .. }
         ));
     }
 

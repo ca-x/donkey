@@ -93,6 +93,7 @@ struct DetectedCapabilities {
     media_type: String,
     nodes: Vec<NodeView>,
     range_nodes: Vec<NodeView>,
+    fallback_nodes: Vec<NodeView>,
 }
 
 #[derive(Clone, Debug)]
@@ -306,6 +307,7 @@ impl Scheduler {
         let planner = BlobPlanner::new(PlannerConfig {
             small_blob_threshold: runtime.parallel_threshold,
             max_concurrent_chunks: effective_concurrency(runtime, node_capacity.max(1)),
+            allow_unmeasured_parallel: runtime.parallel_threshold < 1024 * 1024,
             min_chunk_size: if runtime.adaptive_chunking_enabled {
                 PlannerConfig::default().min_chunk_size
             } else {
@@ -386,8 +388,14 @@ impl Scheduler {
                     "parallel fetch failed; falling back to one upstream"
                 );
                 let _ = tokio::fs::remove_file(&merged).await;
-                self.download_whole(&detected.nodes, request_path, request_headers, &merged)
-                    .await?;
+                self.download_whole(
+                    &detected.fallback_nodes,
+                    request_path,
+                    request_headers,
+                    &merged,
+                    Some(detected.size),
+                )
+                .await?;
             }
         } else if !detected.range_nodes.is_empty()
             && detected.size >= runtime.resumable_threshold
@@ -404,16 +412,53 @@ impl Scheduler {
             )
             .await?;
         } else {
-            self.download_whole(&detected.nodes, request_path, request_headers, &merged)
-                .await?;
+            self.download_whole(
+                &detected.fallback_nodes,
+                request_path,
+                request_headers,
+                &merged,
+                Some(detected.size),
+            )
+            .await?;
         }
 
         let actual_size = tokio::fs::metadata(&merged).await?.len();
         if detected.size > 0 && actual_size != detected.size {
-            return Err(AppError::Integrity);
+            if let Some(digest) = expected_digest
+                && detected.fallback_nodes.len() > 1
+            {
+                self.recover_verified_blob(
+                    &detected.fallback_nodes,
+                    request_path,
+                    request_headers,
+                    &merged,
+                    digest,
+                    Some(detected.size),
+                )
+                .await?;
+            } else {
+                return Err(AppError::Integrity);
+            }
         }
-        if let Some(digest) = expected_digest {
-            verify_file(&merged, digest).await?;
+        if let Some(digest) = expected_digest
+            && let Err(error) = verify_file(&merged, digest).await
+        {
+            if detected.fallback_nodes.len() < 2 {
+                return Err(error);
+            }
+            tracing::warn!(
+                path = request_path,
+                "Blob Digest mismatch after transfer; retrying from alternate nodes"
+            );
+            self.recover_verified_blob(
+                &detected.fallback_nodes,
+                request_path,
+                request_headers,
+                &merged,
+                digest,
+                Some(detected.size),
+            )
+            .await?;
         }
 
         let result = self
@@ -477,7 +522,13 @@ impl Scheduler {
                     {
                         return Err(AppError::Integrity);
                     }
-                    append_response_to_file(response, destination, total_size - offset).await
+                    append_response_to_file(
+                        response,
+                        destination,
+                        total_size - offset,
+                        Some((&self.nodes, node.node.id)),
+                    )
+                    .await
                 }
                 .await;
                 let bytes = tokio::fs::metadata(destination)
@@ -579,9 +630,9 @@ impl Scheduler {
                 .await;
             match result {
                 Ok(value) => {
-                    let compatible_with_baseline = baseline.as_ref().is_none_or(|previous| {
-                        previous.size == value.size && previous.media_type == value.media_type
-                    });
+                    let compatible_with_baseline = baseline
+                        .as_ref()
+                        .is_none_or(|previous| previous.size == value.size);
                     if compatible_with_baseline {
                         if baseline.is_none() {
                             baseline = Some(value.clone());
@@ -601,12 +652,13 @@ impl Scheduler {
                 .filter(|(_, capabilities)| capabilities.supports_range)
                 .map(|(node, _)| node.clone())
                 .collect();
-            let nodes = compatible.into_iter().map(|(node, _)| node).collect();
+            let compatible_nodes = compatible.into_iter().map(|(node, _)| node).collect();
             return Ok(DetectedCapabilities {
                 size: baseline.size,
                 media_type: baseline.media_type,
-                nodes,
+                nodes: compatible_nodes,
                 range_nodes,
+                fallback_nodes: nodes.to_vec(),
             });
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("capability detection failed".into())))
@@ -732,9 +784,21 @@ impl Scheduler {
                         return Err(AppError::Integrity);
                     }
                     if existing > 0 {
-                        append_response_to_file(response, destination, expected).await
+                        append_response_to_file(
+                            response,
+                            destination,
+                            expected,
+                            Some((&self.nodes, node.node.id)),
+                        )
+                        .await
                     } else {
-                        stream_response_to_file(response, destination, Some(expected)).await
+                        stream_response_to_file(
+                            response,
+                            destination,
+                            Some(expected),
+                            Some((&self.nodes, node.node.id)),
+                        )
+                        .await
                     }
                 }
                 .await;
@@ -782,6 +846,7 @@ impl Scheduler {
         request_path: &str,
         request_headers: &HeaderMap,
         destination: &Path,
+        total_size: Option<u64>,
     ) -> ApiResult<()> {
         let mut last_error = None;
         let policy = self.runtime.read().await.scheduler_policy;
@@ -795,7 +860,18 @@ impl Scheduler {
                 attempted = true;
                 let lease = self.acquire(node.node.id, node.max_concurrency).await;
                 let started = Instant::now();
+                let existing = if let Some(total) = total_size.filter(|total| *total > 0) {
+                    tokio::fs::metadata(destination)
+                        .await
+                        .ok()
+                        .and_then(|metadata| (metadata.len() < total).then_some(metadata.len()))
+                } else {
+                    None
+                };
                 let result = async {
+                    let range = existing.and_then(|offset| {
+                        total_size.and_then(|total| total.checked_sub(1).map(|end| (offset, end)))
+                    });
                     let response = self
                         .upstream
                         .send(
@@ -803,7 +879,9 @@ impl Scheduler {
                             http::Method::GET,
                             request_path,
                             request_headers,
-                            RangeMode::Suppress,
+                            range.map_or(RangeMode::Suppress, |(start, end)| {
+                                RangeMode::Exact(start, end)
+                            }),
                         )
                         .await?;
                     if !response.status().is_success() {
@@ -813,13 +891,40 @@ impl Scheduler {
                             response.status()
                         )));
                     }
-                    let length = response.content_length();
-                    stream_response_to_file(response, destination, length).await
+                    if let Some(start) = existing {
+                        let Some(total) = total_size else {
+                            return Err(AppError::Integrity);
+                        };
+                        let Some(end) = total.checked_sub(1) else {
+                            return Err(AppError::Integrity);
+                        };
+                        if response.status() != StatusCode::PARTIAL_CONTENT
+                            || !content_range_matches(response.headers(), start, end, total)
+                        {
+                            return Err(AppError::Integrity);
+                        }
+                        append_response_to_file(
+                            response,
+                            destination,
+                            end - start + 1,
+                            Some((&self.nodes, node.node.id)),
+                        )
+                        .await
+                    } else {
+                        let length = response.content_length();
+                        stream_response_to_file(
+                            response,
+                            destination,
+                            length,
+                            Some((&self.nodes, node.node.id)),
+                        )
+                        .await
+                    }
                 }
                 .await;
                 let bytes = tokio::fs::metadata(destination)
                     .await
-                    .map(|m| m.len())
+                    .map(|m| m.len().saturating_sub(existing.unwrap_or(0)))
                     .unwrap_or(0);
                 self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
                 drop(lease);
@@ -850,6 +955,48 @@ impl Scheduler {
             tokio::time::sleep(delay).await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed".into())))
+    }
+
+    async fn recover_verified_blob(
+        &self,
+        nodes: &[NodeView],
+        request_path: &str,
+        request_headers: &HeaderMap,
+        destination: &Path,
+        expected_digest: &str,
+        total_size: Option<u64>,
+    ) -> ApiResult<()> {
+        let policy = self.runtime.read().await.scheduler_policy;
+        let mut last_error = None;
+        for node in self.ordered_nodes(nodes, 0, policy) {
+            let started = Instant::now();
+            let result = match self
+                .download_whole(
+                    std::slice::from_ref(node),
+                    request_path,
+                    request_headers,
+                    destination,
+                    total_size,
+                )
+                .await
+            {
+                Ok(()) => verify_file(destination, expected_digest).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    self.observe_node(node.node.id, 0, started.elapsed(), false);
+                    self.nodes
+                        .record_transfer(node.node.id, 0, started.elapsed(), false)
+                        .await;
+                    let _ = tokio::fs::remove_file(destination).await;
+                    self.record_retry();
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or(AppError::Integrity))
     }
 
     fn ordered_nodes<'a>(
@@ -1033,6 +1180,7 @@ async fn stream_response_to_file(
     response: reqwest::Response,
     destination: &Path,
     expected: Option<u64>,
+    live: Option<(&NodeService, Uuid)>,
 ) -> ApiResult<()> {
     let mut file = File::create(destination).await?;
     let mut received = 0_u64;
@@ -1044,6 +1192,9 @@ async fn stream_response_to_file(
             && received > expected
         {
             return Err(AppError::Integrity);
+        }
+        if let Some((nodes, node_id)) = live {
+            nodes.record_live_bytes(node_id, chunk.len() as u64);
         }
         file.write_all(&chunk).await?;
     }
@@ -1058,6 +1209,7 @@ async fn append_response_to_file(
     response: reqwest::Response,
     destination: &Path,
     expected: u64,
+    live: Option<(&NodeService, Uuid)>,
 ) -> ApiResult<()> {
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
@@ -1070,6 +1222,9 @@ async fn append_response_to_file(
         received = received.saturating_add(chunk.len() as u64);
         if received > expected {
             return Err(AppError::Integrity);
+        }
+        if let Some((nodes, node_id)) = live {
+            nodes.record_live_bytes(node_id, chunk.len() as u64);
         }
         file.write_all(&chunk).await?;
     }

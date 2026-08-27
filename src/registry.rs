@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use http_content_range::ContentRange;
 use sha2::{Digest, Sha256};
@@ -560,6 +560,7 @@ async fn relay_stream_blob(
                     if complete_blob {
                         hasher.update(&chunk);
                     }
+                    node_service.record_live_bytes(nodes[current_node].node.id, chunk.len() as u64);
                     file.write_all(&chunk).await?;
                     offset += chunk.len() as u64;
                     transferred += chunk.len() as u64;
@@ -821,14 +822,22 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
                 {
                     return Err(AppError::Integrity);
                 }
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|error| AppError::Upstream(error.to_string()))?;
+                let mut body = response.bytes_stream();
+                let mut bytes = BytesMut::with_capacity(expected as usize);
+                while let Some(chunk) = body.next().await {
+                    let chunk = chunk.map_err(|error| AppError::Upstream(error.to_string()))?;
+                    if bytes.len().saturating_add(chunk.len()) as u64 > expected {
+                        return Err(AppError::Integrity);
+                    }
+                    request
+                        .node_service
+                        .record_live_bytes(node.node.id, chunk.len() as u64);
+                    bytes.extend_from_slice(&chunk);
+                }
                 if bytes.len() as u64 != expected {
                     return Err(AppError::Integrity);
                 }
-                Ok(bytes)
+                Ok(bytes.freeze())
             }
             .await;
             drop(permit);
