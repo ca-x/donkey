@@ -117,6 +117,59 @@ pub struct JobInput {
     pub output_format: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ImageJobView {
+    pub id: Uuid,
+    pub kind: String,
+    pub status: String,
+    pub source_ref: String,
+    pub source_node_id: Option<Uuid>,
+    pub source_credential_id: Option<Uuid>,
+    pub destination_ref: Option<String>,
+    pub destination_credential_id: Option<Uuid>,
+    pub platform_os: String,
+    pub platform_arch: String,
+    pub output_format: Option<String>,
+    pub resolved_digest: Option<String>,
+    pub index_digest: Option<String>,
+    pub stage: String,
+    pub progress_bytes: i64,
+    pub total_bytes: i64,
+    pub artifact_name: Option<String>,
+    pub error: Option<String>,
+    pub cancel_requested: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<image_job::Model> for ImageJobView {
+    fn from(job: image_job::Model) -> Self {
+        Self {
+            id: job.id,
+            kind: job.kind,
+            status: job.status,
+            source_ref: job.source_ref,
+            source_node_id: job.source_node_id,
+            source_credential_id: job.source_credential_id,
+            destination_ref: job.destination_ref,
+            destination_credential_id: job.destination_credential_id,
+            platform_os: job.platform_os,
+            platform_arch: job.platform_arch,
+            output_format: job.output_format,
+            resolved_digest: job.resolved_digest,
+            index_digest: job.index_digest,
+            stage: job.stage,
+            progress_bytes: job.progress_bytes,
+            total_bytes: job.total_bytes,
+            artifact_name: job.artifact_name,
+            error: job.error,
+            cancel_requested: job.cancel_requested,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct SyncRuleInput {
     pub name: String,
@@ -1695,13 +1748,16 @@ async fn delete_credential(
 async fn list_jobs(
     State(service): State<ImageTools>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<Json<Vec<image_job::Model>>> {
+) -> ApiResult<Json<Vec<ImageJobView>>> {
     Ok(Json(
         image_job::Entity::find()
             .order_by_desc(image_job::Column::CreatedAt)
             .limit(query.limit.min(500))
             .all(&service.db)
-            .await?,
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
     ))
 }
 
@@ -1709,26 +1765,27 @@ async fn create_job(
     State(service): State<ImageTools>,
     headers: HeaderMap,
     Json(input): Json<JobInput>,
-) -> ApiResult<(StatusCode, Json<image_job::Model>)> {
+) -> ApiResult<(StatusCode, Json<ImageJobView>)> {
     let key = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     Ok((
         StatusCode::CREATED,
-        Json(service.create_job(input, key).await?),
+        Json(service.create_job(input, key).await?.into()),
     ))
 }
 
 async fn get_job(
     State(service): State<ImageTools>,
     AxumPath(id): AxumPath<Uuid>,
-) -> ApiResult<Json<image_job::Model>> {
+) -> ApiResult<Json<ImageJobView>> {
     Ok(Json(
         image_job::Entity::find_by_id(id)
             .one(&service.db)
             .await?
-            .ok_or_else(|| AppError::not_found("image job"))?,
+            .ok_or_else(|| AppError::not_found("image job"))?
+            .into(),
     ))
 }
 
@@ -1817,7 +1874,7 @@ async fn cancel_job_from_status(
 async fn retry_job(
     State(service): State<ImageTools>,
     AxumPath(id): AxumPath<Uuid>,
-) -> ApiResult<Json<image_job::Model>> {
+) -> ApiResult<Json<ImageJobView>> {
     let model = image_job::Entity::find_by_id(id)
         .one(&service.db)
         .await?
@@ -1846,7 +1903,7 @@ async fn retry_job(
         .await?
         .ok_or_else(|| AppError::not_found("image job"))?;
     service.wake.notify_one();
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 async fn download_artifact(
@@ -1998,12 +2055,12 @@ async fn delete_rule(
 async fn run_rule(
     State(service): State<ImageTools>,
     AxumPath(id): AxumPath<Uuid>,
-) -> ApiResult<(StatusCode, Json<image_job::Model>)> {
+) -> ApiResult<(StatusCode, Json<ImageJobView>)> {
     let job = service
         .create_rule_job(id, None, "manual")
         .await?
         .ok_or_else(|| AppError::not_found("sync rule"))?;
-    Ok((StatusCode::CREATED, Json(job)))
+    Ok((StatusCode::CREATED, Json(job.into())))
 }
 
 impl ImageTools {
@@ -3151,9 +3208,14 @@ mod tests {
                 assert_eq!(stored.stage, "queued");
                 assert!(!stored.cancel_requested);
                 assert!(stored.error.is_none());
-                assert!(stored.started_at.is_none());
-                assert!(stored.finished_at.is_none());
-                assert!(stored.lease_until.is_none());
+                let persisted = image_job::Entity::find_by_id(job.id)
+                    .one(&service.db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(persisted.started_at.is_none());
+                assert!(persisted.finished_at.is_none());
+                assert!(persisted.lease_until.is_none());
             } else {
                 assert!(matches!(result, Err(AppError::BadRequest(_))));
             }
