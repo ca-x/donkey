@@ -978,6 +978,34 @@ pub async fn list_cache_entries(
         .await
 }
 
+pub async fn cache_eviction_candidates(
+    db: &DatabaseConnection,
+    policy: &str,
+    limit: u64,
+) -> Result<Vec<cache_entry::Model>, DbErr> {
+    let query = cache_entry::Entity::find();
+    let query = match policy {
+        "lfu" => query
+            .order_by_asc(cache_entry::Column::HitCount)
+            .order_by_asc(cache_entry::Column::LastAccessedAt),
+        _ => query.order_by_asc(cache_entry::Column::LastAccessedAt),
+    };
+    query.limit(limit.clamp(1, 1024)).all(db).await
+}
+
+pub async fn expired_cache_candidates(
+    db: &DatabaseConnection,
+    cutoff: DateTime<Utc>,
+    limit: u64,
+) -> Result<Vec<cache_entry::Model>, DbErr> {
+    cache_entry::Entity::find()
+        .filter(cache_entry::Column::LastAccessedAt.lt(cutoff))
+        .order_by_asc(cache_entry::Column::LastAccessedAt)
+        .limit(limit.clamp(1, 1024))
+        .all(db)
+        .await
+}
+
 pub async fn all_cache_entries(db: &DatabaseConnection) -> Result<Vec<cache_entry::Model>, DbErr> {
     cache_entry::Entity::find()
         .order_by_asc(cache_entry::Column::LastAccessedAt)

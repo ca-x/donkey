@@ -353,17 +353,24 @@ impl CacheStore {
             return Ok(0);
         };
         let cutoff = Utc::now() - chrono::Duration::from_std(ttl).map_err(AppError::internal)?;
-        let entries = db::all_cache_entries(&self.db).await?;
         let mut freed = 0_u64;
-        for entry in entries
-            .into_iter()
-            .filter(|entry| entry.last_accessed_at < cutoff)
-        {
-            if self.active_flights.contains_key(&entry.key) {
-                continue;
+        loop {
+            let entries = db::expired_cache_candidates(&self.db, cutoff, 512).await?;
+            if entries.is_empty() {
+                break;
             }
-            self.remove(&entry.key).await?;
-            freed = freed.saturating_add(entry.size_bytes.max(0) as u64);
+            let mut removed = false;
+            for entry in entries {
+                if self.active_flights.contains_key(&entry.key) {
+                    continue;
+                }
+                self.remove(&entry.key).await?;
+                freed = freed.saturating_add(entry.size_bytes.max(0) as u64);
+                removed = true;
+            }
+            if !removed {
+                break;
+            }
         }
         Ok(freed)
     }
@@ -375,11 +382,7 @@ impl CacheStore {
                 "object exceeds the configured cache capacity",
             ));
         }
-        let mut entries = db::all_cache_entries(&self.db).await?;
-        let current = entries
-            .iter()
-            .map(|entry| entry.size_bytes.max(0) as u64)
-            .sum::<u64>();
+        let current = db::cache_aggregate(&self.db).await?.bytes;
         let high = (runtime.max_cache_bytes as f64 * runtime.cache_high_watermark) as u64;
         if current.saturating_add(incoming) <= high {
             return Ok(());
@@ -389,23 +392,35 @@ impl CacheStore {
         let need_to_free = current
             .saturating_add(incoming)
             .saturating_sub(target_after_admission);
-        let now = Utc::now();
-        entries.sort_by(|a, b| {
-            retention_score(a, now, runtime.cache_policy).total_cmp(&retention_score(
-                b,
-                now,
-                runtime.cache_policy,
-            ))
-        });
         let mut freed = 0_u64;
-        for entry in entries {
-            if entry.key == protected_key || self.active_flights.contains_key(&entry.key) {
-                continue;
+        let policy = runtime.cache_policy.to_string();
+        while freed < need_to_free {
+            let mut entries = db::cache_eviction_candidates(&self.db, &policy, 512).await?;
+            if entries.is_empty() {
+                break;
             }
-            let size = entry.size_bytes.max(0) as u64;
-            self.remove(&entry.key).await?;
-            freed = freed.saturating_add(size);
-            if freed >= need_to_free {
+            let now = Utc::now();
+            entries.sort_by(|a, b| {
+                retention_score(a, now, runtime.cache_policy).total_cmp(&retention_score(
+                    b,
+                    now,
+                    runtime.cache_policy,
+                ))
+            });
+            let mut removed = false;
+            for entry in entries {
+                if entry.key == protected_key || self.active_flights.contains_key(&entry.key) {
+                    continue;
+                }
+                let size = entry.size_bytes.max(0) as u64;
+                self.remove(&entry.key).await?;
+                freed = freed.saturating_add(size);
+                removed = true;
+                if freed >= need_to_free {
+                    break;
+                }
+            }
+            if !removed {
                 break;
             }
         }
