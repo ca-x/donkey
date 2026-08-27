@@ -315,11 +315,10 @@ async fn update_runtime(
     Json(input): Json<RuntimeSettingsInput>,
 ) -> ApiResult<Json<RuntimeConfig>> {
     persist_runtime(&state, &input).await?;
+    let effective = effective_config(&state).await?;
+    state.scheduler.update_runtime(&effective).await;
     let cache = state.cache.stats().await?;
-    Ok(Json(runtime_config(
-        &effective_config(&state).await?,
-        cache,
-    )))
+    Ok(Json(runtime_config(&effective, cache)))
 }
 
 async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeSettingsExport>> {
@@ -458,11 +457,10 @@ async fn import_runtime(
     if let Some(settings) = export.settings.as_ref() {
         persist_runtime(&state, settings).await?;
     }
+    let effective = effective_config(&state).await?;
+    state.scheduler.update_runtime(&effective).await;
     let cache = state.cache.stats().await?;
-    Ok(Json(runtime_config(
-        &effective_config(&state).await?,
-        cache,
-    )))
+    Ok(Json(runtime_config(&effective, cache)))
 }
 
 async fn validate_import_snapshot(

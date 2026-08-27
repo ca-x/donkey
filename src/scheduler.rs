@@ -17,18 +17,28 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt},
+    sync::RwLock,
 };
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct Scheduler {
-    config: Arc<Config>,
+    runtime: Arc<RwLock<SchedulerRuntimeConfig>>,
     nodes: NodeService,
     cache: CacheStore,
     upstream: UpstreamService,
     runtime_speeds: Arc<DashMap<Uuid, f64>>,
     active_chunks: Arc<DashMap<Uuid, usize>>,
     capabilities: Cache<String, BlobCapabilities>,
+}
+
+#[derive(Clone, Copy)]
+struct SchedulerRuntimeConfig {
+    chunk_size: u64,
+    parallel_threshold: u64,
+    resumable_threshold: u64,
+    chunk_concurrency: usize,
+    scheduler_policy: SchedulerPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +56,16 @@ struct Chunk {
     total_size: u64,
 }
 
+struct ParallelDownloadRequest<'a> {
+    nodes: &'a [NodeView],
+    request_path: &'a str,
+    request_headers: &'a HeaderMap,
+    total_size: u64,
+    temp_dir: &'a Path,
+    merged: &'a Path,
+    runtime: SchedulerRuntimeConfig,
+}
+
 impl Scheduler {
     pub fn new(
         config: Arc<Config>,
@@ -54,7 +74,13 @@ impl Scheduler {
         upstream: UpstreamService,
     ) -> Self {
         Self {
-            config,
+            runtime: Arc::new(RwLock::new(SchedulerRuntimeConfig {
+                chunk_size: config.chunk_size,
+                parallel_threshold: config.parallel_threshold,
+                resumable_threshold: config.resumable_threshold,
+                chunk_concurrency: config.chunk_concurrency,
+                scheduler_policy: config.scheduler_policy,
+            })),
             nodes,
             cache,
             upstream,
@@ -65,6 +91,15 @@ impl Scheduler {
                 .time_to_live(std::time::Duration::from_secs(600))
                 .build(),
         }
+    }
+
+    pub async fn update_runtime(&self, config: &Config) {
+        let mut runtime = self.runtime.write().await;
+        runtime.chunk_size = config.chunk_size;
+        runtime.parallel_threshold = config.parallel_threshold;
+        runtime.resumable_threshold = config.resumable_threshold;
+        runtime.chunk_concurrency = config.chunk_concurrency;
+        runtime.scheduler_policy = config.scheduler_policy;
     }
 
     pub async fn fetch_blob(
@@ -108,6 +143,7 @@ impl Scheduler {
         expected_digest: Option<&str>,
         nodes: &[NodeView],
     ) -> ApiResult<CachedObject> {
+        let runtime = *self.runtime.read().await;
         let capability_key = format!("{}:{}", nodes[0].node.url, request_path);
         let capabilities = if let Some(value) = self.capabilities.get(&capability_key).await {
             value
@@ -125,26 +161,27 @@ impl Scheduler {
         tokio::fs::create_dir_all(&partial_dir).await?;
         let merged = partial_dir.join("object.partial");
         let can_parallel = capabilities.supports_range
-            && capabilities.size >= self.config.parallel_threshold
+            && capabilities.size >= runtime.parallel_threshold
             && nodes.len() > 1;
 
         if can_parallel {
             tracing::info!(
                 path = request_path,
                 size = capabilities.size,
-                chunks = chunks(capabilities.size, self.config.chunk_size).len(),
+                chunks = chunks(capabilities.size, runtime.chunk_size).len(),
                 nodes = nodes.len(),
                 "starting parallel Blob fetch"
             );
             if let Err(error) = self
-                .download_parallel(
+                .download_parallel(ParallelDownloadRequest {
                     nodes,
                     request_path,
                     request_headers,
-                    capabilities.size,
-                    &partial_dir,
-                    &merged,
-                )
+                    total_size: capabilities.size,
+                    temp_dir: &partial_dir,
+                    merged: &merged,
+                    runtime,
+                })
                 .await
             {
                 tracing::warn!(
@@ -157,7 +194,7 @@ impl Scheduler {
                     .await?;
             }
         } else if capabilities.supports_range
-            && capabilities.size >= self.config.resumable_threshold
+            && capabilities.size >= runtime.resumable_threshold
             && tokio::fs::metadata(&merged)
                 .await
                 .is_ok_and(|metadata| metadata.len() > 0 && metadata.len() < capabilities.size)
@@ -208,7 +245,8 @@ impl Scheduler {
     ) -> ApiResult<()> {
         let mut last_error = None;
         let mut attempted = false;
-        for node in self.ordered_nodes(nodes, 0) {
+        let policy = self.runtime.read().await.scheduler_policy;
+        for node in self.ordered_nodes(nodes, 0, policy) {
             let offset = tokio::fs::metadata(destination).await?.len();
             if offset >= total_size {
                 return Ok(());
@@ -348,33 +386,24 @@ impl Scheduler {
         Err(last_error.unwrap_or_else(|| AppError::Upstream("capability detection failed".into())))
     }
 
-    async fn download_parallel(
-        &self,
-        nodes: &[NodeView],
-        request_path: &str,
-        request_headers: &HeaderMap,
-        total_size: u64,
-        temp_dir: &Path,
-        merged: &Path,
-    ) -> ApiResult<()> {
-        let chunks = chunks(total_size, self.config.chunk_size);
-        let node_capacity = nodes
+    async fn download_parallel(&self, request: ParallelDownloadRequest<'_>) -> ApiResult<()> {
+        let chunks = chunks(request.total_size, request.runtime.chunk_size);
+        let node_capacity = request
+            .nodes
             .iter()
             .map(|node| usize::from(node.max_concurrency))
             .sum::<usize>();
-        let concurrency = self
-            .config
-            .chunk_concurrency
+        let concurrency = request.runtime.chunk_concurrency
             .min(node_capacity.max(1))
             .min(chunks.len())
             .max(1);
         let results = stream::iter(chunks.clone())
             .map(|chunk| {
                 let scheduler = self.clone();
-                let nodes = nodes.to_vec();
-                let request_path = request_path.to_owned();
-                let request_headers = request_headers.clone();
-                let part_path = temp_dir.join(format!("{:08}.part", chunk.index));
+                let nodes = request.nodes.to_vec();
+                let request_path = request.request_path.to_owned();
+                let request_headers = request.request_headers.clone();
+                let part_path = request.temp_dir.join(format!("{:08}.part", chunk.index));
                 async move {
                     if tokio::fs::metadata(&part_path)
                         .await
@@ -383,7 +412,14 @@ impl Scheduler {
                         return Ok((chunk.index, part_path));
                     }
                     scheduler
-                        .download_chunk(&nodes, &request_path, &request_headers, &chunk, &part_path)
+                        .download_chunk(
+                            &nodes,
+                            &request_path,
+                            &request_headers,
+                            &chunk,
+                            &part_path,
+                            request.runtime.scheduler_policy,
+                        )
                         .await
                         .map(|_| (chunk.index, part_path))
                 }
@@ -397,7 +433,7 @@ impl Scheduler {
             let (index, path) = result?;
             ordered[index] = Some(path);
         }
-        let mut output = File::create(merged).await?;
+        let mut output = File::create(request.merged).await?;
         for path in ordered {
             let path = path.ok_or(AppError::Integrity)?;
             let mut input = File::open(path).await?;
@@ -414,10 +450,11 @@ impl Scheduler {
         request_headers: &HeaderMap,
         chunk: &Chunk,
         destination: &Path,
+        policy: SchedulerPolicy,
     ) -> ApiResult<()> {
         let mut last_error = None;
         let mut attempted = false;
-        for node in self.ordered_nodes(nodes, chunk.index) {
+        for node in self.ordered_nodes(nodes, chunk.index, policy) {
             if self.at_capacity(node.node.id, node.max_concurrency) {
                 continue;
             }
@@ -502,6 +539,7 @@ impl Scheduler {
                 request_headers,
                 chunk,
                 destination,
+                policy,
             ))
             .await;
         }
@@ -516,7 +554,8 @@ impl Scheduler {
         destination: &Path,
     ) -> ApiResult<()> {
         let mut last_error = None;
-        for node in self.ordered_nodes(nodes, 0) {
+        let policy = self.runtime.read().await.scheduler_policy;
+        for node in self.ordered_nodes(nodes, 0, policy) {
             if self.at_capacity(node.node.id, node.max_concurrency) {
                 continue;
             }
@@ -569,9 +608,14 @@ impl Scheduler {
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed".into())))
     }
 
-    fn ordered_nodes<'a>(&self, nodes: &'a [NodeView], sequence: usize) -> Vec<&'a NodeView> {
+    fn ordered_nodes<'a>(
+        &self,
+        nodes: &'a [NodeView],
+        sequence: usize,
+        policy: SchedulerPolicy,
+    ) -> Vec<&'a NodeView> {
         let mut ordered = nodes.iter().collect::<Vec<_>>();
-        match self.config.scheduler_policy {
+        match policy {
             SchedulerPolicy::Balanced => {
                 if !ordered.is_empty() {
                     let offset = sequence % ordered.len();
