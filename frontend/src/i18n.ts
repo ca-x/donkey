@@ -1,9 +1,27 @@
 import i18n from 'i18next'
 import { initReactI18next } from 'react-i18next'
 
+const concurrencyHelp = {
+  zh: {
+    blobLabel: '单个 Blob 并发上限',
+    blobDescription: '实际并发取全局上限、可用节点容量之和与分片数量中的最小值。',
+    automaticLabel: '自动汇总节点并发',
+    automaticDescription: '每个 Registry 命名空间分别汇总启用节点；当前最高计算值为 {{value}}。',
+    nodeDescription: '此节点跨所有同时进行的 Blob 共享该硬上限；多个节点的容量可以叠加。',
+  },
+  en: {
+    blobLabel: 'Per-Blob concurrency limit',
+    blobDescription: 'Actual concurrency is the minimum of this limit, combined available node capacity, and the number of chunks.',
+    automaticLabel: 'Automatically combine node capacity',
+    automaticDescription: 'Sums enabled node limits separately per Registry namespace. The current highest value is {{value}}.',
+    nodeDescription: 'This hard limit is shared by this node across all active Blobs; capacity from multiple nodes can be combined.',
+  },
+} as const
+
 const resources = {
   zh: {
     translation: {
+      concurrencyHelp: concurrencyHelp.zh,
       routeFeedback: { keyInUse: '路由键已被其他命名空间使用', prefixInUse: '路径前缀已被其他命名空间使用', conflict: '路由键、路径前缀或默认设置与现有命名空间冲突，请检查后重试' },
       nav: { overview: '概览', nodes: '加速节点', nodesShort: '节点', cache: '缓存', domain: '域名加速', domainShort: '转换', imageTools: '镜像工具', imageToolsShort: '工具', settings: '参数设置', settingsShort: '设置', deployment: '部署帮助', deploymentShort: '部署', about: '关于' },
       deployment: { title: '部署帮助', description: 'Docker daemon 配置、镜像地址用法和客户端一键设置。' },
@@ -23,6 +41,7 @@ const resources = {
   },
   en: {
     translation: {
+      concurrencyHelp: concurrencyHelp.en,
       routeFeedback: { keyInUse: 'Another namespace already uses this route key', prefixInUse: 'Another namespace already uses this path prefix', conflict: 'The route key, path prefix, or default setting conflicts with another namespace. Review the form and try again.' },
       nav: { overview: 'Overview', nodes: 'Upstreams', nodesShort: 'Nodes', cache: 'Cache', domain: 'DomainFold', domainShort: 'Convert', imageTools: 'Image tools', imageToolsShort: 'Tools', settings: 'Settings', settingsShort: 'Settings', deployment: 'Deployment help', deploymentShort: 'Deploy', about: 'About' },
       deployment: { title: 'Deployment help', description: 'Docker daemon setup, image references, and client commands.' },

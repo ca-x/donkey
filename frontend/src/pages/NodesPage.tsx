@@ -53,7 +53,7 @@ function nodeInitialValues(registryRouteId: string): NodeInput {
     registry_route_id: registryRouteId,
     enabled: true,
     priority: 100,
-    max_concurrency: 4,
+    max_concurrency: 8,
     cf_preferred: false,
     connect_ip: null,
     auth_mode: 'none',
@@ -250,7 +250,7 @@ function NodeDialog({ opened, value, initialRouteId, routes, close }: { opened: 
             <TextInput label={t('nodes.upstream')} description={t('nodes.upstreamDesc')} required {...form.getInputProps('url')} />
             <SimpleGrid cols={{ base: 1, sm: 2 }}>
               <NumberInput label={t('nodes.priority')} min={0} max={1000} {...form.getInputProps('priority')} />
-              <NumberInput label={t('nodes.maxConcurrency')} min={1} max={64} {...form.getInputProps('max_concurrency')} />
+              <NumberInput label={t('nodes.maxConcurrency')} description={t('concurrencyHelp.nodeDescription')} min={1} max={64} {...form.getInputProps('max_concurrency')} />
               <TextInput label={t('nodes.connectIp')} {...form.getInputProps('connect_ip')} />
             </SimpleGrid>
             <Group gap="xl">

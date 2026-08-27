@@ -299,7 +299,8 @@ http://proxy-user:proxy-password@donkey-host:5003
 | `DONKEY_CACHE_TTL` | 空 | 可选，例如 `30d`、`12h` |
 | `DONKEY_CHUNK_SIZE` | `2097152` | 上游 Range 分片大小 |
 | `DONKEY_ADAPTIVE_CHUNKING_ENABLED` | `true` | 根据 Blob 大小和节点容量在 2–8 MiB 内自动选择分片 |
-| `DONKEY_CHUNK_CONCURRENCY` | `8` | 单个 Blob 最大并发分片数 |
+| `DONKEY_CHUNK_CONCURRENCY` | `32` | 关闭自动并发计算后使用的单个 Blob 手动上限 |
+| `DONKEY_AUTOMATIC_CONCURRENCY_ENABLED` | `true` | 自动汇总所有启用节点的并发容量，最高 64 |
 | `DONKEY_PARALLEL_THRESHOLD` | `8388608` | 大于该值才启用分片 |
 | `DONKEY_RESUMABLE_THRESHOLD` | `8388608` | 大于该值且上游支持 Range 时启用断点续传 |
 | `DONKEY_SCHEDULER_POLICY` | `balanced` | `balanced` 或 `speed-first` |

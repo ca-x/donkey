@@ -35,6 +35,7 @@ function AccountSettings() {
 function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeConfig }) {
   const { t } = useTranslation()
   const client = useQueryClient()
+  const nodes = useQuery({ queryKey: ['nodes'], queryFn: api.nodes })
   const [advanced, setAdvanced] = useState(false)
   const [importFile, setImportFile] = useState<File | null>(null)
   const [pendingImport, setPendingImport] = useState<import('../types').RuntimeSettingsExport | null>(null)
@@ -43,6 +44,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
   const form = useForm({ initialValues: {
     chunk_size: config.chunk_size, chunk_concurrency: config.chunk_concurrency,
     adaptive_chunking_enabled: config.adaptive_chunking_enabled,
+    automatic_concurrency_enabled: config.automatic_concurrency_enabled,
     parallel_threshold: config.parallel_threshold, resumable_threshold: config.resumable_threshold,
     scheduler_policy: config.scheduler_policy, upstream_timeout_seconds: config.upstream_timeout_seconds,
     stream_fallback_timeout_seconds: config.stream_fallback_timeout_seconds, max_cache_bytes: config.max_cache_bytes,
@@ -59,21 +61,28 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
   const importSettings = useMutation({ mutationFn: api.importRuntime, onSuccess: () => { setImportFile(null); setPendingImport(null); void client.invalidateQueries({ queryKey: ['runtime'] }); void client.invalidateQueries({ queryKey: ['nodes'] }); void client.invalidateQueries({ queryKey: ['registry-routes'] }); notifications.show({ color: 'green', message: t('settings.imported') }) } })
   const handleImport = async () => { if (!importFile) return; try { const parsed = JSON.parse(await importFile.text()) as import('../types').RuntimeSettingsExport; if (parsed.format !== 'donkey-runtime-settings' || parsed.version !== 1 || !Array.isArray(parsed.nodes) || !Array.isArray(parsed.registry_routes)) throw new Error(t('settings.invalidImport')); setPendingImport(parsed) } catch (error) { notifications.show({ color: 'red', message: error instanceof Error ? error.message : t('settings.invalidImport') }) } }
   const reset = () => form.setValues({
-    chunk_size: 2 * 1024 * 1024, chunk_concurrency: 8, parallel_threshold: 8 * 1024 * 1024,
+    chunk_size: 2 * 1024 * 1024, chunk_concurrency: 32, parallel_threshold: 8 * 1024 * 1024,
     resumable_threshold: 8 * 1024 * 1024, scheduler_policy: 'balanced', upstream_timeout_seconds: 30,
     stream_fallback_timeout_seconds: 10, partial_ttl_seconds: 3600, max_cache_bytes: 50 * 1024 ** 3,
     cache_policy: 'balanced', cache_high_watermark: 0.9, cache_low_watermark: 0.8,
     cache_ttl_seconds: 0, health_interval_seconds: 60, max_export_bytes: 20 * 1024 ** 3, export_ttl_seconds: 7 * 86400,
     pull_logging_enabled: true,
     adaptive_chunking_enabled: true,
+    automatic_concurrency_enabled: true,
     pull_log_retention_days: 30, pull_log_max_entries: 10000,
   })
+  const routeCapacities = new Map<string, number>()
+  for (const node of nodes.data ?? []) {
+    if (node.node.enabled && node.route.enabled) routeCapacities.set(node.route.id, (routeCapacities.get(node.route.id) ?? 0) + node.max_concurrency)
+  }
+  const automaticConcurrency = Math.min(64, Math.max(0, ...routeCapacities.values()))
   return <SettingsPanel icon={<IconSettings size={19} />} title={t('settings.runtimeTitle')}>
     <Text size="sm" c="dimmed">{t('settings.runtimeDescription')}</Text>
     <Paper className="settings-summary" withBorder><Group gap="sm"><IconAdjustments size={18} /><Box><Text size="sm" fw={650}>{t('settings.recommendedMode')}</Text><Text size="xs" c="dimmed">{t('settings.recommendedDescription')}</Text></Box></Group><Text size="xs" c="dimmed" mt="sm">{t('settings.effectiveSummary', { policy: form.values.scheduler_policy === 'speed-first' ? t('settings.speedFirstPolicy') : t('settings.balancedPolicy'), chunk: form.values.adaptive_chunking_enabled ? `${t('pulls.adaptiveChunking')} 2–8 MiB` : formatSettingBytes(form.values.chunk_size), resumable: formatSettingBytes(form.values.resumable_threshold) })}</Text></Paper>
     <Switch label={t('pulls.adaptiveChunking')} description={t('pulls.adaptiveChunkingDescription')} {...form.getInputProps('adaptive_chunking_enabled', { type: 'checkbox' })} />
+    <Switch label={t('concurrencyHelp.automaticLabel')} description={t('concurrencyHelp.automaticDescription', { value: automaticConcurrency })} {...form.getInputProps('automatic_concurrency_enabled', { type: 'checkbox' })} />
     <SimpleGrid cols={{ base: 1, md: 2 }}>
-      <NumberInput label={t('settings.concurrency')} min={1} max={64} {...form.getInputProps('chunk_concurrency')} />
+      {!form.values.automatic_concurrency_enabled && <NumberInput label={t('concurrencyHelp.blobLabel')} description={t('concurrencyHelp.blobDescription')} min={1} max={64} {...form.getInputProps('chunk_concurrency')} />}
       <Select label={t('settings.schedulerPolicy')} data={[{ value: 'balanced', label: t('settings.balancedPolicy') }, { value: 'speed-first', label: t('settings.speedFirstPolicy') }]} {...form.getInputProps('scheduler_policy')} />
       <NumberInput label={t('settings.upstreamTimeout')} min={1} max={3600} suffix=" s" {...form.getInputProps('upstream_timeout_seconds')} />
       <UnitInput label={t('cache.capacity')} value={form.values.max_cache_bytes} onChange={(value) => form.setFieldValue('max_cache_bytes', value)} />
