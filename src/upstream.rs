@@ -77,6 +77,10 @@ impl UpstreamService {
         *self.timeout.write().await = config.upstream_timeout;
     }
 
+    pub async fn timeout(&self) -> Duration {
+        *self.timeout.read().await
+    }
+
     pub async fn send(
         &self,
         node: &NodeView,
@@ -206,7 +210,7 @@ impl UpstreamService {
         }
         let mut validated = security::validate_target_url(realm.as_str(), &self.config).await?;
         self.apply_connect_ip(node, &mut validated)?;
-        let client = security::client_for(&validated, self.config.upstream_timeout)?;
+        let client = security::client_for(&validated, self.timeout().await)?;
         let request = client
             .get(validated.url)
             .header(header::ACCEPT, "application/json");

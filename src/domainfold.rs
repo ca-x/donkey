@@ -218,7 +218,7 @@ async fn send_domain_request(
 ) -> ApiResult<Response> {
     for redirect_count in 0..=3 {
         let validated = security::validate_target_url(url.as_str(), &state.config).await?;
-        let client = security::client_for(&validated, state.config.upstream_timeout)?;
+        let client = security::client_for(&validated, state.upstream.timeout().await)?;
         let mut builder = client.request(method.clone(), validated.url);
         for name in [
             header::ACCEPT,
