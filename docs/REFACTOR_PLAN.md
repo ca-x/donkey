@@ -12,6 +12,7 @@
 - 镜像拉取历史已支持默认开启、运行时开关、服务端分页、安全清空及按时间/数量自动保留。
 - Docker archive 与 OCI archive 已使用独立构建路径，并分别校验 manifest 引用和 OCI layout 根结构。
 - NodeSelection 已集中管理吞吐 EWMA、全局并发租约、策略排序与指数冷却；更细的错误分类指标待完善。
+- 自适应分片默认开启，按 Blob 大小、全局并发和节点容量在 2–8 MiB 内计算；可关闭并回退固定分片。
 - 每个增量提交均经过 Rust 全量测试、Clippy 与前端 lint/build 验证；暂不创建版本 tag。
 
 ## 总目标
