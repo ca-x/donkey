@@ -163,9 +163,20 @@ export interface RuntimeConfig {
   admin_external_loopback: boolean
   registry_external_tls: boolean
   registry_auth_enabled: boolean
+  pull_logging_enabled: boolean
 }
 
-export type RuntimeSettingsInput = Pick<RuntimeConfig, 'chunk_size' | 'chunk_concurrency' | 'parallel_threshold' | 'resumable_threshold' | 'scheduler_policy' | 'upstream_timeout_seconds' | 'stream_fallback_timeout_seconds' | 'partial_ttl_seconds' | 'max_cache_bytes' | 'cache_policy' | 'cache_high_watermark' | 'cache_low_watermark' | 'cache_ttl_seconds' | 'health_interval_seconds' | 'max_export_bytes' | 'export_ttl_seconds'>
+export type RuntimeSettingsInput = Pick<RuntimeConfig, 'chunk_size' | 'chunk_concurrency' | 'parallel_threshold' | 'resumable_threshold' | 'scheduler_policy' | 'upstream_timeout_seconds' | 'stream_fallback_timeout_seconds' | 'partial_ttl_seconds' | 'max_cache_bytes' | 'cache_policy' | 'cache_high_watermark' | 'cache_low_watermark' | 'cache_ttl_seconds' | 'health_interval_seconds' | 'max_export_bytes' | 'export_ttl_seconds' | 'pull_logging_enabled'>
+
+export interface PullEvent {
+  id: string
+  registry_route_id: string
+  repository: string
+  reference: string
+  resolved_digest: string | null
+  status_code: number
+  created_at: string
+}
 
 export interface RuntimeSettingsExport {
   format: 'donkey-runtime-settings'
