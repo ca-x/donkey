@@ -213,6 +213,7 @@ mod tests {
                 enabled: true,
             },
             max_concurrency: 4,
+            live_bps: 0,
         }
     }
 

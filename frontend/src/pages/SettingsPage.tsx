@@ -27,9 +27,22 @@ function AccountSettings() {
   const { t } = useTranslation()
   const user = useAuth()
   const client = useQueryClient()
-  const form = useForm({ initialValues: { display_name: user.display_name, username: user.username, current_password: '', new_password: '' } })
-  const save = useMutation({ mutationFn: () => api.updateProfile({ display_name: form.values.display_name, username: user.local_password ? form.values.username : undefined, current_password: form.values.current_password || undefined, new_password: form.values.new_password || undefined }), onSuccess: (updated) => { client.setQueryData(['auth-me'], updated); form.setFieldValue('current_password', ''); form.setFieldValue('new_password', ''); notifications.show({ color: 'green', message: t('settings.profileSaved') }) } })
-  return <SettingsPanel icon={<IconSettings size={19} />} title={t('settings.profileTitle')}><SimpleGrid cols={{ base: 1, md: 2 }}><TextInput label={t('settings.displayName')} required {...form.getInputProps('display_name')} />{user.local_password && <TextInput label={t('settings.loginName')} required {...form.getInputProps('username')} />}</SimpleGrid>{user.local_password && <SimpleGrid cols={{ base: 1, md: 2 }}><PasswordInput label={t('settings.currentPassword')} visibilityToggleButtonProps={{ 'aria-label': t('ui.togglePassword') }} {...form.getInputProps('current_password')} /><PasswordInput label={t('settings.newPassword')} description={t('settings.passwordHint')} visibilityToggleButtonProps={{ 'aria-label': t('ui.togglePassword') }} {...form.getInputProps('new_password')} /></SimpleGrid>}<Group justify="flex-end"><Button onClick={() => save.mutate()} loading={save.isPending}>{t('common.save')}</Button></Group></SettingsPanel>
+  const form = useForm({ mode: 'controlled', initialValues: { display_name: user.display_name, username: user.username, current_password: '', new_password: '' } })
+  const save = useMutation({
+    mutationFn: (values: typeof form.values) => api.updateProfile({
+      display_name: values.display_name,
+      username: user.local_password && values.username !== user.username ? values.username ?? undefined : undefined,
+      current_password: values.current_password || undefined,
+      new_password: values.new_password || undefined,
+    }),
+    onSuccess: (updated) => {
+      client.setQueryData(['auth-me'], updated)
+      form.setValues({ display_name: updated.display_name, username: updated.username, current_password: '', new_password: '' })
+      notifications.show({ color: 'green', message: t('settings.profileSaved') })
+    },
+    onError: (error: Error) => notifications.show({ color: 'red', title: t('ui.profileSaveFailed'), message: error.message }),
+  })
+  return <form onSubmit={form.onSubmit((values) => save.mutate(values))}><SettingsPanel icon={<IconSettings size={19} />} title={t('settings.profileTitle')}><SimpleGrid cols={{ base: 1, md: 2 }}><TextInput label={t('settings.displayName')} required {...form.getInputProps('display_name')} />{user.local_password && <TextInput label={t('settings.loginName')} required {...form.getInputProps('username')} />}</SimpleGrid>{user.local_password && <SimpleGrid cols={{ base: 1, md: 2 }}><PasswordInput label={t('settings.currentPassword')} visibilityToggleButtonProps={{ 'aria-label': t('ui.togglePassword') }} {...form.getInputProps('current_password')} /><PasswordInput label={t('settings.newPassword')} description={t('settings.passwordHint')} visibilityToggleButtonProps={{ 'aria-label': t('ui.togglePassword') }} {...form.getInputProps('new_password')} /></SimpleGrid>}<Group justify="flex-end"><Button type="submit" loading={save.isPending}>{t('common.save')}</Button></Group></SettingsPanel></form>
 }
 
 function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeConfig }) {
@@ -41,7 +54,7 @@ function RuntimeSettingsEditor({ config }: { config: import('../types').RuntimeC
   const [pendingImport, setPendingImport] = useState<import('../types').RuntimeSettingsExport | null>(null)
   const [pendingExport, setPendingExport] = useState<import('../types').RuntimeSettingsExport | null>(null)
   const [exportScope, setExportScope] = useState({ runtime: true, routes: true, nodes: true })
-  const form = useForm({ initialValues: {
+  const form = useForm({ mode: 'controlled', initialValues: {
     chunk_size: config.chunk_size, chunk_concurrency: config.chunk_concurrency,
     adaptive_chunking_enabled: config.adaptive_chunking_enabled,
     automatic_concurrency_enabled: config.automatic_concurrency_enabled,

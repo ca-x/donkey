@@ -1,7 +1,13 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
+use dashmap::DashMap;
 use http::{HeaderName, HeaderValue};
+use sea_orm::sea_query::CaseStatement;
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, ExprTrait, QueryFilter, sea_query::Expr,
 };
@@ -28,6 +34,7 @@ pub struct NodeService {
     runtime: Arc<RwLock<NodeRuntimeConfig>>,
     db: DatabaseConnection,
     cipher: CredentialCipher,
+    live_rates: Arc<DashMap<Uuid, Arc<Mutex<RateWindow>>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -35,6 +42,70 @@ struct NodeRuntimeConfig {
     scheduler_policy: SchedulerPolicy,
     upstream_timeout: std::time::Duration,
     health_interval: std::time::Duration,
+}
+
+const LIVE_RATE_WINDOW: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct RateWindow {
+    samples: VecDeque<RateSample>,
+}
+
+struct RateSample {
+    started_at: Instant,
+    finished_at: Instant,
+    bytes: u64,
+}
+
+impl RateWindow {
+    fn record(&mut self, now: Instant, bytes: u64, elapsed: Duration) {
+        self.samples.push_back(RateSample {
+            started_at: now.checked_sub(elapsed).unwrap_or(now),
+            finished_at: now,
+            bytes,
+        });
+        self.prune(now);
+    }
+
+    fn rate(&mut self, now: Instant) -> u64 {
+        self.prune(now);
+        let Some(first) = self.samples.front() else {
+            return 0;
+        };
+        let window_start = now.checked_sub(LIVE_RATE_WINDOW).unwrap_or(now);
+        let started_at = first.started_at.max(window_start);
+        let seconds = now.duration_since(started_at).as_secs_f64().max(0.001);
+        let bytes = self
+            .samples
+            .iter()
+            .map(|sample| {
+                let sample_seconds = sample
+                    .finished_at
+                    .duration_since(sample.started_at)
+                    .as_secs_f64();
+                if sample_seconds <= 0.0 {
+                    return sample.bytes as f64;
+                }
+                let overlap_start = sample.started_at.max(started_at);
+                let overlap_seconds = sample
+                    .finished_at
+                    .duration_since(overlap_start)
+                    .as_secs_f64();
+                sample.bytes as f64 * (overlap_seconds / sample_seconds).clamp(0.0, 1.0)
+            })
+            .sum::<f64>();
+        (bytes / seconds).min(u64::MAX as f64) as u64
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .samples
+            .front()
+            .is_some_and(|sample| now.duration_since(sample.finished_at) > LIVE_RATE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -67,6 +138,7 @@ pub struct NodeView {
     pub auth_configured: bool,
     pub route: RegistryRouteSummary,
     pub max_concurrency: u16,
+    pub live_bps: u64,
 }
 
 #[derive(Serialize)]
@@ -76,6 +148,7 @@ struct NodeViewWire<'a> {
     score: f64,
     auth_configured: bool,
     max_concurrency: u16,
+    live_bps: u64,
     route: &'a RegistryRouteSummary,
 }
 
@@ -121,6 +194,7 @@ impl Serialize for NodeView {
             score: self.score,
             auth_configured: self.auth_configured,
             max_concurrency: self.max_concurrency,
+            live_bps: self.live_bps,
             route: &self.route,
         }
         .serialize(serializer)
@@ -151,6 +225,7 @@ impl NodeService {
             config,
             db,
             cipher,
+            live_rates: Arc::new(DashMap::new()),
         })
     }
 
@@ -302,6 +377,7 @@ impl NodeService {
         if deleted == 0 {
             return Err(AppError::not_found("node"));
         }
+        self.live_rates.remove(&id);
         Ok(())
     }
 
@@ -378,6 +454,7 @@ impl NodeService {
         let score = score(&node, &metric, policy);
         let auth_configured = node.auth_secret_enc.is_some();
         let max_concurrency = db::get_node_max_concurrency(&self.db, node.id).await?;
+        let live_bps = self.live_rate(node.id);
         Ok(NodeView {
             node,
             metric,
@@ -385,6 +462,7 @@ impl NodeService {
             auth_configured,
             route: (&route).into(),
             max_concurrency,
+            live_bps,
         })
     }
 
@@ -459,6 +537,9 @@ impl NodeService {
         elapsed: std::time::Duration,
         success: bool,
     ) {
+        if success && bytes > 0 {
+            self.record_live_transfer(id, bytes, elapsed);
+        }
         let sample = if success { 1.0_f64 } else { 0.0_f64 };
         let mut update = node_metric::Entity::update_many()
             .col_expr(
@@ -467,7 +548,6 @@ impl NodeService {
                     .mul(0.85)
                     .add(sample * 0.15),
             )
-            .col_expr(node_metric::Column::LastCheckedAt, Expr::value(Utc::now()))
             .filter(node_metric::Column::NodeId.eq(id));
         if success && elapsed.as_secs_f64() > 0.0 {
             let bps = (bytes as f64 / elapsed.as_secs_f64()).min(i64::MAX as f64) as i64;
@@ -475,7 +555,21 @@ impl NodeService {
             update = update
                 .col_expr(node_metric::Column::Healthy, Expr::value(true))
                 .col_expr(node_metric::Column::CurrentBps, Expr::value(bps))
-                .col_expr(node_metric::Column::SpeedBps, Expr::value(bps))
+                .col_expr(
+                    node_metric::Column::SpeedBps,
+                    CaseStatement::new()
+                        .case(
+                            Expr::col(node_metric::Column::SpeedBps).lte(0),
+                            Expr::value(bps),
+                        )
+                        .finally(
+                            Expr::col(node_metric::Column::SpeedBps)
+                                .mul(7)
+                                .add(bps.saturating_mul(3))
+                                .div(10),
+                        )
+                        .into(),
+                )
                 .col_expr(
                     node_metric::Column::TotalBytes,
                     Expr::col(node_metric::Column::TotalBytes).add(byte_count),
@@ -484,6 +578,29 @@ impl NodeService {
         if let Err(error) = update.exec(&self.db).await {
             tracing::warn!(?error, "failed to update node transfer metric");
         }
+    }
+
+    fn record_live_transfer(&self, id: Uuid, bytes: u64, elapsed: Duration) {
+        let window = self
+            .live_rates
+            .entry(id)
+            .or_insert_with(|| Arc::new(Mutex::new(RateWindow::default())))
+            .clone();
+        if let Ok(mut window) = window.lock() {
+            window.record(Instant::now(), bytes, elapsed);
+        }
+    }
+
+    fn live_rate(&self, id: Uuid) -> u64 {
+        self.live_rates
+            .get(&id)
+            .and_then(|window| {
+                window
+                    .lock()
+                    .ok()
+                    .map(|mut window| window.rate(Instant::now()))
+            })
+            .unwrap_or(0)
     }
 
     pub fn apply_auth(
@@ -675,6 +792,7 @@ mod tests {
         DOCKER_HUB_ROUTE_ID, GHCR_ROUTE_ID, RegistryRouteInput, RegistryRouteService,
     };
     use axum::http::StatusCode;
+    use httpmock::prelude::*;
     use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel};
     use secrecy::SecretString;
 
@@ -750,6 +868,22 @@ mod tests {
     }
 
     #[test]
+    fn live_rate_aggregates_concurrent_transfers_and_expires() {
+        let now = Instant::now();
+        let mut window = RateWindow::default();
+        window.record(now, 1_000, Duration::from_secs(1));
+        window.record(now, 3_000, Duration::from_secs(1));
+        assert_eq!(window.rate(now), 4_000);
+        let mut slow = RateWindow::default();
+        slow.record(now, 2_000, Duration::from_secs(20));
+        assert_eq!(slow.rate(now), 100);
+        assert_eq!(
+            window.rate(now + LIVE_RATE_WINDOW + Duration::from_millis(1)),
+            0
+        );
+    }
+
+    #[test]
     fn node_input_defaults_to_eight_connections() {
         let input: NodeInput = serde_json::from_value(serde_json::json!({
             "name": "default concurrency",
@@ -759,6 +893,65 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.max_concurrency, 8);
+    }
+
+    #[tokio::test]
+    async fn transfer_metrics_keep_latest_and_smoothed_rates_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = db::connect(&config.database_url).await.unwrap();
+        let service = NodeService::new(Arc::new(config), db.clone()).unwrap();
+        let node = service
+            .create(plain_node_input(DOCKER_HUB_ROUTE_ID))
+            .await
+            .unwrap();
+
+        service
+            .record_transfer(node.node.id, 1_000, std::time::Duration::from_secs(1), true)
+            .await;
+        service
+            .record_transfer(node.node.id, 3_000, std::time::Duration::from_secs(1), true)
+            .await;
+
+        let metric = db::metric_for(&db, node.node.id).await.unwrap().unwrap();
+        assert_eq!(metric.current_bps, 3_000);
+        assert_eq!(metric.speed_bps, 1_600);
+        assert!(metric.last_checked_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_persists_real_round_trip_latency() {
+        let upstream = MockServer::start_async().await;
+        upstream
+            .mock_async(|when, then| {
+                when.method(GET).path("/v2/");
+                then.status(200).delay(std::time::Duration::from_millis(30));
+            })
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = db::connect(&config.database_url).await.unwrap();
+        let service = NodeService::new(Arc::new(config), db.clone()).unwrap();
+        let node = service
+            .create(NodeInput {
+                url: upstream.base_url(),
+                ..plain_node_input(DOCKER_HUB_ROUTE_ID)
+            })
+            .await
+            .unwrap();
+
+        let measured = service.probe(node.node.id).await.unwrap();
+        let stored = service
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.node.id == node.node.id)
+            .unwrap();
+
+        assert!(measured.metric.latency_ms >= 25);
+        assert_eq!(stored.metric.latency_ms, measured.metric.latency_ms);
+        assert!(stored.metric.last_checked_at.is_some());
     }
 
     #[tokio::test]

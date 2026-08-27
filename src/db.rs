@@ -1056,7 +1056,19 @@ pub async fn upsert_metric(
         .await?
         .is_some()
     {
-        metric.into_active_model().update(db).await?;
+        node_metric::ActiveModel {
+            node_id: ActiveValue::Unchanged(metric.node_id),
+            healthy: ActiveValue::Set(metric.healthy),
+            latency_ms: ActiveValue::Set(metric.latency_ms),
+            speed_bps: ActiveValue::Set(metric.speed_bps),
+            success_rate: ActiveValue::Set(metric.success_rate),
+            current_bps: ActiveValue::Set(metric.current_bps),
+            total_bytes: ActiveValue::Set(metric.total_bytes),
+            last_checked_at: ActiveValue::Set(metric.last_checked_at),
+            last_error: ActiveValue::Set(metric.last_error),
+        }
+        .update(db)
+        .await?;
     } else {
         metric.into_active_model().insert(db).await?;
     }
@@ -1072,7 +1084,18 @@ pub async fn insert_cache_entry(
         .await?
         .is_some()
     {
-        entry.into_active_model().update(db).await?;
+        cache_entry::ActiveModel {
+            key: ActiveValue::Unchanged(entry.key),
+            media_type: ActiveValue::Set(entry.media_type),
+            path: ActiveValue::Set(entry.path),
+            size_bytes: ActiveValue::Set(entry.size_bytes),
+            digest: ActiveValue::Set(entry.digest),
+            hit_count: ActiveValue::Set(entry.hit_count),
+            created_at: ActiveValue::Set(entry.created_at),
+            last_accessed_at: ActiveValue::Set(entry.last_accessed_at),
+        }
+        .update(db)
+        .await?;
     } else {
         entry.into_active_model().insert(db).await?;
     }
@@ -1181,7 +1204,30 @@ pub async fn insert_pull_event(
     db: &DatabaseConnection,
     event: pull_event::Model,
 ) -> Result<(), DbErr> {
-    event.into_active_model().insert(db).await?;
+    let dedupe_since = event.created_at - chrono::Duration::seconds(5);
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO pull_events(id, registry_route_id, repository, reference, resolved_digest, status_code, created_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (
+             SELECT 1 FROM pull_events
+             WHERE registry_route_id = ? AND repository = ? AND reference = ? AND created_at >= ?
+         )",
+        [
+            event.id.into(),
+            event.registry_route_id.into(),
+            event.repository.clone().into(),
+            event.reference.clone().into(),
+            event.resolved_digest.into(),
+            event.status_code.into(),
+            event.created_at.into(),
+            event.registry_route_id.into(),
+            event.repository.into(),
+            event.reference.into(),
+            dedupe_since.into(),
+        ],
+    ))
+    .await?;
     Ok(())
 }
 
@@ -1601,7 +1647,17 @@ pub async fn save_mapping(
     db: &DatabaseConnection,
     model: domain_mapping::Model,
 ) -> Result<domain_mapping::Model, DbErr> {
-    model.into_active_model().update(db).await
+    domain_mapping::ActiveModel {
+        id: ActiveValue::Unchanged(model.id),
+        source_host: ActiveValue::Set(model.source_host),
+        upstream_base: ActiveValue::Set(model.upstream_base),
+        public_base: ActiveValue::Set(model.public_base),
+        enabled: ActiveValue::Set(model.enabled),
+        created_at: ActiveValue::Unchanged(model.created_at),
+        updated_at: ActiveValue::Set(model.updated_at),
+    }
+    .update(db)
+    .await
 }
 
 pub async fn delete_mapping(db: &DatabaseConnection, id: Uuid) -> Result<u64, DbErr> {
@@ -1759,7 +1815,24 @@ mod tests {
             updated_at: now,
         };
         insert_node(&db, node.clone()).await.unwrap();
-        assert_eq!(get_node(&db, node.id).await.unwrap(), Some(node));
+        assert_eq!(get_node(&db, node.id).await.unwrap(), Some(node.clone()));
+
+        let mut metric = node_metric::Model {
+            node_id: node.id,
+            healthy: true,
+            latency_ms: 120,
+            speed_bps: 1_000,
+            success_rate: 1.0,
+            current_bps: 1_000,
+            total_bytes: 10,
+            last_checked_at: Some(now),
+            last_error: None,
+        };
+        upsert_metric(&db, metric.clone()).await.unwrap();
+        metric.latency_ms = 45;
+        metric.speed_bps = 4_000;
+        upsert_metric(&db, metric.clone()).await.unwrap();
+        assert_eq!(metric_for(&db, node.id).await.unwrap(), Some(metric));
     }
 
     #[tokio::test]

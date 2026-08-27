@@ -17,7 +17,7 @@ export function PullHistoryPage() {
   const client = useQueryClient()
   const [page, setPage] = useState(1)
   const [clearRequested, setClearRequested] = useState(false)
-  const events = useQuery({ queryKey: ['pull-events', page], queryFn: () => api.pullEvents(page, 50), refetchInterval: 15_000 })
+  const events = useQuery({ queryKey: ['pull-events', page], queryFn: () => api.pullEvents(page, 50), refetchInterval: 5_000 })
   const routes = useQuery({ queryKey: ['registry-routes'], queryFn: api.registryRoutes })
   const clear = useMutation({
     mutationFn: api.clearPullEvents,

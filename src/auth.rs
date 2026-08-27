@@ -632,7 +632,11 @@ async fn update_profile(
         .await?
         .ok_or(AppError::Unauthorized)?;
     let password_changed = input.new_password.is_some();
-    let changing_credentials = input.username.is_some() || input.new_password.is_some();
+    let username_changed = input
+        .username
+        .as_deref()
+        .is_some_and(|username| account.username.as_deref() != Some(username));
+    let changing_credentials = username_changed || password_changed;
     if changing_credentials {
         let Some(hash) = account.password_hash.clone() else {
             return Err(AppError::bad_request(
@@ -647,7 +651,7 @@ async fn update_profile(
             return Err(AppError::Unauthorized);
         }
     }
-    if let Some(username) = input.username.as_deref() {
+    if username_changed && let Some(username) = input.username.as_deref() {
         validate_username(username)?;
         if user::Entity::find()
             .filter(user::Column::Username.eq(username))
@@ -666,11 +670,16 @@ async fn update_profile(
     }
     account.display_name = input.display_name.trim().to_owned();
     account.updated_at = Utc::now();
-    let updated = account
-        .clone()
-        .into_active_model()
-        .update(&service.db)
-        .await?;
+    let username = account.username.clone();
+    let password_hash = account.password_hash.clone();
+    let display_name = account.display_name.clone();
+    let updated_at = account.updated_at;
+    let mut active = account.into_active_model();
+    active.username = Set(username);
+    active.password_hash = Set(password_hash);
+    active.display_name = Set(display_name);
+    active.updated_at = Set(updated_at);
+    let updated = active.update(&service.db).await?;
     if password_changed && let Some(current_token_hash) = current_user.session_token_hash.as_deref()
     {
         admin_session::Entity::delete_many()
@@ -926,6 +935,62 @@ mod tests {
                 .await,
             Err(AppError::RateLimited)
         ));
+    }
+
+    #[tokio::test]
+    async fn unchanged_login_name_does_not_require_password_for_profile_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Arc::new(Config::for_test(directory.path().to_owned()));
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let service = AuthService::new(config, db.clone()).await.unwrap();
+        let now = Utc::now();
+        let account = user::Model {
+            id: Uuid::new_v4(),
+            identity_key: "local:admin".into(),
+            username: Some("admin".into()),
+            issuer: None,
+            subject: "admin".into(),
+            display_name: "Old name".into(),
+            email: None,
+            password_hash: Some(
+                hash_password(SecretString::from("donkey-test-password"))
+                    .await
+                    .unwrap(),
+            ),
+            role: "admin".into(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            last_login_at: None,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let response = update_profile(
+            State(service),
+            Extension(principal(account)),
+            Json(ProfileInput {
+                display_name: "New name".into(),
+                username: Some("admin".into()),
+                current_password: None,
+                new_password: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.display_name, "New name");
+        assert_eq!(
+            user::Entity::find_by_id(response.0.id.unwrap())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "New name"
+        );
     }
 
     #[tokio::test]

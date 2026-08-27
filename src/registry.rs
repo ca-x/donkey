@@ -31,9 +31,10 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Response
         Err(error) => error.into_response(),
     };
     if count_traffic {
-        traffic.record_response(&response);
+        traffic.track_response(response)
+    } else {
+        response
     }
-    response
 }
 
 async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> {
@@ -143,9 +144,10 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
     }
     let method = request.method().clone();
     let headers = request.headers().clone();
-    let pull_subject = (method == Method::GET && state.runtime_flags.pull_logging_enabled())
-        .then(|| manifest_pull_subject(&upstream_path))
-        .flatten();
+    let pull_subject = (matches!(method, Method::GET | Method::HEAD)
+        && state.runtime_flags.pull_logging_enabled())
+    .then(|| manifest_pull_subject(&upstream_path))
+    .flatten();
     let response = proxy_passthrough(&state, method, upstream_path, headers, nodes).await?;
     if let Some((repository, reference)) = pull_subject
         && response.status().is_success()
@@ -208,6 +210,7 @@ async fn stream_blob(
     let nodes = state.scheduler.ordered_stream_nodes(&nodes, path).await;
     let mut last_error = None;
     for (node_index, node) in nodes.iter().enumerate() {
+        let started = std::time::Instant::now();
         let upstream = match state
             .upstream
             .send(
@@ -219,8 +222,20 @@ async fn stream_blob(
             )
             .await
         {
-            Ok(response) if response.status().is_success() => response,
+            Ok(response) if response.status().is_success() => {
+                state
+                    .scheduler
+                    .observe_node(node.node.id, 0, started.elapsed(), true);
+                response
+            }
             Ok(response) => {
+                state
+                    .scheduler
+                    .observe_node(node.node.id, 0, started.elapsed(), false);
+                state
+                    .nodes
+                    .record_transfer(node.node.id, 0, started.elapsed(), false)
+                    .await;
                 last_error = Some(AppError::Upstream(format!(
                     "{} returned {}",
                     node.node.name,
@@ -229,6 +244,13 @@ async fn stream_blob(
                 continue;
             }
             Err(error) => {
+                state
+                    .scheduler
+                    .observe_node(node.node.id, 0, started.elapsed(), false);
+                state
+                    .nodes
+                    .record_transfer(node.node.id, 0, started.elapsed(), false)
+                    .await;
                 last_error = Some(error);
                 continue;
             }
@@ -757,12 +779,15 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
     let mut last_error = None;
     loop {
         let mut attempted = false;
-        for step in 0..request.nodes.len() {
-            let index = (request.chunk.sequence + step) % request.nodes.len();
-            let Some(permit) = request.scheduler.try_acquire(
-                request.nodes[index].node.id,
-                request.nodes[index].max_concurrency,
-            ) else {
+        let candidates = request
+            .scheduler
+            .ordered_parallel_nodes(&request.nodes, request.chunk.sequence)
+            .await;
+        for node in candidates {
+            let Some(permit) = request
+                .scheduler
+                .try_acquire(node.node.id, node.max_concurrency)
+            else {
                 continue;
             };
             attempted = true;
@@ -771,7 +796,7 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
                 let response = request
                     .upstream
                     .send(
-                        &request.nodes[index],
+                        &node,
                         Method::GET,
                         &request.path,
                         &request.headers,
@@ -799,7 +824,7 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
             .await;
             drop(permit);
             request.scheduler.observe_node(
-                request.nodes[index].node.id,
+                node.node.id,
                 result.as_ref().map_or(0, |bytes| bytes.len() as u64),
                 started.elapsed(),
                 result.is_ok(),
@@ -807,7 +832,7 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
             request
                 .node_service
                 .record_transfer(
-                    request.nodes[index].node.id,
+                    node.node.id,
                     result.as_ref().map_or(0, |bytes| bytes.len() as u64),
                     started.elapsed(),
                     result.is_ok(),

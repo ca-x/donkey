@@ -158,6 +158,18 @@ impl Scheduler {
             .collect()
     }
 
+    pub(crate) async fn ordered_parallel_nodes(
+        &self,
+        nodes: &[NodeView],
+        sequence: usize,
+    ) -> Vec<NodeView> {
+        let policy = self.runtime.read().await.scheduler_policy;
+        self.ordered_nodes(nodes, sequence, policy)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     pub async fn stream_download_config(
         &self,
         total_size: u64,

@@ -51,6 +51,7 @@ export interface NodeView {
   auth_configured: boolean
   route: RegistryRouteSummary
   max_concurrency: number
+  live_bps: number
 }
 
 export interface NodeInput {
@@ -129,6 +130,7 @@ export interface DashboardData {
   healthy_nodes: number
   registry_requests: number
   registry_bytes: number
+  registry_current_bps: number
   parallel_blobs: number
   resume_attempts: number
   retry_attempts: number

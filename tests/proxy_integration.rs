@@ -1136,6 +1136,59 @@ mod proxy_integration {
         }
 
         #[tokio::test]
+        async fn streaming_parallel_skips_a_cooling_failed_node() {
+            let bytes = vec![b'c'; 1024 * 1024];
+            let failing = Fixture::start(FixtureBehavior::RetryableFailure, bytes.clone()).await;
+            let healthy = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.parallel_threshold = 1;
+            config.chunk_size = 256 * 1024;
+            config.chunk_concurrency = 4;
+            let state = AppState::new(config).await.unwrap();
+            for (index, fixture) in [&failing, &healthy].into_iter().enumerate() {
+                state
+                    .nodes
+                    .create(NodeInput {
+                        name: format!("cooling-stream-{index}"),
+                        url: fixture.url(),
+                        registry_route_id: DOCKER_HUB_ROUTE_ID,
+                        enabled: true,
+                        priority: index as i32,
+                        max_concurrency: 4,
+                        cf_preferred: false,
+                        connect_ip: None,
+                        auth_mode: "none".into(),
+                        auth_username: None,
+                        auth_header: None,
+                        auth_secret: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let response = request(
+                registry_router(state),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert_eq!(failing.get_count(), 1);
+            assert!(healthy.max_active_requests() > 1);
+        }
+
+        #[tokio::test]
         async fn node_concurrency_limit_is_global_across_streams() {
             let bytes = vec![b'g'; 1024 * 1024];
             let first = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;
@@ -1482,6 +1535,14 @@ mod proxy_integration {
             )
             .await;
             let (state, _directory) = proxy_state(&[&fixture]).await;
+            let head = request(
+                registry_router(state.clone()),
+                Method::HEAD,
+                "/v2/team/widget/manifests/latest",
+                None,
+            )
+            .await;
+            assert_eq!(head.status(), StatusCode::OK);
             let response = request(
                 registry_router(state.clone()),
                 Method::GET,

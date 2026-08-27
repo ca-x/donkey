@@ -156,9 +156,9 @@ function NodeCard({ item, canWrite, edit }: { item: NodeView; canWrite: boolean;
         </Group>}
       </Group>
       <div className="node-metrics">
-        <Metric label={t('nodes.currentRate')} value={formatRate(item.metric.current_bps)} />
-        <Metric label={t('nodes.measuredRate')} value={formatRate(item.metric.speed_bps)} />
-        <Metric label={t('nodes.latency')} value={`${item.metric.latency_ms} ms`} />
+        <Metric label={t('ui.liveNodeRate')} value={formatRate(item.live_bps)} />
+        <Metric label={t('ui.smoothedNodeRate')} value={formatRate(item.metric.speed_bps)} />
+        <Metric label={t('nodes.latency')} value={item.metric.last_checked_at ? `${item.metric.latency_ms} ms` : '—'} />
         <Metric label={t('nodes.downloaded')} value={formatBytes(item.metric.total_bytes)} />
         <Metric label={t('nodes.maxConcurrency')} value={`${item.max_concurrency}`} />
       </div>
@@ -239,7 +239,7 @@ function NodeDialog({ opened, value, initialRouteId, routes, close }: { opened: 
 
   return (
     <Modal.Stack>
-      <Modal stackId="node-editor" opened={opened} onClose={requestClose} title={t(editing ? 'nodes.editTitle' : 'nodes.createTitle')} size="lg" centered withCloseButton={!save.isPending} closeOnClickOutside={!save.isPending} closeOnEscape={!save.isPending} classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }} transitionProps={{ transition: 'pop', duration: 220, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}>
+      <Modal stackId="node-editor" opened={opened} onClose={requestClose} title={t(editing ? 'nodes.editTitle' : 'nodes.createTitle')} size="lg" centered closeButtonProps={{ 'aria-label': t('ui.close') }} withCloseButton={!save.isPending} closeOnClickOutside={!save.isPending} closeOnEscape={!save.isPending} classNames={{ content: 'polished-modal', overlay: 'polished-overlay' }} transitionProps={{ transition: 'pop', duration: 220, timingFunction: 'cubic-bezier(0.23, 1, 0.32, 1)' }}>
         <form aria-busy={save.isPending} onSubmit={form.onSubmit((values) => save.mutate(values))}>
           <fieldset className="pending-form" disabled={save.isPending}>
             <Stack gap="md">
@@ -248,11 +248,11 @@ function NodeDialog({ opened, value, initialRouteId, routes, close }: { opened: 
               <Select label={t('nodes.registryNamespace')} data={routeOptions} searchable required {...form.getInputProps('registry_route_id')} />
             </SimpleGrid>
             <TextInput label={t('nodes.upstream')} description={t('nodes.upstreamDesc')} required {...form.getInputProps('url')} />
-            <SimpleGrid cols={{ base: 1, sm: 2 }}>
-              <NumberInput label={t('nodes.priority')} min={0} max={1000} {...form.getInputProps('priority')} />
+            <SimpleGrid cols={{ base: 1, sm: 2 }} className="node-tuning-grid">
+              <NumberInput label={t('nodes.priority')} description={t('nodes.priorityDesc')} min={0} max={1000} {...form.getInputProps('priority')} />
               <NumberInput label={t('nodes.maxConcurrency')} description={t('concurrencyHelp.nodeDescription')} min={1} max={64} {...form.getInputProps('max_concurrency')} />
-              <TextInput label={t('nodes.connectIp')} {...form.getInputProps('connect_ip')} />
             </SimpleGrid>
+            <TextInput label={t('nodes.connectIp')} description={t('nodes.connectIpDesc')} {...form.getInputProps('connect_ip')} />
             <Group gap="xl">
               <Switch label={t('nodes.enableNode')} {...form.getInputProps('enabled', { type: 'checkbox' })} />
               <Switch label={t('nodes.cfip')} {...form.getInputProps('cf_preferred', { type: 'checkbox' })} />

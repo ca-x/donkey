@@ -332,6 +332,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mapping_updates_are_persisted() {
+        let db = db::connect("sqlite::memory:").await.unwrap();
+        let mapping = create(
+            &db,
+            MappingInput {
+                source_host: "downloads.example".into(),
+                upstream_base: "https://downloads.example/releases/".into(),
+                public_base: "https://old.example/".into(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        update(
+            &db,
+            mapping.id,
+            MappingInput {
+                source_host: "downloads.example".into(),
+                upstream_base: "https://downloads.example/releases/".into(),
+                public_base: "https://new.example/".into(),
+                enabled: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = db::get_mapping(&db, mapping.id).await.unwrap().unwrap();
+        assert_eq!(stored.public_base, "https://new.example/");
+        assert!(!stored.enabled);
+    }
+
+    #[tokio::test]
     async fn rejects_same_host_paths_outside_mapping_prefix() {
         let db = db::connect("sqlite::memory:").await.unwrap();
         create(

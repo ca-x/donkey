@@ -5,8 +5,8 @@ use axum::{
     routing::{get, post, put},
 };
 use sea_orm::{
-    ActiveModelTrait, ConnectionTrait, DbBackend, EntityTrait, IntoActiveModel, Statement,
-    TransactionTrait,
+    ActiveModelTrait, ActiveValue, ConnectionTrait, DbBackend, EntityTrait, IntoActiveModel,
+    Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -74,6 +74,7 @@ struct Dashboard {
     healthy_nodes: usize,
     registry_requests: u64,
     registry_bytes: u64,
+    registry_current_bps: u64,
     parallel_blobs: u64,
     resume_attempts: u64,
     retry_attempts: u64,
@@ -84,7 +85,7 @@ struct Dashboard {
 async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> {
     let nodes = state.nodes.list().await?;
     let cache = state.cache.stats().await?;
-    let (registry_requests, registry_bytes) = state.traffic.snapshot();
+    let traffic = state.traffic.snapshot();
     let scheduler = state.scheduler.stats();
     Ok(Json(Dashboard {
         healthy_nodes: nodes
@@ -95,8 +96,9 @@ async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> 
         cache_bytes: cache.bytes,
         cache_hits: cache.hits,
         nodes,
-        registry_requests,
-        registry_bytes,
+        registry_requests: traffic.requests,
+        registry_bytes: traffic.response_bytes,
+        registry_current_bps: traffic.current_bps,
         parallel_blobs: scheduler.parallel_blobs,
         resume_attempts: scheduler.resume_attempts,
         retry_attempts: scheduler.retry_attempts,
@@ -685,12 +687,21 @@ async fn apply_prepared_snapshot(
     }
     for route in routes {
         if route.exists {
-            route
-                .model
-                .clone()
-                .into_active_model()
-                .update(transaction)
-                .await?;
+            let model = &route.model;
+            db::registry_route::ActiveModel {
+                id: ActiveValue::Unchanged(model.id),
+                key: ActiveValue::Set(model.key.clone()),
+                name: ActiveValue::Set(model.name.clone()),
+                canonical_registry: ActiveValue::Set(model.canonical_registry.clone()),
+                path_prefix: ActiveValue::Set(model.path_prefix.clone()),
+                repository_mode: ActiveValue::Set(model.repository_mode.clone()),
+                is_default: ActiveValue::Set(model.is_default),
+                enabled: ActiveValue::Set(model.enabled),
+                created_at: ActiveValue::Unchanged(model.created_at),
+                updated_at: ActiveValue::Set(model.updated_at),
+            }
+            .update(transaction)
+            .await?;
         } else {
             route
                 .model
@@ -702,11 +713,25 @@ async fn apply_prepared_snapshot(
     }
     for node in nodes {
         if node.exists {
-            node.model
-                .clone()
-                .into_active_model()
-                .update(transaction)
-                .await?;
+            let model = &node.model;
+            db::node::ActiveModel {
+                id: ActiveValue::Unchanged(model.id),
+                name: ActiveValue::Set(model.name.clone()),
+                url: ActiveValue::Set(model.url.clone()),
+                registry_route_id: ActiveValue::Set(model.registry_route_id),
+                enabled: ActiveValue::Set(model.enabled),
+                priority: ActiveValue::Set(model.priority),
+                cf_preferred: ActiveValue::Set(model.cf_preferred),
+                connect_ip: ActiveValue::Set(model.connect_ip.clone()),
+                auth_mode: ActiveValue::Set(model.auth_mode.clone()),
+                auth_username: ActiveValue::Set(model.auth_username.clone()),
+                auth_header: ActiveValue::Set(model.auth_header.clone()),
+                auth_secret_enc: ActiveValue::Set(model.auth_secret_enc.clone()),
+                created_at: ActiveValue::Unchanged(model.created_at),
+                updated_at: ActiveValue::Set(model.updated_at),
+            }
+            .update(transaction)
+            .await?;
         } else {
             node.model
                 .clone()
@@ -1022,5 +1047,43 @@ mod tests {
         assert_eq!(imported[0].auth_mode, "basic");
         assert_eq!(imported[0].auth_username.as_deref(), Some("robot"));
         assert!(imported[0].auth_secret_enc.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_updates_existing_node_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(crate::Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        state
+            .nodes
+            .create(NodeInput {
+                name: "before import".into(),
+                url: "http://127.0.0.1:5004/".into(),
+                registry_route_id: crate::registry_routes::DOCKER_HUB_ROUTE_ID,
+                enabled: true,
+                priority: 20,
+                max_concurrency: 4,
+                cf_preferred: false,
+                connect_ip: None,
+                auth_mode: "none".into(),
+                auth_username: None,
+                auth_header: None,
+                auth_secret: None,
+            })
+            .await
+            .unwrap();
+        let mut export = export_runtime(State(state.clone())).await.unwrap().0;
+        let node = export.nodes.first_mut().unwrap();
+        node.name = "after import".into();
+        node.priority = 7;
+        node.max_concurrency = 12;
+
+        apply_runtime_snapshot(&state, &export).await.unwrap();
+
+        let stored = state.nodes.list().await.unwrap();
+        assert_eq!(stored[0].node.name, "after import");
+        assert_eq!(stored[0].node.priority, 7);
+        assert_eq!(stored[0].max_concurrency, 12);
     }
 }

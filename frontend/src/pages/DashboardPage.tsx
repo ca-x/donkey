@@ -27,7 +27,7 @@ export function DashboardPage() {
   const dashboard = useQuery({
     queryKey: ['dashboard'],
     queryFn: api.dashboard,
-    refetchInterval: 15_000,
+    refetchInterval: 3_000,
   })
 
   if (dashboard.isLoading) return <LoadingState />
@@ -36,7 +36,7 @@ export function DashboardPage() {
   const enabledNodes = data.nodes.filter((item) => item.node.enabled)
   const chart = enabledNodes.slice(0, 8).map((item) => ({
     name: item.node.name.length > 12 ? `${item.node.name.slice(0, 11)}…` : item.node.name,
-    speed: Math.round(item.metric.speed_bps / 1024),
+    speed: Math.round(item.live_bps / 1024),
     healthy: item.metric.healthy,
   }))
 
@@ -44,7 +44,7 @@ export function DashboardPage() {
     <Stack gap={24}>
       <PageHeader
         title={t('dashboard.title')}
-        description={t('dashboard.description')}
+        description={t('ui.dashboardDescription')}
         action={<Group gap={7} wrap="nowrap"><span className="badge-dot" data-healthy={data.healthy_nodes > 0 || undefined} aria-hidden="true" /><Text size="sm" fw={620}>{t(data.healthy_nodes > 0 ? 'dashboard.online' : 'dashboard.waiting')}</Text></Group>}
       />
 
@@ -54,7 +54,7 @@ export function DashboardPage() {
         <MetricCard index={2} label={t('dashboard.hits')} value={data.cache_hits.toLocaleString()} detail={t('dashboard.hitsDetail')} icon={<IconBolt size={18} />} />
         <MetricCard index={3} label={t('dashboard.mode')} value={t(enabledNodes.length > 1 ? 'dashboard.concurrent' : 'dashboard.fallback')} detail={t('dashboard.integrity')} icon={<IconRoute size={18} />} />
         <MetricCard index={4} label={t('dashboard.registryRequests')} value={data.registry_requests.toLocaleString()} detail={t('dashboard.registryRequestsDetail')} icon={<IconActivityHeartbeat size={18} />} />
-        <MetricCard index={5} label={t('dashboard.registryBytes')} value={formatBytes(data.registry_bytes)} detail={t('dashboard.registryBytesDetail')} icon={<IconDatabase size={18} />} />
+        <MetricCard index={5} label={t('dashboard.registryBytes')} value={formatBytes(data.registry_bytes)} detail={t('ui.liveRate', { rate: formatRate(data.registry_current_bps) })} icon={<IconDatabase size={18} />} />
         <MetricCard index={6} label={t('dashboard.concurrent')} value={data.parallel_blobs.toLocaleString()} detail={`${formatBytes(data.last_chunk_size)} · ${data.cooling_nodes} ${t('dashboard.waiting')}`} icon={<IconRoute size={18} />} />
         <MetricCard index={7} label={t('imageTools.retry')} value={data.retry_attempts.toLocaleString()} detail={`${data.resume_attempts.toLocaleString()} · ${t('settings.resumableThreshold')}`} icon={<IconActivityHeartbeat size={18} />} />
       </SimpleGrid>
@@ -63,8 +63,8 @@ export function DashboardPage() {
         <Paper className="panel chart-panel">
           <Group justify="space-between" align="flex-start" mb="lg">
             <Box>
-              <Title order={2}>{t('dashboard.throughput')}</Title>
-              <Text size="sm" c="dimmed" mt={4}>{t('dashboard.throughputDesc')}</Text>
+              <Title order={2}>{t('ui.liveThroughput')}</Title>
+              <Text size="sm" c="dimmed" mt={4}>{t('ui.liveThroughputDescription')}</Text>
             </Box>
           </Group>
           {chart.length > 0 ? (
@@ -98,7 +98,7 @@ export function DashboardPage() {
                 <Box c={item.metric.healthy ? 'green.5' : 'red.5'} aria-hidden="true"><IconRoute size={18} /></Box>
                 <Box className="route-copy">
                   <Text size="sm" fw={650} truncate>{item.node.name}</Text>
-                  <Text size="xs" c="dimmed">{formatRate(item.metric.speed_bps)} · {item.metric.latency_ms}ms</Text>
+                  <Text size="xs" c="dimmed">{t('ui.liveRate', { rate: formatRate(item.live_bps) })} · {t('ui.smoothedRate', { rate: formatRate(item.metric.speed_bps) })} · {item.metric.last_checked_at ? `${item.metric.latency_ms}ms` : '—'}</Text>
                 </Box>
                 <Text size="xs" fw={620} c={item.metric.healthy ? 'green.5' : 'red.5'}>
                   {t(item.metric.healthy ? 'dashboard.available' : 'common.error')}
