@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -10,13 +9,13 @@ use std::{
 use axum::{body::Body, response::Response};
 use futures_util::StreamExt;
 
-const LIVE_WINDOW: Duration = Duration::from_secs(5);
+const MIN_RATE_SAMPLE: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TrafficMetrics {
     requests: Arc<AtomicU64>,
     response_bytes: Arc<AtomicU64>,
-    live: Arc<Mutex<RateWindow>>,
+    rate: Arc<Mutex<RateSampler>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -26,9 +25,20 @@ pub struct TrafficSnapshot {
     pub current_bps: u64,
 }
 
-#[derive(Default)]
-struct RateWindow {
-    samples: VecDeque<(Instant, u64)>,
+struct RateSampler {
+    observed_at: Instant,
+    observed_bytes: u64,
+    current_bps: u64,
+}
+
+impl Default for TrafficMetrics {
+    fn default() -> Self {
+        Self {
+            requests: Arc::new(AtomicU64::new(0)),
+            response_bytes: Arc::new(AtomicU64::new(0)),
+            rate: Arc::new(Mutex::new(RateSampler::new(Instant::now(), 0))),
+        }
+    }
 }
 
 impl TrafficMetrics {
@@ -49,53 +59,42 @@ impl TrafficMetrics {
     }
 
     pub fn snapshot(&self) -> TrafficSnapshot {
+        let response_bytes = self.response_bytes.load(Ordering::Relaxed);
         let current_bps = self
-            .live
+            .rate
             .lock()
-            .map(|mut window| window.rate(Instant::now()))
+            .map(|mut sampler| sampler.observe(Instant::now(), response_bytes))
             .unwrap_or(0);
         TrafficSnapshot {
             requests: self.requests.load(Ordering::Relaxed),
-            response_bytes: self.response_bytes.load(Ordering::Relaxed),
+            response_bytes,
             current_bps,
         }
     }
 
     fn record_bytes(&self, bytes: u64) {
         self.response_bytes.fetch_add(bytes, Ordering::Relaxed);
-        if let Ok(mut window) = self.live.lock() {
-            window.record(Instant::now(), bytes);
-        }
     }
 }
 
-impl RateWindow {
-    fn record(&mut self, now: Instant, bytes: u64) {
-        self.samples.push_back((now, bytes));
-        self.prune(now);
-    }
-
-    fn rate(&mut self, now: Instant) -> u64 {
-        self.prune(now);
-        let Some((first_at, _)) = self.samples.front() else {
-            return 0;
-        };
-        let elapsed = now.duration_since(*first_at).as_secs_f64().max(0.25);
-        let bytes = self
-            .samples
-            .iter()
-            .fold(0_u64, |total, (_, bytes)| total.saturating_add(*bytes));
-        (bytes as f64 / elapsed).min(u64::MAX as f64) as u64
-    }
-
-    fn prune(&mut self, now: Instant) {
-        while self
-            .samples
-            .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) > LIVE_WINDOW)
-        {
-            self.samples.pop_front();
+impl RateSampler {
+    fn new(observed_at: Instant, observed_bytes: u64) -> Self {
+        Self {
+            observed_at,
+            observed_bytes,
+            current_bps: 0,
         }
+    }
+
+    fn observe(&mut self, now: Instant, total_bytes: u64) -> u64 {
+        let elapsed = now.duration_since(self.observed_at);
+        if elapsed >= MIN_RATE_SAMPLE {
+            let bytes = total_bytes.saturating_sub(self.observed_bytes);
+            self.current_bps = (bytes as f64 / elapsed.as_secs_f64()).min(u64::MAX as f64) as u64;
+            self.observed_at = now;
+            self.observed_bytes = total_bytes;
+        }
+        self.current_bps
     }
 }
 
@@ -115,6 +114,25 @@ mod tests {
         assert_eq!(body.as_ref(), b"payload");
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.response_bytes, 7);
-        assert!(snapshot.current_bps > 0);
+    }
+
+    #[test]
+    fn rate_is_sampled_from_the_atomic_total_off_the_response_hot_path() {
+        let started = Instant::now();
+        let mut sampler = RateSampler::new(started, 1_000);
+
+        assert_eq!(
+            sampler.observe(started + Duration::from_secs(2), 9_000),
+            4_000
+        );
+        assert_eq!(
+            sampler.observe(
+                started + Duration::from_secs(2) + Duration::from_millis(10),
+                9_100
+            ),
+            4_000
+        );
+        assert_eq!(sampler.observe(started + Duration::from_secs(5), 9_100), 33);
+        assert_eq!(sampler.observe(started + Duration::from_secs(8), 9_100), 0);
     }
 }

@@ -30,8 +30,8 @@ export function CachePage() {
   const client = useQueryClient()
   const [pendingDelete, setPendingDelete] = useState<CacheEntry | null>(null)
   const [clearRequested, setClearRequested] = useState(false)
-  const cache = useQuery({ queryKey: ['cache'], queryFn: () => api.cache(500) })
-  const runtime = useQuery({ queryKey: ['runtime'], queryFn: api.runtime })
+  const cache = useQuery({ queryKey: ['cache'], queryFn: () => api.cache(500), refetchInterval: 10_000 })
+  const runtime = useQuery({ queryKey: ['runtime'], queryFn: api.runtime, refetchInterval: 10_000 })
   const remove = useMutation({
     mutationFn: api.deleteCache,
     onSuccess: () => {

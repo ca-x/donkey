@@ -1080,7 +1080,10 @@ mod proxy_integration {
             );
             assert!(first.ranges().await.iter().any(Option::is_some));
             assert!(second.ranges().await.iter().any(Option::is_some));
-            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+            let cache = state.cache.stats().await.unwrap();
+            assert_eq!(cache.entries, 1);
+            assert_eq!(cache.bytes, bytes.len() as u64);
+            assert_eq!(state.traffic.snapshot().response_bytes, bytes.len() as u64);
             let scheduler = state.scheduler.stats();
             assert!(scheduler.parallel_blobs >= 1);
             assert_eq!(scheduler.last_chunk_size, 4);
