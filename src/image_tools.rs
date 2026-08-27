@@ -17,10 +17,10 @@ use chrono_tz::Tz;
 use cron::Schedule;
 use dashmap::DashMap;
 use futures_util::StreamExt;
+#[cfg(test)]
+use oci_client::client::ClientConfig;
 use oci_client::{
-    Client, Reference, RegistryOperation,
-    client::ClientConfig,
-    errors::OciDistributionError,
+    Client, Reference,
     manifest::{OciImageManifest, OciManifest},
     secrets::RegistryAuth,
 };
@@ -37,7 +37,6 @@ use tokio::{
     sync::RwLock,
     sync::{Mutex, Notify},
 };
-use tokio_util::io::ReaderStream;
 use url::Url;
 use uuid::Uuid;
 
@@ -53,12 +52,14 @@ use crate::{
 mod archive;
 mod artifacts;
 mod files;
+mod registry;
 
 use archive::{ArchiveInput, build_archive};
 #[cfg(test)]
 use archive::{build_docker_archive, build_oci_archive};
 use artifacts::ArtifactStore;
 use files::{FileBrowser, FileEntry};
+use registry::{DestinationRegistryAdapter, SourceRegistryAdapter, image_client};
 
 #[derive(Clone)]
 pub struct ImageTools {
@@ -707,11 +708,12 @@ impl ImageTools {
             return self.prepare_image_via_node(job, &logical, node_id).await;
         }
         let (source, auth) = self.source_transport(&logical, job).await?;
-        let client = image_client(&job.platform_os, &job.platform_arch);
-        let (manifest, digest, config_json, index_digest) = client
-            .pull_manifest_and_config_and_list_digest(&source, &auth)
-            .await
-            .map_err(oci_error)?;
+        let source = SourceRegistryAdapter::new(source, auth, &job.platform_os, &job.platform_arch);
+        let pulled = source.pull_manifest().await?;
+        let manifest = pulled.manifest;
+        let digest = pulled.digest;
+        let config_json = pulled.config_json;
+        let index_digest = pulled.index_digest;
         let total_bytes = manifest
             .layers
             .iter()
@@ -745,10 +747,7 @@ impl ImageTools {
             let shared = self.artifacts.shared_blob_path(&layer.digest)?;
             if tokio::fs::metadata(&shared).await.is_err() {
                 let temp = shared.with_extension("partial");
-                client
-                    .pull_blob(&source, layer, File::create(&temp).await?)
-                    .await
-                    .map_err(oci_error)?;
+                source.pull_blob(layer, File::create(&temp).await?).await?;
                 tokio::fs::rename(&temp, &shared).await?;
             }
             link_or_copy(&shared, &path).await?;
@@ -1173,40 +1172,27 @@ impl ImageTools {
         auth: &RegistryAuth,
         client: &Client,
     ) -> ApiResult<()> {
-        client
-            .auth(destination, auth, RegistryOperation::Push)
-            .await
-            .map_err(oci_error)?;
+        let destination = DestinationRegistryAdapter::new(client, destination, auth);
+        destination.authenticate().await?;
 
         for (layer, path) in image.manifest.layers.iter().zip(&image.layer_paths) {
             self.check_cancelled(job.id).await?;
-            if !client
-                .blob_exists(destination, &layer.digest)
-                .await
-                .map_err(oci_error)?
-            {
-                push_file(client, destination, path, &layer.digest).await?;
+            if !destination.blob_exists(&layer.digest).await? {
+                destination.push_file(path, &layer.digest).await?;
             }
         }
-        if !client
-            .blob_exists(destination, &image.manifest.config.digest)
-            .await
-            .map_err(oci_error)?
+        if !destination
+            .blob_exists(&image.manifest.config.digest)
+            .await?
         {
-            client
-                .push_blob(
-                    destination,
+            destination
+                .push_bytes(
                     image.config_json.as_bytes().to_vec(),
                     &image.manifest.config.digest,
                 )
-                .await
-                .map_err(oci_error)?;
+                .await?;
         }
-        client
-            .push_manifest(destination, &OciManifest::Image(image.manifest.clone()))
-            .await
-            .map_err(oci_error)?;
-        Ok(())
+        destination.push_manifest(image.manifest.clone()).await
     }
 
     async fn copy_already_completed(
@@ -2074,29 +2060,6 @@ async fn extracted_root(db: &DatabaseConnection, id: Uuid) -> ApiResult<PathBuf>
     Ok(path)
 }
 
-fn image_client(os: &str, arch: &str) -> Client {
-    let os = os.to_owned();
-    let arch = arch.to_owned();
-    let config = ClientConfig {
-        max_concurrent_download: 4,
-        max_concurrent_upload: 4,
-        read_timeout: Some(Duration::from_secs(120)),
-        connect_timeout: Some(Duration::from_secs(15)),
-        platform_resolver: Some(Box::new(move |manifests| {
-            manifests
-                .iter()
-                .find(|entry| {
-                    entry.platform.as_ref().is_some_and(|platform| {
-                        platform.os.to_string() == os && platform.architecture.to_string() == arch
-                    })
-                })
-                .map(|entry| entry.digest.clone())
-        })),
-        ..Default::default()
-    };
-    Client::new(config)
-}
-
 fn manifest_accept() -> &'static str {
     "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
 }
@@ -2345,21 +2308,6 @@ async fn write_layout(layout: &Path, manifest: &OciImageManifest) -> ApiResult<(
     Ok(())
 }
 
-async fn push_file(
-    client: &Client,
-    reference: &Reference,
-    path: &Path,
-    digest: &str,
-) -> ApiResult<()> {
-    let stream = ReaderStream::new(File::open(path).await?)
-        .map(|result| result.map_err(OciDistributionError::IoError));
-    client
-        .push_blob_stream(reference, stream, digest)
-        .await
-        .map_err(oci_error)?;
-    Ok(())
-}
-
 fn safe_error(error: &AppError) -> String {
     match error {
         AppError::BadRequest(message) => message.chars().take(500).collect(),
@@ -2367,10 +2315,6 @@ fn safe_error(error: &AppError) -> String {
         AppError::Integrity => "image content integrity check failed".into(),
         _ => "image task failed; check server logs".into(),
     }
-}
-
-fn oci_error(error: OciDistributionError) -> AppError {
-    AppError::Upstream(error.to_string().chars().take(500).collect())
 }
 
 #[cfg(test)]
