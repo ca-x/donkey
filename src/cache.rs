@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use moka::future::Cache;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::{
     config::{CachePolicy, Config},
@@ -19,8 +19,18 @@ pub struct CacheStore {
     db: DatabaseConnection,
     flights: Cache<String, Arc<Mutex<()>>>,
     active_flights: Arc<DashMap<String, ()>>,
-    config: Arc<Config>,
+    runtime: Arc<RwLock<CacheRuntimeConfig>>,
     capacity_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Copy)]
+struct CacheRuntimeConfig {
+    partial_ttl: std::time::Duration,
+    cache_ttl: Option<std::time::Duration>,
+    max_cache_bytes: u64,
+    cache_policy: CachePolicy,
+    cache_high_watermark: f64,
+    cache_low_watermark: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -90,9 +100,26 @@ impl CacheStore {
                 .time_to_idle(std::time::Duration::from_secs(60 * 60))
                 .build(),
             active_flights: Arc::new(DashMap::new()),
-            config,
+            runtime: Arc::new(RwLock::new(CacheRuntimeConfig {
+                partial_ttl: config.partial_ttl,
+                cache_ttl: config.cache_ttl,
+                max_cache_bytes: config.max_cache_bytes,
+                cache_policy: config.cache_policy,
+                cache_high_watermark: config.cache_high_watermark,
+                cache_low_watermark: config.cache_low_watermark,
+            })),
             capacity_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub async fn update_runtime(&self, config: &Config) {
+        let mut runtime = self.runtime.write().await;
+        runtime.partial_ttl = config.partial_ttl;
+        runtime.cache_ttl = config.cache_ttl;
+        runtime.max_cache_bytes = config.max_cache_bytes;
+        runtime.cache_policy = config.cache_policy;
+        runtime.cache_high_watermark = config.cache_high_watermark;
+        runtime.cache_low_watermark = config.cache_low_watermark;
     }
 
     pub fn key(request_path: &str, authorization: Option<&str>) -> String {
@@ -248,8 +275,9 @@ impl CacheStore {
         // Remove orphaned object files and stale partials that are not present
         // in the index. Active downloads remain protected by the partial TTL.
         let _ = remove_orphan_files(&self.root.join("objects"), None, &self.active_flights).await;
+        let partial_ttl = self.runtime.read().await.partial_ttl;
         let cutoff = std::time::SystemTime::now()
-            .checked_sub(self.config.partial_ttl)
+            .checked_sub(partial_ttl)
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         let _ =
             remove_orphan_files(&self.root.join("tmp"), Some(cutoff), &self.active_flights).await;
@@ -268,7 +296,8 @@ impl CacheStore {
     }
 
     pub async fn cleanup_expired(&self) -> ApiResult<u64> {
-        let Some(ttl) = self.config.cache_ttl else {
+        let ttl = self.runtime.read().await.cache_ttl;
+        let Some(ttl) = ttl else {
             return Ok(0);
         };
         let cutoff = Utc::now() - chrono::Duration::from_std(ttl).map_err(AppError::internal)?;
@@ -288,7 +317,8 @@ impl CacheStore {
     }
 
     async fn reserve_capacity_locked(&self, incoming: u64, protected_key: &str) -> ApiResult<()> {
-        if incoming > self.config.max_cache_bytes {
+        let runtime = *self.runtime.read().await;
+        if incoming > runtime.max_cache_bytes {
             return Err(AppError::bad_request(
                 "object exceeds the configured cache capacity",
             ));
@@ -298,21 +328,21 @@ impl CacheStore {
             .iter()
             .map(|entry| entry.size_bytes.max(0) as u64)
             .sum::<u64>();
-        let high = (self.config.max_cache_bytes as f64 * self.config.cache_high_watermark) as u64;
+        let high = (runtime.max_cache_bytes as f64 * runtime.cache_high_watermark) as u64;
         if current.saturating_add(incoming) <= high {
             return Ok(());
         }
-        let target = (self.config.max_cache_bytes as f64 * self.config.cache_low_watermark) as u64;
+        let target = (runtime.max_cache_bytes as f64 * runtime.cache_low_watermark) as u64;
         let target_after_admission = target.max(incoming);
         let need_to_free = current
             .saturating_add(incoming)
             .saturating_sub(target_after_admission);
         let now = Utc::now();
         entries.sort_by(|a, b| {
-            retention_score(a, now, self.config.cache_policy).total_cmp(&retention_score(
+            retention_score(a, now, runtime.cache_policy).total_cmp(&retention_score(
                 b,
                 now,
-                self.config.cache_policy,
+                runtime.cache_policy,
             ))
         });
         let mut freed = 0_u64;
