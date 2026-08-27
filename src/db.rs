@@ -967,6 +967,31 @@ pub async fn finish_image_job_owned(
     Ok(result.rows_affected() == 1)
 }
 
+pub async fn renew_image_job(
+    db: &DatabaseConnection,
+    job_id: Uuid,
+    worker_id: Uuid,
+    attempt: i64,
+    now: DateTime<Utc>,
+    lease_until: DateTime<Utc>,
+) -> Result<bool, DbErr> {
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE image_jobs SET lease_until = ?, updated_at = ? WHERE id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM image_job_owners WHERE job_id = ? AND worker_id = ? AND attempt = ?)",
+            [
+                lease_until.into(),
+                now.into(),
+                job_id.into(),
+                job_id.to_string().into(),
+                worker_id.to_string().into(),
+                attempt.into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub async fn list_mappings(db: &DatabaseConnection) -> Result<Vec<domain_mapping::Model>, DbErr> {
     domain_mapping::Entity::find()
         .order_by_asc(domain_mapping::Column::SourceHost)

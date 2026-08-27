@@ -36,6 +36,7 @@ use tokio::{
     io::AsyncWriteExt,
     sync::{Mutex, Notify},
 };
+use dashmap::DashMap;
 use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
@@ -62,6 +63,7 @@ pub struct ImageTools {
     wake: Arc<Notify>,
     last_cleanup: Arc<Mutex<Instant>>,
     worker_id: Uuid,
+    active_attempts: Arc<DashMap<Uuid, i64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,6 +334,7 @@ impl ImageTools {
             wake: Arc::new(Notify::new()),
             last_cleanup: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
             worker_id: Uuid::new_v4(),
+            active_attempts: Arc::new(DashMap::new()),
         };
         service.recover_abandoned_jobs(Utc::now()).await?;
         Ok(service)
@@ -386,9 +389,36 @@ impl ImageTools {
             .filter(|(worker, _)| *worker == self.worker_id)
             .map(|(_, attempt)| attempt)
             .ok_or_else(|| AppError::Conflict("image job ownership was lost".into()))?;
+        self.active_attempts.insert(job.id, attempt);
 
+        let heartbeat = {
+            let service = self.clone();
+            tokio::spawn(async move {
+                let interval = Duration::from_secs((JOB_LEASE_MINUTES as u64 * 60 / 3).max(1));
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let now = Utc::now();
+                    if !db::renew_image_job(
+                        &service.db,
+                        job.id,
+                        service.worker_id,
+                        attempt,
+                        now,
+                        now + chrono::Duration::minutes(JOB_LEASE_MINUTES),
+                    )
+                    .await
+                    .unwrap_or(false)
+                    {
+                        break;
+                    }
+                }
+            })
+        };
         let result = self.process_job(&job).await;
-        self.finish_job(job.id, attempt, result).await
+        heartbeat.abort();
+        let finished = self.finish_job(job.id, attempt, result).await;
+        self.active_attempts.remove(&job.id);
+        finished
     }
 
     async fn claim_next_job(&self) -> ApiResult<Option<image_job::Model>> {
@@ -469,28 +499,14 @@ impl ImageTools {
             return Ok(());
         }
 
-        let current = image_job::Entity::find_by_id(id)
-            .one(&self.db)
-            .await?
-            .ok_or_else(|| AppError::not_found("image job"))?;
-        if current.status == JobStatus::Running.as_str() && current.cancel_requested {
-            let cancelled =
-                transition_update(JobStatus::Running, JobStatus::Cancelled, Utc::now(), None)?
-                    .filter(image_job::Column::Id.eq(id))
-                    .filter(image_job::Column::CancelRequested.eq(true))
-                    .exec(&self.db)
-                    .await?;
-            if cancelled.rows_affected == 1 {
-                return Ok(());
-            }
-        }
         Err(AppError::bad_request(
             "image job is no longer in a finishable state",
         ))
     }
 
-    // v0.1 runs one worker per process. Leases support abandonment recovery;
-    // they are not ownership tokens and do not provide cross-process fencing.
+    // Each worker owns a claimed job through image_job_owners and its
+    // monotonically increasing attempt token. Expired leases may be reclaimed
+    // by another worker; stale writes are rejected by ownership checks.
     async fn recover_abandoned_jobs(&self, now: DateTime<Utc>) -> ApiResult<u64> {
         let has_abandoned = image_job::Entity::find()
             .select_only()
@@ -1128,6 +1144,7 @@ impl ImageTools {
     }
 
     async fn update_job_manifest(&self, id: Uuid, image: &PreparedImage) -> ApiResult<()> {
+        self.ensure_job_owner(id).await?;
         image_job::Entity::update_many()
             .col_expr(
                 image_job::Column::ResolvedDigest,
@@ -1148,6 +1165,7 @@ impl ImageTools {
     }
 
     async fn set_progress(&self, id: Uuid, stage: &str, current: u64, total: u64) -> ApiResult<()> {
+        self.ensure_job_owner(id).await?;
         let now = Utc::now();
         image_job::Entity::update_many()
             .col_expr(
@@ -1180,6 +1198,7 @@ impl ImageTools {
     }
 
     async fn set_stage(&self, id: Uuid, stage: &str) -> ApiResult<()> {
+        self.ensure_job_owner(id).await?;
         let now = Utc::now();
         image_job::Entity::update_many()
             .col_expr(
@@ -1204,6 +1223,7 @@ impl ImageTools {
     }
 
     async fn set_artifact(&self, id: Uuid, path: &Path, name: &str) -> ApiResult<()> {
+        self.ensure_job_owner(id).await?;
         image_job::Entity::update_many()
             .col_expr(
                 image_job::Column::ArtifactPath,
@@ -1229,6 +1249,21 @@ impl ImageTools {
         } else {
             Ok(())
         }
+    }
+
+    async fn ensure_job_owner(&self, id: Uuid) -> ApiResult<()> {
+        let Some((worker, attempt)) = db::image_job_owner(&self.db, id).await? else {
+            return Err(AppError::Conflict("image job ownership is missing".into()));
+        };
+        if worker != self.worker_id
+            || self
+                .active_attempts
+                .get(&id)
+                .is_none_or(|expected| *expected != attempt)
+        {
+            return Err(AppError::Conflict("image job ownership has changed".into()));
+        }
+        Ok(())
     }
 
     async fn enqueue_due_rules(&self) -> ApiResult<()> {
