@@ -6,6 +6,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
+use http_content_range::ContentRange;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tower::ServiceExt;
@@ -146,11 +147,11 @@ async fn stream_blob(
     nodes: Vec<crate::nodes::NodeView>,
 ) -> ApiResult<Response> {
     let mut last_error = None;
-    for node in nodes {
+    for (node_index, node) in nodes.iter().enumerate() {
         let upstream = match state
             .upstream
             .send(
-                &node,
+                node,
                 Method::GET,
                 path,
                 &headers,
@@ -173,13 +174,17 @@ async fn stream_blob(
             }
         };
 
+        let status = upstream.status();
         let response_headers = upstream.headers().clone();
+        let Some(window) = stream_window(&upstream) else {
+            return Ok(to_response(upstream));
+        };
         let media_type = response_headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_owned();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
         let cache = state.cache.clone();
         let key = CacheStore::key(
             path,
@@ -188,51 +193,33 @@ async fn stream_blob(
                 .and_then(|v| v.to_str().ok()),
         );
         let expected = expected_digest.map(str::to_owned);
-        let temp_dir = cache.temp_dir();
+        let relay = StreamRelay {
+            upstream: state.upstream.clone(),
+            nodes: nodes.clone(),
+            current_node: node_index,
+            response: upstream,
+            path: path.to_owned(),
+            headers,
+            window,
+            cache,
+            key,
+            media_type,
+            expected_digest: expected,
+        };
         tokio::spawn(async move {
-            let temp = match tempfile::Builder::new()
-                .prefix("donkey-stream-")
-                .tempdir_in(temp_dir)
-            {
-                Ok(temp) => temp,
-                Err(_) => return,
-            };
-            let partial = temp.path().join("object.partial");
-            let mut file = match tokio::fs::File::create(&partial).await {
-                Ok(file) => file,
-                Err(_) => return,
-            };
-            let mut hasher = Sha256::new();
-            let mut body = upstream.bytes_stream();
-            while let Some(chunk) = body.next().await {
-                let Ok(chunk) = chunk else { return };
-                hasher.update(&chunk);
-                if file.write_all(&chunk).await.is_err() || tx.send(chunk).await.is_err() {
-                    return;
-                }
-            }
-            if let Some(expected) = expected.as_deref() {
-                let actual = format!("sha256:{:x}", hasher.finalize());
-                if actual != expected {
-                    return;
-                }
-            }
-            let _ = file.flush().await;
-            if cache
-                .admit(&key, &partial, &media_type, expected)
-                .await
-                .is_ok()
-            {
-                let _ = tokio::fs::remove_dir_all(cache.temp_dir().join(&key)).await;
+            let errors = tx.clone();
+            if let Err(error) = relay_stream_blob(relay, tx).await {
+                let _ = errors
+                    .send(Err(std::io::Error::other(error.to_string())))
+                    .await;
             }
         });
 
         let body = futures_util::stream::unfold(rx, |mut rx| async {
-            rx.recv()
-                .await
-                .map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), rx))
+            rx.recv().await.map(|chunk| (chunk, rx))
         });
         let mut response = Response::new(Body::from_stream(body));
+        *response.status_mut() = status;
         copy_response_headers(&response_headers, response.headers_mut());
         response.headers_mut().insert(
             "docker-distribution-api-version",
@@ -241,6 +228,226 @@ async fn stream_blob(
         return Ok(response);
     }
     Err(last_error.unwrap_or_else(|| AppError::unavailable("all upstream nodes failed")))
+}
+
+#[derive(Clone, Copy)]
+struct StreamWindow {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+struct StreamRelay {
+    upstream: crate::upstream::UpstreamService,
+    nodes: Vec<crate::nodes::NodeView>,
+    current_node: usize,
+    response: reqwest::Response,
+    path: String,
+    headers: HeaderMap,
+    window: StreamWindow,
+    cache: CacheStore,
+    key: String,
+    media_type: String,
+    expected_digest: Option<String>,
+}
+
+struct ResumeRequest<'a> {
+    upstream: &'a crate::upstream::UpstreamService,
+    nodes: &'a [crate::nodes::NodeView],
+    current_node: usize,
+    path: &'a str,
+    headers: &'a HeaderMap,
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+fn stream_window(response: &reqwest::Response) -> Option<StreamWindow> {
+    if response.status() == StatusCode::PARTIAL_CONTENT {
+        let range = response
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(ContentRange::parse)?;
+        let ContentRange::Bytes(range) = range else {
+            return None;
+        };
+        let length = range
+            .last_byte
+            .checked_sub(range.first_byte)?
+            .checked_add(1)?;
+        if response.content_length() != Some(length) {
+            return None;
+        }
+        return Some(StreamWindow {
+            start: range.first_byte,
+            end: range.last_byte,
+            total: range.complete_length,
+        });
+    }
+    if response.status().is_success() {
+        let total = response.content_length().filter(|size| *size > 0)?;
+        return Some(StreamWindow {
+            start: 0,
+            end: total - 1,
+            total,
+        });
+    }
+    None
+}
+
+async fn relay_stream_blob(
+    relay: StreamRelay,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> ApiResult<()> {
+    let StreamRelay {
+        upstream,
+        nodes,
+        mut current_node,
+        response,
+        path,
+        headers,
+        window,
+        cache,
+        key,
+        media_type,
+        expected_digest,
+    } = relay;
+    let temp = tempfile::Builder::new()
+        .prefix("donkey-stream-")
+        .tempdir_in(cache.temp_dir())?;
+    let partial = temp.path().join("object.partial");
+    let mut file = tokio::fs::File::create(&partial).await?;
+    let complete_blob = window.start == 0 && window.end.checked_add(1) == Some(window.total);
+    let mut hasher = Sha256::new();
+    let mut offset = window.start;
+    let mut response = response;
+
+    while offset <= window.end {
+        let mut body = response.bytes_stream();
+        let mut stream_error = None;
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    let remaining = window.end - offset + 1;
+                    if chunk.len() as u64 > remaining {
+                        return Err(AppError::Integrity);
+                    }
+                    if complete_blob {
+                        hasher.update(&chunk);
+                    }
+                    file.write_all(&chunk).await?;
+                    offset += chunk.len() as u64;
+                    tx.send(Ok(chunk)).await.map_err(|_| {
+                        AppError::Upstream("client disconnected during Blob stream".into())
+                    })?;
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        if offset > window.end {
+            break;
+        }
+        tracing::warn!(
+            path,
+            offset,
+            expected_end = window.end,
+            error = stream_error
+                .as_deref()
+                .unwrap_or("upstream body ended early"),
+            "Blob stream interrupted; resuming from another node"
+        );
+        let (next_node, next_response) = resume_stream_response(ResumeRequest {
+            upstream: &upstream,
+            nodes: &nodes,
+            current_node,
+            path: &path,
+            headers: &headers,
+            start: offset,
+            end: window.end,
+            total: window.total,
+        })
+        .await?;
+        current_node = next_node;
+        response = next_response;
+    }
+
+    file.flush().await?;
+    if complete_blob {
+        if let Some(expected) = expected_digest.as_deref() {
+            let actual = format!("sha256:{:x}", hasher.finalize());
+            if actual != expected {
+                return Err(AppError::Integrity);
+            }
+        }
+        cache
+            .admit(&key, &partial, &media_type, expected_digest)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn resume_stream_response(
+    request: ResumeRequest<'_>,
+) -> ApiResult<(usize, reqwest::Response)> {
+    use backoff::backoff::Backoff;
+
+    if request.nodes.is_empty() {
+        return Err(AppError::unavailable(
+            "no nodes are available for Blob resume",
+        ));
+    }
+    let mut policy = backoff::ExponentialBackoffBuilder::new()
+        .with_initial_interval(std::time::Duration::from_millis(100))
+        .with_max_interval(std::time::Duration::from_secs(2))
+        .with_max_elapsed_time(Some(std::time::Duration::from_secs(30)))
+        .build();
+    let mut last_error = None;
+    loop {
+        for step in 1..=request.nodes.len() {
+            let index = (request.current_node + step) % request.nodes.len();
+            match request
+                .upstream
+                .send(
+                    &request.nodes[index],
+                    Method::GET,
+                    request.path,
+                    request.headers,
+                    crate::upstream::RangeMode::Exact(request.start, request.end),
+                )
+                .await
+            {
+                Ok(response)
+                    if response.status() == StatusCode::PARTIAL_CONTENT
+                        && stream_window(&response).is_some_and(|window| {
+                            window.start == request.start
+                                && window.end == request.end
+                                && window.total == request.total
+                        }) =>
+                {
+                    return Ok((index, response));
+                }
+                Ok(response) => {
+                    last_error = Some(format!(
+                        "{} returned an invalid resume response ({})",
+                        request.nodes[index].node.name,
+                        response.status()
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        let Some(delay) = policy.next_backoff() else {
+            break;
+        };
+        tokio::time::sleep(delay).await;
+    }
+    Err(AppError::Upstream(last_error.unwrap_or_else(|| {
+        "all nodes failed to resume the Blob stream".into()
+    })))
 }
 
 async fn serve_cached(

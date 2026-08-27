@@ -185,13 +185,29 @@ mod proxy_integration {
                         let end = end.min(state.bytes.len().saturating_sub(1) as u64);
                         let prefix_end = (start + 3).min(end);
                         let prefix = state.bytes[start as usize..=prefix_end as usize].to_vec();
-                        let body = futures_util::stream::iter([
-                            Ok::<_, std::io::Error>(bytes::Bytes::from(prefix)),
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionReset,
-                                "fixture drop",
-                            )),
-                        ]);
+                        let body = futures_util::stream::unfold(
+                            (0_u8, Some(bytes::Bytes::from(prefix))),
+                            |(step, mut prefix)| async move {
+                                match step {
+                                    0 => Some((
+                                        Ok::<_, std::io::Error>(prefix.take().unwrap()),
+                                        (1, prefix),
+                                    )),
+                                    1 => {
+                                        tokio::time::sleep(std::time::Duration::from_millis(25))
+                                            .await;
+                                        Some((
+                                            Err(std::io::Error::new(
+                                                std::io::ErrorKind::ConnectionReset,
+                                                "fixture drop",
+                                            )),
+                                            (2, prefix),
+                                        ))
+                                    }
+                                    _ => None,
+                                }
+                            },
+                        );
                         let mut response = Response::new(Body::from_stream(body));
                         response.headers_mut().insert(
                             header::CONTENT_LENGTH,
@@ -697,7 +713,61 @@ mod proxy_integration {
             assert!(healthy_ranges.iter().any(|range| {
                 range
                     .as_deref()
-                    .is_some_and(|value| value.starts_with("bytes=8-"))
+                    .and_then(parse_range)
+                    .is_some_and(|(start, _)| start >= 8)
+            }));
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+        }
+
+        #[tokio::test]
+        async fn streaming_resumes_after_source_body_disconnect() {
+            let bytes = vec![b'z'; 1024 * 1024 + 17];
+            let failing = Fixture::start(FixtureBehavior::DropAfterPrefix, bytes.clone()).await;
+            let healthy = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            let state = AppState::new(config).await.unwrap();
+            for (index, fixture) in [&failing, &healthy].into_iter().enumerate() {
+                state
+                    .nodes
+                    .create(NodeInput {
+                        name: format!("stream-fixture-{index}"),
+                        url: fixture.url(),
+                        registry_route_id: DOCKER_HUB_ROUTE_ID,
+                        enabled: true,
+                        priority: index as i32,
+                        max_concurrency: 4,
+                        cf_preferred: false,
+                        connect_ip: None,
+                        auth_mode: "none".into(),
+                        auth_username: None,
+                        auth_header: None,
+                        auth_secret: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert!(healthy.ranges().await.iter().any(|range| {
+                range
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("bytes=4-"))
             }));
             assert_eq!(state.cache.stats().await.unwrap().entries, 1);
         }
