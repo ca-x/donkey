@@ -1,6 +1,5 @@
 use std::{
-    collections::HashSet,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -8,7 +7,6 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::Body,
     extract::{Path as AxumPath, Query, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     response::Response,
@@ -40,8 +38,6 @@ use tokio::{
     sync::{Mutex, Notify},
 };
 use tokio_util::io::ReaderStream;
-use tower::ServiceExt;
-use tower_http::services::ServeFile;
 use url::Url;
 use uuid::Uuid;
 
@@ -55,10 +51,14 @@ use crate::{
 };
 
 mod archive;
+mod artifacts;
+mod files;
 
 use archive::{ArchiveInput, build_archive};
 #[cfg(test)]
 use archive::{build_docker_archive, build_oci_archive};
+use artifacts::ArtifactStore;
+use files::{FileBrowser, FileEntry};
 
 #[derive(Clone)]
 pub struct ImageTools {
@@ -68,7 +68,7 @@ pub struct ImageTools {
     nodes: NodeService,
     upstream: UpstreamService,
     cipher: CredentialCipher,
-    root: Arc<PathBuf>,
+    artifacts: ArtifactStore,
     wake: Arc<Notify>,
     last_cleanup: Arc<Mutex<Instant>>,
     worker_id: Uuid,
@@ -240,14 +240,6 @@ struct ListQuery {
 struct FileQuery {
     #[serde(default)]
     path: String,
-}
-
-#[derive(Debug, Serialize)]
-struct FileEntry {
-    path: String,
-    name: String,
-    kind: &'static str,
-    size: u64,
 }
 
 const JOB_LEASE_MINUTES: i64 = 10;
@@ -445,9 +437,7 @@ impl ImageTools {
         db: DatabaseConnection,
         nodes: NodeService,
     ) -> ApiResult<Self> {
-        let root = config.data_dir.join("image-tools");
-        tokio::fs::create_dir_all(root.join("jobs")).await?;
-        tokio::fs::create_dir_all(root.join("blobs/sha256")).await?;
+        let artifacts = ArtifactStore::open(&config.data_dir).await?;
         let service = Self {
             cipher: CredentialCipher::from_config(&config)?,
             upstream: UpstreamService::new(config.clone(), nodes.clone()),
@@ -458,7 +448,7 @@ impl ImageTools {
             config,
             db,
             nodes,
-            root: Arc::new(root),
+            artifacts,
             wake: Arc::new(Notify::new()),
             last_cleanup: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
             worker_id: Uuid::new_v4(),
@@ -735,11 +725,11 @@ impl ImageTools {
             ));
         }
 
-        let job_root = self.root.join("jobs").join(job.id.to_string());
+        let job_root = self.artifacts.job_root(job.id);
         let layout = job_root.join("layout");
         tokio::fs::create_dir_all(layout.join("blobs/sha256")).await?;
         let config_path = blob_path(&layout, &manifest.config.digest)?;
-        let shared_config = self.shared_blob_path(&manifest.config.digest)?;
+        let shared_config = self.artifacts.shared_blob_path(&manifest.config.digest)?;
         if tokio::fs::metadata(&shared_config).await.is_err() {
             atomic_write(&shared_config, config_json.as_bytes()).await?;
         }
@@ -752,7 +742,7 @@ impl ImageTools {
         for layer in &manifest.layers {
             self.check_cancelled(job.id).await?;
             let path = blob_path(&layout, &layer.digest)?;
-            let shared = self.shared_blob_path(&layer.digest)?;
+            let shared = self.artifacts.shared_blob_path(&layer.digest)?;
             if tokio::fs::metadata(&shared).await.is_err() {
                 let temp = shared.with_extension("partial");
                 client
@@ -883,11 +873,11 @@ impl ImageTools {
         let config_json = String::from_utf8(config_bytes)
             .map_err(|_| AppError::Upstream("image config is not UTF-8 JSON".into()))?;
 
-        let job_root = self.root.join("jobs").join(job.id.to_string());
+        let job_root = self.artifacts.job_root(job.id);
         let layout = job_root.join("layout");
         tokio::fs::create_dir_all(layout.join("blobs/sha256")).await?;
         let layout_config = blob_path(&layout, &manifest.config.digest)?;
-        let shared_config = self.shared_blob_path(&manifest.config.digest)?;
+        let shared_config = self.artifacts.shared_blob_path(&manifest.config.digest)?;
         if tokio::fs::metadata(&shared_config).await.is_err() {
             atomic_write(&shared_config, config_json.as_bytes()).await?;
         }
@@ -900,7 +890,7 @@ impl ImageTools {
         for layer in &manifest.layers {
             self.check_cancelled(job.id).await?;
             let path = blob_path(&layout, &layer.digest)?;
-            let shared = self.shared_blob_path(&layer.digest)?;
+            let shared = self.artifacts.shared_blob_path(&layer.digest)?;
             if tokio::fs::metadata(&shared).await.is_err() {
                 let temporary = shared.with_extension("partial");
                 let result = self
@@ -1104,7 +1094,7 @@ impl ImageTools {
             return Err(AppError::bad_request("output format must be docker or oci"));
         }
         let name = safe_artifact_name(&job.source_ref, format);
-        let output = self.root.join("jobs").join(job.id.to_string()).join(&name);
+        let output = self.artifacts.job_root(job.id).join(&name);
         let output_clone = output.clone();
         let archive = if format == "docker" {
             ArchiveInput::Docker {
@@ -1133,11 +1123,7 @@ impl ImageTools {
     #[cfg(unix)]
     async fn extract_image(&self, job: &image_job::Model, image: &PreparedImage) -> ApiResult<()> {
         self.set_stage(job.id, "extracting").await?;
-        let rootfs = self
-            .root
-            .join("jobs")
-            .join(job.id.to_string())
-            .join("rootfs");
+        let rootfs = self.artifacts.job_root(job.id).join("rootfs");
         if tokio::fs::metadata(&rootfs).await.is_ok() {
             tokio::fs::remove_dir_all(&rootfs).await?;
         }
@@ -1563,14 +1549,6 @@ impl ImageTools {
         Ok(model)
     }
 
-    fn shared_blob_path(&self, digest: &str) -> ApiResult<PathBuf> {
-        let value = digest
-            .strip_prefix("sha256:")
-            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .ok_or_else(|| AppError::bad_request("only sha256 image blobs are supported"))?;
-        Ok(self.root.join("blobs/sha256").join(value))
-    }
-
     async fn cleanup_storage(&self, protected_job: Option<Uuid>) -> ApiResult<()> {
         if protected_job.is_none() {
             let mut last_cleanup = self.last_cleanup.lock().await;
@@ -1595,8 +1573,8 @@ impl ImageTools {
             }
         }
 
-        self.gc_shared_blobs().await?;
-        let mut used = storage_usage(self.root.clone()).await?;
+        self.artifacts.gc_shared_blobs().await?;
+        let mut used = self.artifacts.usage().await?;
         if used <= runtime.max_export_bytes {
             return Ok(());
         }
@@ -1611,8 +1589,8 @@ impl ImageTools {
                 continue;
             }
             self.remove_job_storage(job.id).await?;
-            self.gc_shared_blobs().await?;
-            used = storage_usage(self.root.clone()).await?;
+            self.artifacts.gc_shared_blobs().await?;
+            used = self.artifacts.usage().await?;
             if used <= runtime.max_export_bytes {
                 break;
             }
@@ -1623,23 +1601,18 @@ impl ImageTools {
     async fn enforce_storage_quota(&self, job_id: Uuid) -> ApiResult<()> {
         self.cleanup_storage(Some(job_id)).await?;
         let max_export_bytes = self.runtime.read().await.max_export_bytes;
-        if storage_usage(self.root.clone()).await? <= max_export_bytes {
+        if self.artifacts.usage().await? <= max_export_bytes {
             return Ok(());
         }
         self.remove_job_storage(job_id).await?;
-        self.gc_shared_blobs().await?;
+        self.artifacts.gc_shared_blobs().await?;
         Err(AppError::bad_request(
             "image tools storage exceeds DONKEY_MAX_EXPORT_BYTES",
         ))
     }
 
     async fn remove_job_storage(&self, id: Uuid) -> ApiResult<()> {
-        let path = self.root.join("jobs").join(id.to_string());
-        match tokio::fs::remove_dir_all(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        self.artifacts.remove_job(id).await?;
         image_job::Entity::update_many()
             .col_expr(
                 image_job::Column::ArtifactPath,
@@ -1657,14 +1630,6 @@ impl ImageTools {
             .exec(&self.db)
             .await?;
         Ok(())
-    }
-
-    async fn gc_shared_blobs(&self) -> ApiResult<()> {
-        let root = self.root.clone();
-        tokio::task::spawn_blocking(move || gc_shared_blobs_sync(&root))
-            .await
-            .map_err(AppError::internal)?
-            .map_err(AppError::from)
     }
 }
 
@@ -1958,7 +1923,7 @@ async fn download_artifact(
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .ok_or_else(|| AppError::not_found("image artifact"))?;
-    serve_path(path, job.artifact_name.as_deref(), request).await
+    FileBrowser::serve_artifact(path, job.artifact_name.as_deref(), request).await
 }
 
 async fn list_files(
@@ -1967,33 +1932,7 @@ async fn list_files(
     Query(query): Query<FileQuery>,
 ) -> ApiResult<Json<Vec<FileEntry>>> {
     let root = extracted_root(&service.db, id).await?;
-    let directory = safe_join(&root, &query.path)?;
-    let mut entries = Vec::new();
-    let mut reader = tokio::fs::read_dir(&directory).await?;
-    while let Some(entry) = reader.next_entry().await? {
-        let metadata = tokio::fs::symlink_metadata(entry.path()).await?;
-        let kind = if metadata.is_dir() {
-            "directory"
-        } else if metadata.file_type().is_symlink() {
-            "symlink"
-        } else {
-            "file"
-        };
-        let relative = entry
-            .path()
-            .strip_prefix(&root)
-            .map_err(AppError::internal)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        entries.push(FileEntry {
-            path: relative,
-            name: entry.file_name().to_string_lossy().into_owned(),
-            kind,
-            size: metadata.len(),
-        });
-    }
-    entries.sort_by(|left, right| left.kind.cmp(right.kind).then(left.name.cmp(&right.name)));
-    Ok(Json(entries))
+    Ok(Json(FileBrowser::list(&root, &query.path).await?))
 }
 
 async fn download_file(
@@ -2003,14 +1942,7 @@ async fn download_file(
     request: Request,
 ) -> ApiResult<Response> {
     let root = extracted_root(&service.db, id).await?;
-    let path = safe_join(&root, &query.path)?;
-    let metadata = tokio::fs::symlink_metadata(&path).await?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(AppError::bad_request(
-            "only regular files can be downloaded",
-        ));
-    }
-    serve_path(path, None, request).await
+    FileBrowser::serve_file(&root, &query.path, request).await
 }
 
 async fn list_rules(State(service): State<ImageTools>) -> ApiResult<Json<Vec<ImageSyncRuleView>>> {
@@ -2140,25 +2072,6 @@ async fn extracted_root(db: &DatabaseConnection, id: Uuid) -> ApiResult<PathBuf>
         .filter(|path| path.is_dir())
         .ok_or_else(|| AppError::not_found("extracted image"))?;
     Ok(path)
-}
-
-async fn serve_path(path: PathBuf, name: Option<&str>, request: Request) -> ApiResult<Response> {
-    let mut response = ServeFile::new(path)
-        .oneshot(request)
-        .await
-        .map_err(AppError::internal)?
-        .map(Body::new);
-    if let Some(name) = name {
-        let value = format!(
-            "attachment; filename=\"{}\"",
-            name.replace(['"', '\r', '\n'], "_")
-        );
-        response.headers_mut().insert(
-            header::CONTENT_DISPOSITION,
-            value.parse().map_err(AppError::internal)?,
-        );
-    }
-    Ok(response)
 }
 
 fn image_client(os: &str, arch: &str) -> Client {
@@ -2447,27 +2360,6 @@ async fn push_file(
     Ok(())
 }
 
-fn safe_join(root: &Path, relative: &str) -> ApiResult<PathBuf> {
-    let relative = Path::new(relative);
-    if relative.is_absolute()
-        || relative.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(AppError::bad_request("invalid image file path"));
-    }
-    let path = root.join(relative);
-    let canonical_root = std::fs::canonicalize(root).map_err(AppError::from)?;
-    let canonical = std::fs::canonicalize(&path).map_err(AppError::from)?;
-    if !canonical.starts_with(canonical_root) {
-        return Err(AppError::Forbidden);
-    }
-    Ok(canonical)
-}
-
 fn safe_error(error: &AppError) -> String {
     match error {
         AppError::BadRequest(message) => message.chars().take(500).collect(),
@@ -2475,87 +2367,6 @@ fn safe_error(error: &AppError) -> String {
         AppError::Integrity => "image content integrity check failed".into(),
         _ => "image task failed; check server logs".into(),
     }
-}
-
-async fn storage_usage(root: Arc<PathBuf>) -> ApiResult<u64> {
-    tokio::task::spawn_blocking(move || storage_usage_sync(&root))
-        .await
-        .map_err(AppError::internal)?
-        .map_err(AppError::from)
-}
-
-fn storage_usage_sync(root: &Path) -> std::io::Result<u64> {
-    fn visit(root: &Path, path: &Path, total: &mut u64) -> std::io::Result<()> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() {
-            return Ok(());
-        }
-        if metadata.is_file() {
-            let relative = path.strip_prefix(root).unwrap_or(path);
-            let parts = relative
-                .components()
-                .filter_map(|part| match part {
-                    Component::Normal(value) => value.to_str(),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let is_layout_blob = parts.len() >= 6
-                && parts[0] == "jobs"
-                && parts[2] == "layout"
-                && parts[3] == "blobs"
-                && parts[4] == "sha256";
-            if !is_layout_blob {
-                *total = total.saturating_add(metadata.len());
-            }
-            return Ok(());
-        }
-        if metadata.is_dir() {
-            for entry in std::fs::read_dir(path)? {
-                visit(root, &entry?.path(), total)?;
-            }
-        }
-        Ok(())
-    }
-
-    if !root.exists() {
-        return Ok(0);
-    }
-    let mut total = 0;
-    visit(root, root, &mut total)?;
-    Ok(total)
-}
-
-fn gc_shared_blobs_sync(root: &Path) -> std::io::Result<()> {
-    let mut referenced = HashSet::new();
-    let jobs = root.join("jobs");
-    if let Ok(job_entries) = std::fs::read_dir(jobs) {
-        for job in job_entries.flatten() {
-            let blobs = job.path().join("layout/blobs/sha256");
-            if let Ok(entries) = std::fs::read_dir(blobs) {
-                for entry in entries.flatten() {
-                    if entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                        referenced.insert(entry.file_name());
-                    }
-                }
-            }
-        }
-    }
-
-    let shared = root.join("blobs/sha256");
-    if let Ok(entries) = std::fs::read_dir(shared) {
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|kind| kind.is_file())
-                && !referenced.contains(&entry.file_name())
-            {
-                match std::fs::remove_file(entry.path()) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn oci_error(error: OciDistributionError) -> AppError {
@@ -3285,15 +3096,6 @@ mod tests {
         assert!(next > Utc::now());
     }
 
-    #[test]
-    fn file_browser_rejects_parent_traversal() {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("safe.txt"), b"safe").unwrap();
-        assert!(safe_join(directory.path(), "safe.txt").is_ok());
-        assert!(safe_join(directory.path(), "../secret").is_err());
-        assert!(safe_join(directory.path(), "/etc/passwd").is_err());
-    }
-
     #[tokio::test]
     async fn idempotency_key_returns_the_existing_job() {
         let directory = tempfile::tempdir().unwrap();
@@ -3672,25 +3474,5 @@ mod tests {
                 .unwrap(),
             RegistryAuth::Basic("robot".into(), "registry-password".into())
         );
-    }
-
-    #[test]
-    fn storage_usage_counts_shared_blobs_once_and_gc_removes_orphans() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let shared = root.join("blobs/sha256");
-        let layout = root.join("jobs/job/layout/blobs/sha256");
-        std::fs::create_dir_all(&shared).unwrap();
-        std::fs::create_dir_all(&layout).unwrap();
-        std::fs::write(shared.join("kept"), b"1234").unwrap();
-        std::fs::write(shared.join("orphan"), b"12345678").unwrap();
-        std::fs::hard_link(shared.join("kept"), layout.join("kept")).unwrap();
-        std::fs::write(root.join("jobs/job/export.tar"), b"123456").unwrap();
-
-        assert_eq!(storage_usage_sync(root).unwrap(), 18);
-        gc_shared_blobs_sync(root).unwrap();
-        assert!(shared.join("kept").exists());
-        assert!(!shared.join("orphan").exists());
-        assert_eq!(storage_usage_sync(root).unwrap(), 10);
     }
 }
