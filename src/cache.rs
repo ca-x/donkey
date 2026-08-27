@@ -19,6 +19,7 @@ pub struct CacheStore {
     db: DatabaseConnection,
     flights: Cache<String, Arc<Mutex<()>>>,
     active_flights: Arc<DashMap<String, ()>>,
+    pending_hits: Arc<DashMap<String, u64>>,
     runtime: Arc<RwLock<CacheRuntimeConfig>>,
     capacity_lock: Arc<Mutex<()>>,
 }
@@ -100,6 +101,7 @@ impl CacheStore {
                 .time_to_idle(std::time::Duration::from_secs(60 * 60))
                 .build(),
             active_flights: Arc::new(DashMap::new()),
+            pending_hits: Arc::new(DashMap::new()),
             runtime: Arc::new(RwLock::new(CacheRuntimeConfig {
                 partial_ttl: config.partial_ttl,
                 cache_ttl: config.cache_ttl,
@@ -166,7 +168,7 @@ impl CacheStore {
                 return Ok(None);
             }
         };
-        db::touch_cache_entry(&self.db, key).await?;
+        self.record_hit(key).await?;
         Ok(Some(CachedObject {
             key: entry.key,
             path,
@@ -238,12 +240,14 @@ impl CacheStore {
     }
 
     pub async fn list(&self, limit: u64) -> ApiResult<Vec<cache_entry::Model>> {
+        self.flush_hits().await?;
         db::list_cache_entries(&self.db, limit.min(10_000))
             .await
             .map_err(Into::into)
     }
 
     pub async fn stats(&self) -> ApiResult<CacheStats> {
+        self.flush_hits().await?;
         let aggregate = db::cache_aggregate(&self.db).await?;
         Ok(CacheStats {
             entries: aggregate.entries.min(usize::MAX as u64) as usize,
@@ -257,11 +261,13 @@ impl CacheStore {
             return Err(AppError::bad_request("invalid cache key"));
         }
         let _guard = self.lock(key).await;
+        self.pending_hits.remove(key);
         self.remove_locked(key).await
     }
 
     pub async fn clear_all(&self) -> ApiResult<u64> {
         let _capacity_guard = self.capacity_lock.lock().await;
+        self.pending_hits.clear();
         let entries = db::all_cache_entries(&self.db).await?;
         let mut freed = 0_u64;
         for entry in &entries {
@@ -282,6 +288,52 @@ impl CacheStore {
         let _ =
             remove_orphan_files(&self.root.join("tmp"), Some(cutoff), &self.active_flights).await;
         Ok(freed)
+    }
+
+    async fn record_hit(&self, key: &str) -> ApiResult<()> {
+        const FLUSH_THRESHOLD: u64 = 32;
+        let pending = {
+            let mut count = self.pending_hits.entry(key.to_owned()).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count >= FLUSH_THRESHOLD {
+                let pending = *count;
+                *count = 0;
+                Some(pending)
+            } else {
+                None
+            }
+        };
+        if let Some(pending) = pending
+            && let Err(error) = db::add_cache_hits(&self.db, key, pending).await
+        {
+            self.pending_hits
+                .entry(key.to_owned())
+                .and_modify(|count| *count = count.saturating_add(pending))
+                .or_insert(pending);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    async fn flush_hits(&self) -> ApiResult<()> {
+        let keys = self
+            .pending_hits
+            .iter()
+            .filter_map(|entry| (*entry.value() > 0).then(|| entry.key().clone()))
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some((_, count)) = self.pending_hits.remove(&key)
+                && count > 0
+                && let Err(error) = db::add_cache_hits(&self.db, &key, count).await
+            {
+                self.pending_hits
+                    .entry(key)
+                    .and_modify(|pending| *pending = pending.saturating_add(count))
+                    .or_insert(count);
+                return Err(error.into());
+            }
+        }
+        Ok(())
     }
 
     async fn remove_locked(&self, key: &str) -> ApiResult<()> {
@@ -444,6 +496,7 @@ mod tests {
     use super::CacheStore;
     use crate::Config;
     use futures_util::future::try_join_all;
+    use sea_orm::EntityTrait;
     use std::sync::Arc;
 
     #[test]
@@ -502,5 +555,31 @@ mod tests {
             .unwrap();
         assert!(results.into_iter().all(|result| result.is_some()));
         assert_eq!(cache.stats().await.unwrap().hits, hits);
+    }
+
+    #[tokio::test]
+    async fn cache_hits_are_batched_until_stats_flushes_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let cache = CacheStore::new(Arc::new(config), db.clone()).await.unwrap();
+        let temporary = directory.path().join("batched.partial");
+        tokio::fs::write(&temporary, b"payload").await.unwrap();
+        let key = "d".repeat(64);
+        cache
+            .admit(&key, &temporary, "application/octet-stream", None)
+            .await
+            .unwrap();
+
+        for _ in 0..10 {
+            assert!(cache.get(&key).await.unwrap().is_some());
+        }
+        let stored = crate::db::cache_entry::Entity::find_by_id(&key)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.hit_count, 0);
+        assert_eq!(cache.stats().await.unwrap().hits, 10);
     }
 }

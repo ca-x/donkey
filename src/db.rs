@@ -889,13 +889,14 @@ pub async fn insert_cache_entry(
     Ok(())
 }
 
-pub async fn touch_cache_entry(db: &DatabaseConnection, key: &str) -> Result<(), DbErr> {
+pub async fn add_cache_hits(db: &DatabaseConnection, key: &str, count: u64) -> Result<(), DbErr> {
     use sea_orm::ExprTrait;
 
+    let count = std::cmp::min(count, i64::MAX as u64) as i64;
     cache_entry::Entity::update_many()
         .col_expr(
             cache_entry::Column::HitCount,
-            Expr::col(cache_entry::Column::HitCount).add(1),
+            Expr::col(cache_entry::Column::HitCount).add(count),
         )
         .col_expr(cache_entry::Column::LastAccessedAt, Expr::value(Utc::now()))
         .filter(cache_entry::Column::Key.eq(key))
