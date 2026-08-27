@@ -125,6 +125,14 @@ impl NodeSelector {
             .is_some_and(|failure| failure.cooldown_until > Instant::now())
     }
 
+    pub(crate) fn cooling_count(&self) -> usize {
+        let now = Instant::now();
+        self.failures
+            .iter()
+            .filter(|failure| failure.cooldown_until > now)
+            .count()
+    }
+
     fn available_capacity(&self, node: &NodeView) -> f64 {
         let measured = self
             .speeds

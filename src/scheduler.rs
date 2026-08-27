@@ -1,4 +1,11 @@
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use crate::{
     cache::{CacheStore, CachedObject},
@@ -28,7 +35,25 @@ pub struct Scheduler {
     cache: CacheStore,
     upstream: UpstreamService,
     selector: NodeSelector,
+    stats: Arc<SchedulerCounters>,
     capabilities: Cache<String, BlobCapabilities>,
+}
+
+#[derive(Default)]
+struct SchedulerCounters {
+    parallel_blobs: AtomicU64,
+    resume_attempts: AtomicU64,
+    retry_attempts: AtomicU64,
+    last_chunk_size: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+pub struct SchedulerStats {
+    pub parallel_blobs: u64,
+    pub resume_attempts: u64,
+    pub retry_attempts: u64,
+    pub last_chunk_size: u64,
+    pub cooling_nodes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -95,6 +120,7 @@ impl Scheduler {
             cache,
             upstream,
             selector: NodeSelector::new(),
+            stats: Arc::new(SchedulerCounters::default()),
             capabilities: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(std::time::Duration::from_secs(600))
@@ -138,6 +164,31 @@ impl Scheduler {
             concurrency: runtime.chunk_concurrency,
             parallel_threshold: runtime.parallel_threshold,
         }
+    }
+
+    pub fn stats(&self) -> SchedulerStats {
+        SchedulerStats {
+            parallel_blobs: self.stats.parallel_blobs.load(Ordering::Relaxed),
+            resume_attempts: self.stats.resume_attempts.load(Ordering::Relaxed),
+            retry_attempts: self.stats.retry_attempts.load(Ordering::Relaxed),
+            last_chunk_size: self.stats.last_chunk_size.load(Ordering::Relaxed),
+            cooling_nodes: self.selector.cooling_count(),
+        }
+    }
+
+    pub(crate) fn record_parallel_blob(&self, chunk_size: u64) {
+        self.stats.parallel_blobs.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .last_chunk_size
+            .store(chunk_size, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_resume(&self) {
+        self.stats.resume_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_retry(&self) {
+        self.stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
     pub async fn fetch_blob(
@@ -208,6 +259,7 @@ impl Scheduler {
             && nodes.len() > 1;
 
         if can_parallel {
+            self.record_parallel_blob(runtime.chunk_size);
             tracing::info!(
                 path = request_path,
                 size = capabilities.size,
@@ -286,6 +338,7 @@ impl Scheduler {
         total_size: u64,
         destination: &Path,
     ) -> ApiResult<()> {
+        self.record_resume();
         let mut last_error = None;
         let mut attempted = false;
         let policy = self.runtime.read().await.scheduler_policy;
@@ -336,6 +389,7 @@ impl Scheduler {
             match result {
                 Ok(()) => return Ok(()),
                 Err(error) => {
+                    self.record_retry();
                     if matches!(&error, AppError::Integrity) {
                         let _ = tokio::fs::remove_file(destination).await;
                     }
@@ -417,6 +471,7 @@ impl Scheduler {
                     }
                 }
                 Err(error) => {
+                    self.record_retry();
                     all_compatible = false;
                     last_error = Some(error)
                 }
@@ -569,6 +624,7 @@ impl Scheduler {
             match result {
                 Ok(()) => return Ok(()),
                 Err(error) => {
+                    self.record_retry();
                     if matches!(&error, AppError::Integrity) {
                         let _ = tokio::fs::remove_file(destination).await;
                     }
@@ -640,6 +696,7 @@ impl Scheduler {
             match result {
                 Ok(()) => return Ok(()),
                 Err(error) => {
+                    self.record_retry();
                     // Keep a transport-truncated file for a future request to
                     // resume. Integrity failures are unsafe to resume and
                     // must start from a clean file.

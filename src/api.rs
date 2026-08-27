@@ -74,12 +74,18 @@ struct Dashboard {
     healthy_nodes: usize,
     registry_requests: u64,
     registry_bytes: u64,
+    parallel_blobs: u64,
+    resume_attempts: u64,
+    retry_attempts: u64,
+    last_chunk_size: u64,
+    cooling_nodes: usize,
 }
 
 async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> {
     let nodes = state.nodes.list().await?;
     let cache = state.cache.stats().await?;
     let (registry_requests, registry_bytes) = state.traffic.snapshot();
+    let scheduler = state.scheduler.stats();
     Ok(Json(Dashboard {
         healthy_nodes: nodes
             .iter()
@@ -91,6 +97,11 @@ async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> 
         nodes,
         registry_requests,
         registry_bytes,
+        parallel_blobs: scheduler.parallel_blobs,
+        resume_attempts: scheduler.resume_attempts,
+        retry_attempts: scheduler.retry_attempts,
+        last_chunk_size: scheduler.last_chunk_size,
+        cooling_nodes: scheduler.cooling_nodes,
     }))
 }
 

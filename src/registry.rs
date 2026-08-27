@@ -251,6 +251,11 @@ async fn stream_blob(
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.eq_ignore_ascii_case("bytes")))
         .then_some(stream_config);
+        if parallel.is_some() {
+            state
+                .scheduler
+                .record_parallel_blob(stream_config.chunk_size);
+        }
         let media_type = response_headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -447,6 +452,7 @@ async fn relay_stream_blob(
                 .map_err(|_| AppError::Upstream("client disconnected during Blob replay".into()))?;
         }
         if offset <= window.end {
+            scheduler.record_resume();
             let (next_node, next_response) = resume_stream_response(ResumeRequest {
                 upstream: &upstream,
                 nodes: &nodes,
@@ -550,6 +556,8 @@ async fn relay_stream_blob(
                 .unwrap_or("upstream body ended early"),
             "Blob stream interrupted; resuming from another node"
         );
+        scheduler.record_retry();
+        scheduler.record_resume();
         let (next_node, next_response) = resume_stream_response(ResumeRequest {
             upstream: &upstream,
             nodes: &nodes,
@@ -789,7 +797,10 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
                 .await;
             match result {
                 Ok(bytes) => return Ok(bytes),
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    request.scheduler.record_retry();
+                    last_error = Some(error);
+                }
             }
         }
         if !attempted {
