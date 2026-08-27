@@ -1159,7 +1159,22 @@ impl ImageTools {
     }
 
     async fn update_job_manifest(&self, id: Uuid, image: &PreparedImage) -> ApiResult<()> {
-        self.ensure_job_owner(id).await?;
+        if let Some(attempt) = self.active_attempts.get(&id).map(|value| *value) {
+            let updated = db::update_image_job_manifest_owned(
+                &self.db,
+                id,
+                self.worker_id,
+                attempt,
+                &image.manifest_digest,
+                image.index_digest.as_deref(),
+                image.total_bytes.min(i64::MAX as u64) as i64,
+            )
+            .await?;
+            if !updated {
+                return Err(AppError::Conflict("image job ownership has changed".into()));
+            }
+            return Ok(());
+        }
         image_job::Entity::update_many()
             .col_expr(
                 image_job::Column::ResolvedDigest,
@@ -1180,8 +1195,27 @@ impl ImageTools {
     }
 
     async fn set_progress(&self, id: Uuid, stage: &str, current: u64, total: u64) -> ApiResult<()> {
-        self.ensure_job_owner(id).await?;
         let now = Utc::now();
+        if let Some(attempt) = self.active_attempts.get(&id).map(|value| *value) {
+            let updated = db::update_image_job_progress_owned(
+                &self.db,
+                db::ImageJobProgress {
+                    job_id: id,
+                    worker_id: self.worker_id,
+                    attempt,
+                    stage,
+                    progress_bytes: current.min(i64::MAX as u64) as i64,
+                    total_bytes: total.min(i64::MAX as u64) as i64,
+                    lease_until: now + chrono::Duration::minutes(JOB_LEASE_MINUTES),
+                    now,
+                },
+            )
+            .await?;
+            if !updated {
+                return Err(AppError::Conflict("image job ownership has changed".into()));
+            }
+            return Ok(());
+        }
         image_job::Entity::update_many()
             .col_expr(
                 image_job::Column::Stage,
@@ -1213,8 +1247,23 @@ impl ImageTools {
     }
 
     async fn set_stage(&self, id: Uuid, stage: &str) -> ApiResult<()> {
-        self.ensure_job_owner(id).await?;
         let now = Utc::now();
+        if let Some(attempt) = self.active_attempts.get(&id).map(|value| *value) {
+            let updated = db::update_image_job_stage_owned(
+                &self.db,
+                id,
+                self.worker_id,
+                attempt,
+                stage,
+                now + chrono::Duration::minutes(JOB_LEASE_MINUTES),
+                now,
+            )
+            .await?;
+            if !updated {
+                return Err(AppError::Conflict("image job ownership has changed".into()));
+            }
+            return Ok(());
+        }
         image_job::Entity::update_many()
             .col_expr(
                 image_job::Column::Stage,
@@ -1238,7 +1287,21 @@ impl ImageTools {
     }
 
     async fn set_artifact(&self, id: Uuid, path: &Path, name: &str) -> ApiResult<()> {
-        self.ensure_job_owner(id).await?;
+        if let Some(attempt) = self.active_attempts.get(&id).map(|value| *value) {
+            let updated = db::update_image_job_artifact_owned(
+                &self.db,
+                id,
+                self.worker_id,
+                attempt,
+                &path.to_string_lossy(),
+                name,
+            )
+            .await?;
+            if !updated {
+                return Err(AppError::Conflict("image job ownership has changed".into()));
+            }
+            return Ok(());
+        }
         image_job::Entity::update_many()
             .col_expr(
                 image_job::Column::ArtifactPath,
@@ -1264,24 +1327,6 @@ impl ImageTools {
         } else {
             Ok(())
         }
-    }
-
-    async fn ensure_job_owner(&self, id: Uuid) -> ApiResult<()> {
-        let Some(expected_attempt) = self.active_attempts.get(&id).map(|value| *value) else {
-            return Ok(());
-        };
-        let Some((worker, attempt)) = db::image_job_owner(&self.db, id).await? else {
-            return Err(AppError::Conflict("image job ownership is missing".into()));
-        };
-        if worker != self.worker_id
-            || self
-                .active_attempts
-                .get(&id)
-                .is_none_or(|expected| *expected != expected_attempt || *expected != attempt)
-        {
-            return Err(AppError::Conflict("image job ownership has changed".into()));
-        }
-        Ok(())
     }
 
     async fn enqueue_due_rules(&self) -> ApiResult<()> {
@@ -2357,6 +2402,7 @@ mod tests {
     use super::*;
     use httpmock::prelude::*;
     use secrecy::SecretString;
+    use sea_orm::ConnectionTrait;
 
     async fn test_service() -> (tempfile::TempDir, ImageTools) {
         let directory = tempfile::tempdir().unwrap();
@@ -2674,6 +2720,44 @@ mod tests {
         assert_eq!(stored.stage, "packing");
         assert_eq!((stored.progress_bytes, stored.total_bytes), (20, 40));
         assert!(stored.lease_until.is_some_and(|lease| lease > old_lease));
+    }
+
+    #[tokio::test]
+    async fn stale_worker_cannot_update_after_fencing_token_changes() {
+        let (_directory, service) = test_service().await;
+        let job = insert_test_job(&service.db, JobStatus::Pending, None).await;
+        let now = Utc::now();
+        let lease = now + chrono::Duration::minutes(JOB_LEASE_MINUTES);
+        let attempt = db::claim_image_job(&service.db, job.id, service.worker_id, now, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        service.active_attempts.insert(job.id, attempt);
+
+        // Simulate another worker taking over the job with a newer fencing token.
+        let replacement_worker = Uuid::new_v4();
+        service
+            .db
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "UPDATE image_job_owners SET worker_id = ?, attempt = ? WHERE job_id = ?",
+                [
+                    replacement_worker.to_string().into(),
+                    (attempt + 1).into(),
+                    job.id.to_string().into(),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let result = service.set_stage(job.id, "packing").await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+        let stored = image_job::Entity::find_by_id(job.id)
+            .one(&service.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.stage, "resolving");
     }
 
     #[tokio::test]

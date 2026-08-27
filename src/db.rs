@@ -1018,6 +1018,124 @@ pub async fn renew_image_job(
     Ok(result.rows_affected() == 1)
 }
 
+/// Update a running image job's manifest only while the caller still owns the
+/// current fencing token.  The ownership predicate is part of the SQL update
+/// so a stale worker cannot write after a successful pre-check races with a
+/// takeover by another worker.
+pub async fn update_image_job_manifest_owned(
+    db: &DatabaseConnection,
+    job_id: Uuid,
+    worker_id: Uuid,
+    attempt: i64,
+    resolved_digest: &str,
+    index_digest: Option<&str>,
+    total_bytes: i64,
+) -> Result<bool, DbErr> {
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE image_jobs SET resolved_digest = ?, index_digest = ?, total_bytes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM image_job_owners WHERE job_id = ? AND worker_id = ? AND attempt = ?)",
+            [
+                resolved_digest.into(),
+                index_digest.map(str::to_owned).into(),
+                total_bytes.into(),
+                job_id.into(),
+                job_id.to_string().into(),
+                worker_id.to_string().into(),
+                attempt.into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub struct ImageJobProgress<'a> {
+    pub job_id: Uuid,
+    pub worker_id: Uuid,
+    pub attempt: i64,
+    pub stage: &'a str,
+    pub progress_bytes: i64,
+    pub total_bytes: i64,
+    pub lease_until: DateTime<Utc>,
+    pub now: DateTime<Utc>,
+}
+
+pub async fn update_image_job_progress_owned(
+    db: &DatabaseConnection,
+    progress: ImageJobProgress<'_>,
+) -> Result<bool, DbErr> {
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE image_jobs SET stage = ?, progress_bytes = ?, total_bytes = ?, updated_at = ?, lease_until = ? WHERE id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM image_job_owners WHERE job_id = ? AND worker_id = ? AND attempt = ?)",
+            [
+                progress.stage.into(),
+                progress.progress_bytes.into(),
+                progress.total_bytes.into(),
+                progress.now.into(),
+                progress.lease_until.into(),
+                progress.job_id.into(),
+                progress.job_id.to_string().into(),
+                progress.worker_id.to_string().into(),
+                progress.attempt.into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn update_image_job_stage_owned(
+    db: &DatabaseConnection,
+    job_id: Uuid,
+    worker_id: Uuid,
+    attempt: i64,
+    stage: &str,
+    lease_until: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<bool, DbErr> {
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE image_jobs SET stage = ?, updated_at = ?, lease_until = ? WHERE id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM image_job_owners WHERE job_id = ? AND worker_id = ? AND attempt = ?)",
+            [
+                stage.into(),
+                now.into(),
+                lease_until.into(),
+                job_id.into(),
+                job_id.to_string().into(),
+                worker_id.to_string().into(),
+                attempt.into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn update_image_job_artifact_owned(
+    db: &DatabaseConnection,
+    job_id: Uuid,
+    worker_id: Uuid,
+    attempt: i64,
+    artifact_path: &str,
+    artifact_name: &str,
+) -> Result<bool, DbErr> {
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE image_jobs SET artifact_path = ?, artifact_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM image_job_owners WHERE job_id = ? AND worker_id = ? AND attempt = ?)",
+            [
+                artifact_path.into(),
+                artifact_name.into(),
+                job_id.into(),
+                job_id.to_string().into(),
+                worker_id.to_string().into(),
+                attempt.into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub async fn list_mappings(db: &DatabaseConnection) -> Result<Vec<domain_mapping::Model>, DbErr> {
     domain_mapping::Entity::find()
         .order_by_asc(domain_mapping::Column::SourceHost)
