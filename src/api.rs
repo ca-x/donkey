@@ -319,6 +319,7 @@ async fn update_runtime(
     state.scheduler.update_runtime(&effective).await;
     state.cache.update_runtime(&effective).await;
     state.upstream.update_runtime(&effective).await;
+    state.nodes.update_runtime(&effective).await;
     let cache = state.cache.stats().await?;
     Ok(Json(runtime_config(&effective, cache)))
 }
@@ -463,6 +464,7 @@ async fn import_runtime(
     state.scheduler.update_runtime(&effective).await;
     state.cache.update_runtime(&effective).await;
     state.upstream.update_runtime(&effective).await;
+    state.nodes.update_runtime(&effective).await;
     let cache = state.cache.stats().await?;
     Ok(Json(runtime_config(&effective, cache)))
 }

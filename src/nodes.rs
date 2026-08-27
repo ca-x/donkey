@@ -7,6 +7,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize, Serializer};
 use tokio::task::JoinSet;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
@@ -24,8 +25,15 @@ const NODE_URL_CONFLICT: &str = "node URL already exists in this Registry route"
 #[derive(Clone)]
 pub struct NodeService {
     config: Arc<Config>,
+    runtime: Arc<RwLock<NodeRuntimeConfig>>,
     db: DatabaseConnection,
     cipher: CredentialCipher,
+}
+
+#[derive(Clone, Copy)]
+struct NodeRuntimeConfig {
+    scheduler_policy: SchedulerPolicy,
+    upstream_timeout: std::time::Duration,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -133,7 +141,21 @@ fn default_max_concurrency() -> u16 {
 impl NodeService {
     pub fn new(config: Arc<Config>, db: DatabaseConnection) -> ApiResult<Self> {
         let cipher = CredentialCipher::from_config(&config)?;
-        Ok(Self { config, db, cipher })
+        Ok(Self {
+            runtime: Arc::new(RwLock::new(NodeRuntimeConfig {
+                scheduler_policy: config.scheduler_policy,
+                upstream_timeout: config.upstream_timeout,
+            })),
+            config,
+            db,
+            cipher,
+        })
+    }
+
+    pub async fn update_runtime(&self, config: &Config) {
+        let mut runtime = self.runtime.write().await;
+        runtime.scheduler_policy = config.scheduler_policy;
+        runtime.upstream_timeout = config.upstream_timeout;
     }
 
     pub async fn list(&self) -> ApiResult<Vec<NodeView>> {
@@ -335,7 +357,8 @@ impl NodeService {
         metric: node_metric::Model,
         route: crate::db::registry_route::Model,
     ) -> ApiResult<NodeView> {
-        let score = score(&node, &metric, self.config.scheduler_policy);
+        let policy = self.runtime.read().await.scheduler_policy;
+        let score = score(&node, &metric, policy);
         let auth_configured = node.auth_secret_enc.is_some();
         let max_concurrency = db::get_node_max_concurrency(&self.db, node.id).await?;
         Ok(NodeView {
@@ -368,7 +391,8 @@ impl NodeService {
         let started = Instant::now();
         let result = async {
             let upstream = security::validate_upstream(&node.url, &self.config).await?;
-            let client = security::client_for(&upstream, self.config.upstream_timeout)?;
+            let timeout = self.runtime.read().await.upstream_timeout;
+            let client = security::client_for(&upstream, timeout)?;
             let url = upstream.url.join("v2/").map_err(AppError::internal)?;
             let request = self.apply_auth(client.get(url), node)?;
             let response = request
