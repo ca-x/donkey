@@ -9,6 +9,7 @@ repository = "https://github.com/ca-x/donkey"
 
 [dependencies]
 anyhow = "1.0"
+backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 aes-gcm = "0.10"
 argon2 = "0.5.3"
 axum = { version = "0.8.9", features = ["http1", "http2", "json", "macros", "tokio"] }

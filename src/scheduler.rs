@@ -263,7 +263,7 @@ impl Scheduler {
             }
         }
         if !attempted {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(capacity_backoff()).await;
             return Box::pin(self.download_resume(
                 nodes,
                 request_path,
@@ -478,7 +478,7 @@ impl Scheduler {
             }
         }
         if !attempted {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(capacity_backoff()).await;
             return Box::pin(self.download_chunk(
                 nodes,
                 request_path,
@@ -595,7 +595,7 @@ impl Scheduler {
                 };
             }
             drop(available);
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(capacity_backoff()).await;
         }
     }
 
@@ -630,6 +630,17 @@ fn speed_first_capacity(measured_bps: f64, success_rate: f64, active_chunks: usi
     let discovery_floor = 256.0 * 1024.0;
     measured_bps.max(discovery_floor) * success_rate.clamp(0.05, 1.0).powi(2)
         / (active_chunks + 1) as f64
+}
+
+fn capacity_backoff() -> std::time::Duration {
+    use backoff::backoff::Backoff;
+    backoff::ExponentialBackoffBuilder::new()
+        .with_initial_interval(std::time::Duration::from_millis(10))
+        .with_max_interval(std::time::Duration::from_millis(250))
+        .with_max_elapsed_time(None)
+        .build()
+        .next_backoff()
+        .unwrap_or_else(|| std::time::Duration::from_millis(250))
 }
 
 fn capabilities_from_head(response: &reqwest::Response) -> Option<BlobCapabilities> {

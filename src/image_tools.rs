@@ -300,6 +300,21 @@ fn default_limit() -> u64 {
     100
 }
 
+fn retry_backoff(attempt: u32) -> Duration {
+    use backoff::backoff::Backoff;
+    let mut policy = backoff::ExponentialBackoffBuilder::new()
+        .with_initial_interval(Duration::from_millis(250))
+        .with_max_interval(Duration::from_secs(2))
+        .with_max_elapsed_time(None)
+        .build();
+    (0..attempt).for_each(|_| {
+        let _ = policy.next_backoff();
+    });
+    policy
+        .next_backoff()
+        .unwrap_or_else(|| Duration::from_secs(2))
+}
+
 impl From<registry_credential::Model> for CredentialView {
     fn from(value: registry_credential::Model) -> Self {
         Self {
@@ -806,7 +821,7 @@ impl ImageTools {
                             attempt,
                             "source Registry request failed; retrying"
                         );
-                        tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+                        tokio::time::sleep(retry_backoff(attempt)).await;
                     }
                 }
             }
@@ -881,7 +896,7 @@ impl ImageTools {
                             attempt,
                             "source Blob stream failed; retrying"
                         );
-                        tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+                        tokio::time::sleep(retry_backoff(attempt)).await;
                     }
                 }
             }
