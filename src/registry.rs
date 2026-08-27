@@ -801,9 +801,12 @@ async fn serve_cached(
         .oneshot(file_request)
         .await
         .map_err(AppError::internal)?;
-    drop(guard);
     let (parts, body) = response.into_parts();
-    let mut response = Response::from_parts(parts, Body::new(body));
+    let guarded = Body::new(body).into_data_stream().map(move |chunk| {
+        let _keep_alive = &guard;
+        chunk
+    });
+    let mut response = Response::from_parts(parts, Body::from_stream(guarded));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         object

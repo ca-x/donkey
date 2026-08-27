@@ -707,6 +707,49 @@ mod proxy_integration {
         }
 
         #[tokio::test]
+        async fn cached_blob_is_protected_until_response_body_finishes() {
+            let bytes = vec![b'k'; 1024 * 1024];
+            let fixture = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
+            let (state, _directory) = proxy_state(&[&fixture]).await;
+            let digest = digest(&bytes);
+            let path = blob_path(&digest);
+            let router = registry_router(state.clone());
+            let first = request(router.clone(), Method::GET, &path, None).await;
+            assert_eq!(
+                to_bytes(first.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+
+            let cached = request(router, Method::GET, &path, None).await;
+            let key = donkey::cache::CacheStore::key(
+                &format!("/v2/{REPOSITORY}/blobs/{digest}"),
+                None,
+            );
+            let cache = state.cache.clone();
+            let mut remove = tokio::spawn(async move { cache.remove(&key).await });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut remove)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                to_bytes(cached.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(1), remove)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+
+        #[tokio::test]
         async fn authorization_scopes_do_not_share_cache_admission_across_routes() {
             let bytes = b"same-verified-blob".to_vec();
             let docker = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
