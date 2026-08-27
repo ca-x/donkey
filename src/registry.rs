@@ -417,6 +417,10 @@ fn stream_window(response: &reqwest::Response) -> Option<StreamWindow> {
     None
 }
 
+fn remaining_window_bytes(end: u64, offset: u64) -> Option<u64> {
+    end.checked_sub(offset)?.checked_add(1)
+}
+
 async fn relay_stream_blob(
     relay: StreamRelay,
     tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
@@ -544,7 +548,12 @@ async fn relay_stream_blob(
         while let Some(chunk) = body.next().await {
             match chunk {
                 Ok(chunk) => {
-                    let remaining = window.end - offset + 1;
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let Some(remaining) = remaining_window_bytes(window.end, offset) else {
+                        return Err(AppError::Integrity);
+                    };
                     if chunk.len() as u64 > remaining {
                         return Err(AppError::Integrity);
                     }
@@ -1318,5 +1327,11 @@ mod tests {
             Some(&"\"sha256:def\"".parse().unwrap()),
             digest
         ));
+    }
+
+    #[test]
+    fn stream_rejects_an_overrun_without_panicking() {
+        assert_eq!(remaining_window_bytes(9, 0), Some(10));
+        assert_eq!(remaining_window_bytes(9, 10), None);
     }
 }

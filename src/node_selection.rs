@@ -125,6 +125,10 @@ impl NodeSelector {
             .is_some_and(|failure| failure.cooldown_until > Instant::now())
     }
 
+    pub(crate) fn is_cooling_node(&self, node_id: Uuid) -> bool {
+        self.is_cooling(node_id)
+    }
+
     pub(crate) fn cooling_count(&self) -> usize {
         let now = Instant::now();
         self.failures

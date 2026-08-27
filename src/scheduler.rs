@@ -8,6 +8,10 @@ use std::{
 };
 
 use crate::{
+    blob_planner::{
+        BlobDownloadPlan, BlobMeta, BlobPlanner, DownloadStrategy, NodeSnapshot, PlannerConfig,
+        PlannerError,
+    },
     cache::{CacheStore, CachedObject},
     config::{Config, SchedulerPolicy},
     error::{ApiResult, AppError},
@@ -82,6 +86,13 @@ struct BlobCapabilities {
     size: u64,
     supports_range: bool,
     media_type: String,
+}
+
+struct DetectedCapabilities {
+    size: u64,
+    media_type: String,
+    nodes: Vec<NodeView>,
+    range_nodes: Vec<NodeView>,
 }
 
 #[derive(Clone, Debug)]
@@ -265,46 +276,104 @@ impl Scheduler {
         nodes: &[NodeView],
     ) -> ApiResult<CachedObject> {
         let mut runtime = *self.runtime.read().await;
-        let capability_key = format!("{}:{}", nodes[0].node.url, request_path);
-        let capabilities = if let Some(value) = self.capabilities.get(&capability_key).await {
-            value
-        } else {
-            let detected = self
-                .detect_capabilities(nodes, request_path, request_headers)
-                .await?;
-            self.capabilities
-                .insert(capability_key, detected.clone())
-                .await;
-            detected
-        };
-        let node_capacity = nodes
+        let detected = self
+            .detect_capabilities(nodes, request_path, request_headers)
+            .await?;
+        let node_capacity: usize = detected
+            .range_nodes
             .iter()
             .map(|node| usize::from(node.max_concurrency))
             .sum();
-        runtime.chunk_size = effective_chunk_size(runtime, capabilities.size, node_capacity);
+        let range_ids = detected
+            .range_nodes
+            .iter()
+            .map(|node| node.node.id)
+            .collect::<std::collections::HashSet<_>>();
+        let snapshots = detected
+            .nodes
+            .iter()
+            .map(|node| NodeSnapshot {
+                url: node.node.url.clone(),
+                supports_range: range_ids.contains(&node.node.id),
+                max_concurrency: usize::from(node.max_concurrency),
+                throughput_bps: (node.metric.speed_bps > 0).then_some(node.metric.speed_bps as u64),
+                latency_ms: (node.metric.last_checked_at.is_some() && node.metric.latency_ms > 0)
+                    .then_some(node.metric.latency_ms as u64),
+                success_rate: node.metric.success_rate,
+                cooling: self.selector.is_cooling_node(node.node.id),
+            })
+            .collect::<Vec<_>>();
+        let planner = BlobPlanner::new(PlannerConfig {
+            small_blob_threshold: runtime.parallel_threshold,
+            max_concurrent_chunks: effective_concurrency(runtime, node_capacity.max(1)),
+            min_chunk_size: if runtime.adaptive_chunking_enabled {
+                PlannerConfig::default().min_chunk_size
+            } else {
+                runtime.chunk_size
+            },
+            max_chunk_size: if runtime.adaptive_chunking_enabled {
+                PlannerConfig::default().max_chunk_size
+            } else {
+                runtime.chunk_size
+            },
+            ..PlannerConfig::default()
+        });
+        let plan = match planner.plan(
+            &BlobMeta {
+                digest: expected_digest.unwrap_or_default().to_owned(),
+                size: detected.size,
+                media_type: detected.media_type.clone(),
+            },
+            false,
+            &snapshots,
+        ) {
+            Ok(plan) => plan,
+            Err(PlannerError::NoUsableNodes) => BlobDownloadPlan {
+                strategy: DownloadStrategy::SingleRequest {
+                    node_url: detected
+                        .nodes
+                        .first()
+                        .map(|node| node.node.url.clone())
+                        .ok_or_else(|| AppError::unavailable("no compatible nodes"))?,
+                },
+            },
+            Err(PlannerError::InvalidConfiguration) => {
+                return Err(AppError::internal(anyhow::anyhow!(
+                    "invalid Blob planner configuration"
+                )));
+            }
+        };
+        let (can_parallel, planned_chunk_size) = match plan {
+            BlobDownloadPlan {
+                strategy: DownloadStrategy::MultiSourceChunked { chunk_size, .. },
+            } => (true, chunk_size),
+            BlobDownloadPlan {
+                strategy: DownloadStrategy::CacheHit,
+            }
+            | BlobDownloadPlan {
+                strategy: DownloadStrategy::SingleRequest { .. },
+            } => (false, runtime.chunk_size),
+        };
+        runtime.chunk_size = planned_chunk_size;
 
         let partial_dir = self.cache.temp_dir().join(key);
         tokio::fs::create_dir_all(&partial_dir).await?;
         let merged = partial_dir.join("object.partial");
-        let can_parallel = capabilities.supports_range
-            && capabilities.size >= runtime.parallel_threshold
-            && node_capacity > 1;
-
         if can_parallel {
             self.record_parallel_blob(runtime.chunk_size);
             tracing::info!(
                 path = request_path,
-                size = capabilities.size,
-                chunks = chunks(capabilities.size, runtime.chunk_size).len(),
-                nodes = nodes.len(),
+                size = detected.size,
+                chunks = chunks(detected.size, runtime.chunk_size).len(),
+                nodes = detected.range_nodes.len(),
                 "starting parallel Blob fetch"
             );
             if let Err(error) = self
                 .download_parallel(ParallelDownloadRequest {
-                    nodes,
+                    nodes: &detected.range_nodes,
                     request_path,
                     request_headers,
-                    total_size: capabilities.size,
+                    total_size: detected.size,
                     temp_dir: &partial_dir,
                     merged: &merged,
                     runtime,
@@ -317,30 +386,30 @@ impl Scheduler {
                     "parallel fetch failed; falling back to one upstream"
                 );
                 let _ = tokio::fs::remove_file(&merged).await;
-                self.download_whole(nodes, request_path, request_headers, &merged)
+                self.download_whole(&detected.nodes, request_path, request_headers, &merged)
                     .await?;
             }
-        } else if capabilities.supports_range
-            && capabilities.size >= runtime.resumable_threshold
+        } else if !detected.range_nodes.is_empty()
+            && detected.size >= runtime.resumable_threshold
             && tokio::fs::metadata(&merged)
                 .await
-                .is_ok_and(|metadata| metadata.len() > 0 && metadata.len() < capabilities.size)
+                .is_ok_and(|metadata| metadata.len() > 0 && metadata.len() < detected.size)
         {
             self.download_resume(
-                nodes,
+                &detected.range_nodes,
                 request_path,
                 request_headers,
-                capabilities.size,
+                detected.size,
                 &merged,
             )
             .await?;
         } else {
-            self.download_whole(nodes, request_path, request_headers, &merged)
+            self.download_whole(&detected.nodes, request_path, request_headers, &merged)
                 .await?;
         }
 
         let actual_size = tokio::fs::metadata(&merged).await?.len();
-        if capabilities.size > 0 && actual_size != capabilities.size {
+        if detected.size > 0 && actual_size != detected.size {
             return Err(AppError::Integrity);
         }
         if let Some(digest) = expected_digest {
@@ -352,7 +421,7 @@ impl Scheduler {
             .admit(
                 key,
                 &merged,
-                &capabilities.media_type,
+                &detected.media_type,
                 expected_digest.map(str::to_owned),
             )
             .await;
@@ -448,70 +517,97 @@ impl Scheduler {
         nodes: &[NodeView],
         request_path: &str,
         request_headers: &HeaderMap,
-    ) -> ApiResult<BlobCapabilities> {
+    ) -> ApiResult<DetectedCapabilities> {
         let mut last_error = None;
         let mut baseline: Option<BlobCapabilities> = None;
-        let mut all_compatible = true;
+        let mut compatible = Vec::new();
         for node in nodes {
+            let capability_key = format!(
+                "{}:{}:{}",
+                node.node.id,
+                node.node.updated_at.timestamp_millis(),
+                request_path
+            );
             let started = Instant::now();
-            let result = async {
-                let response = self
-                    .upstream
-                    .send(
-                        node,
-                        http::Method::HEAD,
-                        request_path,
-                        request_headers,
-                        RangeMode::Suppress,
-                    )
-                    .await?;
-                if response.status().is_success()
-                    && let Some(capabilities) = capabilities_from_head(&response)
-                {
-                    Ok(capabilities)
-                } else {
-                    let probe = self
+            let result = if let Some(value) = self.capabilities.get(&capability_key).await {
+                Ok(value)
+            } else {
+                let result = async {
+                    let response = self
                         .upstream
                         .send(
                             node,
-                            http::Method::GET,
+                            http::Method::HEAD,
                             request_path,
                             request_headers,
-                            RangeMode::Exact(0, 0),
+                            RangeMode::Suppress,
                         )
                         .await?;
-                    capabilities_from_probe(&probe).ok_or_else(|| {
-                        AppError::Upstream(format!(
-                            "{} does not expose Blob length or Range metadata",
-                            node.node.name
-                        ))
-                    })
+                    if response.status().is_success()
+                        && let Some(capabilities) = capabilities_from_head(&response)
+                    {
+                        Ok(capabilities)
+                    } else {
+                        let probe = self
+                            .upstream
+                            .send(
+                                node,
+                                http::Method::GET,
+                                request_path,
+                                request_headers,
+                                RangeMode::Exact(0, 0),
+                            )
+                            .await?;
+                        capabilities_from_probe(&probe).ok_or_else(|| {
+                            AppError::Upstream(format!(
+                                "{} does not expose Blob length or Range metadata",
+                                node.node.name
+                            ))
+                        })
+                    }
                 }
-            }
-            .await;
+                .await;
+                if let Ok(value) = &result {
+                    self.capabilities
+                        .insert(capability_key, value.clone())
+                        .await;
+                }
+                result
+            };
             self.nodes
                 .record_transfer(node.node.id, 0, started.elapsed(), result.is_ok())
                 .await;
             match result {
                 Ok(value) => {
-                    if let Some(previous) = &baseline {
-                        all_compatible &= previous.size == value.size
-                            && previous.media_type == value.media_type
-                            && previous.supports_range == value.supports_range;
-                    } else {
-                        baseline = Some(value);
+                    let compatible_with_baseline = baseline.as_ref().is_none_or(|previous| {
+                        previous.size == value.size && previous.media_type == value.media_type
+                    });
+                    if compatible_with_baseline {
+                        if baseline.is_none() {
+                            baseline = Some(value.clone());
+                        }
+                        compatible.push((node.clone(), value));
                     }
                 }
                 Err(error) => {
                     self.record_retry();
-                    all_compatible = false;
                     last_error = Some(error)
                 }
             }
         }
-        if let Some(mut capabilities) = baseline {
-            capabilities.supports_range &= all_compatible;
-            return Ok(capabilities);
+        if let Some(baseline) = baseline {
+            let range_nodes = compatible
+                .iter()
+                .filter(|(_, capabilities)| capabilities.supports_range)
+                .map(|(node, _)| node.clone())
+                .collect();
+            let nodes = compatible.into_iter().map(|(node, _)| node).collect();
+            return Ok(DetectedCapabilities {
+                size: baseline.size,
+                media_type: baseline.media_type,
+                nodes,
+                range_nodes,
+            });
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("capability detection failed".into())))
     }

@@ -1192,6 +1192,58 @@ mod proxy_integration {
         }
 
         #[tokio::test]
+        async fn parallel_filters_nodes_that_do_not_support_range() {
+            let bytes = vec![b'r'; 2 * 1024 * 1024];
+            let ranged = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
+            let whole_only = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.parallel_threshold = 1;
+            config.chunk_size = 256 * 1024;
+            config.chunk_concurrency = 4;
+            let state = AppState::new(config).await.unwrap();
+            for (index, fixture) in [&ranged, &whole_only].into_iter().enumerate() {
+                state
+                    .nodes
+                    .create(NodeInput {
+                        name: format!("range-capability-{index}"),
+                        url: fixture.url(),
+                        registry_route_id: DOCKER_HUB_ROUTE_ID,
+                        enabled: true,
+                        priority: index as i32,
+                        max_concurrency: 4,
+                        cf_preferred: false,
+                        connect_ip: None,
+                        auth_mode: "none".into(),
+                        auth_username: None,
+                        auth_header: None,
+                        auth_secret: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert!(ranged.ranges().await.iter().any(Option::is_some));
+            assert!(whole_only.ranges().await.iter().all(Option::is_none));
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+        }
+
+        #[tokio::test]
         async fn node_concurrency_limit_is_global_across_streams() {
             let bytes = vec![b'g'; 1024 * 1024];
             let first = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod blob_planner;
 pub mod cache;
 pub mod config;
 pub mod connect;
