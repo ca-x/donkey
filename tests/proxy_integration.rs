@@ -724,10 +724,8 @@ mod proxy_integration {
             );
 
             let cached = request(router, Method::GET, &path, None).await;
-            let key = donkey::cache::CacheStore::key(
-                &format!("/v2/{REPOSITORY}/blobs/{digest}"),
-                None,
-            );
+            let key =
+                donkey::cache::CacheStore::key(&format!("/v2/{REPOSITORY}/blobs/{digest}"), None);
             let cache = state.cache.clone();
             let mut remove = tokio::spawn(async move { cache.remove(&key).await });
             assert!(
@@ -1071,6 +1069,63 @@ mod proxy_integration {
             assert!(first.ranges().await.iter().any(Option::is_some));
             assert!(second.ranges().await.iter().any(Option::is_some));
             assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+        }
+
+        #[tokio::test]
+        async fn node_concurrency_limit_is_global_across_streams() {
+            let bytes = vec![b'g'; 1024 * 1024];
+            let first = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;
+            let second = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_test(directory.path().to_owned());
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.parallel_threshold = 1;
+            config.chunk_size = 256 * 1024;
+            config.chunk_concurrency = 4;
+            let state = AppState::new(config).await.unwrap();
+            for (index, fixture) in [&first, &second].into_iter().enumerate() {
+                state
+                    .nodes
+                    .create(NodeInput {
+                        name: format!("global-limit-{index}"),
+                        url: fixture.url(),
+                        registry_route_id: DOCKER_HUB_ROUTE_ID,
+                        enabled: true,
+                        priority: index as i32,
+                        max_concurrency: 1,
+                        cf_preferred: false,
+                        connect_ip: None,
+                        auth_mode: "none".into(),
+                        auth_username: None,
+                        auth_header: None,
+                        auth_secret: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let router = registry_router(state);
+            let path = blob_path(&digest(&bytes));
+            let pull = |authorization: &'static str| {
+                let router = router.clone();
+                let path = path.clone();
+                let bytes = bytes.clone();
+                async move {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::AUTHORIZATION, authorization.parse().unwrap());
+                    let response = request_with_headers(router, Method::GET, &path, headers).await;
+                    assert_eq!(
+                        to_bytes(response.into_body(), usize::MAX)
+                            .await
+                            .unwrap()
+                            .as_ref(),
+                        bytes
+                    );
+                }
+            };
+            tokio::join!(pull("Bearer first-scope"), pull("Bearer second-scope"));
+            assert!(first.max_active_requests() <= 1);
+            assert!(second.max_active_requests() <= 1);
+            assert!(first.get_count() > 0 && second.get_count() > 0);
         }
 
         #[tokio::test]

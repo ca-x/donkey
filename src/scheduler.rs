@@ -681,18 +681,28 @@ impl Scheduler {
 
     async fn acquire(&self, node_id: Uuid, max_concurrency: u16) -> ActiveChunkLease {
         loop {
-            let mut available = self.active_chunks.entry(node_id).or_insert(0);
-            if *available < usize::from(max_concurrency) {
-                *available += 1;
-                drop(available);
-                return ActiveChunkLease {
-                    node_id,
-                    active_chunks: self.active_chunks.clone(),
-                };
+            if let Some(lease) = self.try_acquire(node_id, max_concurrency) {
+                return lease;
             }
-            drop(available);
             tokio::time::sleep(capacity_backoff()).await;
         }
+    }
+
+    pub(crate) fn try_acquire(
+        &self,
+        node_id: Uuid,
+        max_concurrency: u16,
+    ) -> Option<ActiveChunkLease> {
+        let mut available = self.active_chunks.entry(node_id).or_insert(0);
+        if *available >= usize::from(max_concurrency) {
+            return None;
+        }
+        *available += 1;
+        drop(available);
+        Some(ActiveChunkLease {
+            node_id,
+            active_chunks: self.active_chunks.clone(),
+        })
     }
 
     fn at_capacity(&self, node_id: Uuid, max_concurrency: u16) -> bool {
@@ -825,7 +835,7 @@ fn content_range_matches(headers: &HeaderMap, start: u64, end: u64, total: u64) 
     )
 }
 
-struct ActiveChunkLease {
+pub(crate) struct ActiveChunkLease {
     node_id: Uuid,
     active_chunks: Arc<DashMap<Uuid, usize>>,
 }

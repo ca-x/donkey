@@ -260,6 +260,7 @@ async fn stream_blob(
             _lease: lease,
             node_service: state.nodes.clone(),
             parallel,
+            scheduler: state.scheduler.clone(),
         };
         tokio::spawn(async move {
             let errors = tx.clone();
@@ -307,6 +308,7 @@ struct StreamRelay {
     _lease: CacheLease,
     node_service: crate::nodes::NodeService,
     parallel: Option<crate::scheduler::StreamDownloadConfig>,
+    scheduler: crate::scheduler::Scheduler,
 }
 
 struct ResumeRequest<'a> {
@@ -373,6 +375,7 @@ async fn relay_stream_blob(
         _lease,
         node_service,
         parallel,
+        scheduler,
     } = relay;
     let complete_blob = window.start == 0 && window.end.checked_add(1) == Some(window.total);
     let stable_partial_dir = cache.temp_dir().join(&key);
@@ -459,6 +462,7 @@ async fn relay_stream_blob(
             end: window.end,
             total: window.total,
             config,
+            scheduler: &scheduler,
             file: &mut file,
             hasher: &mut hasher,
             tx: &tx,
@@ -628,6 +632,7 @@ struct ParallelRelay<'a> {
     end: u64,
     total: u64,
     config: crate::scheduler::StreamDownloadConfig,
+    scheduler: &'a crate::scheduler::Scheduler,
     file: &'a mut tokio::fs::File,
     hasher: &'a mut Sha256,
     tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
@@ -636,7 +641,7 @@ struct ParallelRelay<'a> {
 struct ParallelChunkRequest {
     upstream: crate::upstream::UpstreamService,
     nodes: std::sync::Arc<Vec<crate::nodes::NodeView>>,
-    permits: std::sync::Arc<Vec<std::sync::Arc<tokio::sync::Semaphore>>>,
+    scheduler: crate::scheduler::Scheduler,
     node_service: crate::nodes::NodeService,
     path: std::sync::Arc<str>,
     headers: std::sync::Arc<HeaderMap>,
@@ -645,17 +650,6 @@ struct ParallelChunkRequest {
 
 async fn relay_parallel_ranges(relay: ParallelRelay<'_>) -> ApiResult<()> {
     let nodes = std::sync::Arc::new(relay.nodes.to_vec());
-    let permits = std::sync::Arc::new(
-        relay
-            .nodes
-            .iter()
-            .map(|node| {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(usize::from(
-                    node.max_concurrency,
-                )))
-            })
-            .collect::<Vec<_>>(),
-    );
     let path: std::sync::Arc<str> = relay.path.to_owned().into();
     let headers = std::sync::Arc::new(relay.headers.clone());
     let mut chunks = Vec::new();
@@ -678,7 +672,7 @@ async fn relay_parallel_ranges(relay: ParallelRelay<'_>) -> ApiResult<()> {
             fetch_parallel_chunk(ParallelChunkRequest {
                 upstream: relay.upstream.clone(),
                 nodes: nodes.clone(),
-                permits: permits.clone(),
+                scheduler: relay.scheduler.clone(),
                 node_service: relay.node_service.clone(),
                 path: path.clone(),
                 headers: headers.clone(),
@@ -712,7 +706,10 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
         let mut attempted = false;
         for step in 0..request.nodes.len() {
             let index = (request.chunk.sequence + step) % request.nodes.len();
-            let Ok(permit) = request.permits[index].clone().try_acquire_owned() else {
+            let Some(permit) = request.scheduler.try_acquire(
+                request.nodes[index].node.id,
+                request.nodes[index].max_concurrency,
+            ) else {
                 continue;
             };
             attempted = true;
