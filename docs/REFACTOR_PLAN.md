@@ -11,6 +11,7 @@
 - Blob digest 校验、缓存对账和前端账户能力字段已补齐。
 - 镜像拉取历史已支持默认开启、运行时开关、查询和安全清空；保留策略与分页待完善。
 - Docker archive 与 OCI archive 已使用独立构建路径，并分别校验 manifest 引用和 OCI layout 根结构。
+- NodeSelection 已集中管理吞吐 EWMA、全局并发租约、策略排序与指数冷却；更细的错误分类指标待完善。
 - 每个增量提交均经过 Rust 全量测试、Clippy 与前端 lint/build 验证；暂不创建版本 tag。
 
 ## 总目标
