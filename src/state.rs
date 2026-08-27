@@ -94,6 +94,15 @@ impl AppState {
             runtime_flags,
         })
     }
+
+    pub async fn apply_runtime_config(&self, config: &Config) {
+        self.scheduler.update_runtime(config).await;
+        self.cache.update_runtime(config).await;
+        self.upstream.update_runtime(config).await;
+        self.nodes.update_runtime(config).await;
+        self.image_tools.update_runtime(config).await;
+        self.runtime_flags.update(config);
+    }
 }
 
 #[cfg(test)]
