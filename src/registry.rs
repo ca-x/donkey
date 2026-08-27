@@ -503,6 +503,12 @@ async fn relay_stream_blob(
             }
         }
         let completed = offset > window.end;
+        scheduler.observe_node(
+            nodes[current_node].node.id,
+            transferred,
+            started.elapsed(),
+            completed,
+        );
         node_service
             .record_transfer(
                 nodes[current_node].node.id,
@@ -745,6 +751,12 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
             }
             .await;
             drop(permit);
+            request.scheduler.observe_node(
+                request.nodes[index].node.id,
+                result.as_ref().map_or(0, |bytes| bytes.len() as u64),
+                started.elapsed(),
+                result.is_ok(),
+            );
             request
                 .node_service
                 .record_transfer(

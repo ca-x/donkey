@@ -9,6 +9,7 @@ pub mod domainfold;
 pub mod error;
 pub mod helpers;
 pub mod image_tools;
+mod node_selection;
 pub mod nodes;
 pub mod registry;
 pub mod registry_routes;

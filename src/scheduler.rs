@@ -4,10 +4,10 @@ use crate::{
     cache::{CacheStore, CachedObject},
     config::{Config, SchedulerPolicy},
     error::{ApiResult, AppError},
+    node_selection::{NodeLease, NodeSelector},
     nodes::{NodeService, NodeView},
     upstream::{RangeMode, UpstreamService},
 };
-use dashmap::DashMap;
 use futures_util::{StreamExt, stream};
 use http::{HeaderMap, header};
 use http_content_range::ContentRange;
@@ -27,8 +27,7 @@ pub struct Scheduler {
     nodes: NodeService,
     cache: CacheStore,
     upstream: UpstreamService,
-    runtime_speeds: Arc<DashMap<Uuid, f64>>,
-    active_chunks: Arc<DashMap<Uuid, usize>>,
+    selector: NodeSelector,
     capabilities: Cache<String, BlobCapabilities>,
 }
 
@@ -93,8 +92,7 @@ impl Scheduler {
             nodes,
             cache,
             upstream,
-            runtime_speeds: Arc::new(DashMap::new()),
-            active_chunks: Arc::new(DashMap::new()),
+            selector: NodeSelector::new(),
             capabilities: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(std::time::Duration::from_secs(600))
@@ -318,7 +316,7 @@ impl Scheduler {
                 .await
                 .map(|m| m.len().saturating_sub(offset))
                 .unwrap_or(0);
-            self.observe_speed(node.node.id, bytes, started.elapsed(), result.is_ok());
+            self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
             drop(lease);
             self.nodes
                 .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
@@ -541,7 +539,7 @@ impl Scheduler {
                 }
             }
             .await;
-            self.observe_speed(
+            self.observe_node(
                 node.node.id,
                 chunk.end - chunk.start + 1,
                 started.elapsed(),
@@ -622,7 +620,7 @@ impl Scheduler {
                 .await
                 .map(|m| m.len())
                 .unwrap_or(0);
-            self.observe_speed(node.node.id, bytes, started.elapsed(), result.is_ok());
+            self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
             drop(lease);
             self.nodes
                 .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
@@ -649,37 +647,10 @@ impl Scheduler {
         sequence: usize,
         policy: SchedulerPolicy,
     ) -> Vec<&'a NodeView> {
-        let mut ordered = nodes.iter().collect::<Vec<_>>();
-        match policy {
-            SchedulerPolicy::Balanced => {
-                if !ordered.is_empty() {
-                    let offset = sequence % ordered.len();
-                    ordered.rotate_left(offset);
-                }
-            }
-            SchedulerPolicy::SpeedFirst => ordered.sort_by(|left, right| {
-                self.available_capacity(right)
-                    .total_cmp(&self.available_capacity(left))
-            }),
-        }
-        ordered
+        self.selector.order(nodes, sequence, policy)
     }
 
-    fn available_capacity(&self, node: &NodeView) -> f64 {
-        let measured = self
-            .runtime_speeds
-            .get(&node.node.id)
-            .map(|value| *value)
-            .unwrap_or(node.metric.speed_bps.max(0) as f64);
-        let active = self
-            .active_chunks
-            .get(&node.node.id)
-            .map(|value| *value)
-            .unwrap_or(0);
-        speed_first_capacity(measured, node.metric.success_rate, active)
-    }
-
-    async fn acquire(&self, node_id: Uuid, max_concurrency: u16) -> ActiveChunkLease {
+    async fn acquire(&self, node_id: Uuid, max_concurrency: u16) -> NodeLease {
         loop {
             if let Some(lease) = self.try_acquire(node_id, max_concurrency) {
                 return lease;
@@ -688,54 +659,23 @@ impl Scheduler {
         }
     }
 
-    pub(crate) fn try_acquire(
-        &self,
-        node_id: Uuid,
-        max_concurrency: u16,
-    ) -> Option<ActiveChunkLease> {
-        let mut available = self.active_chunks.entry(node_id).or_insert(0);
-        if *available >= usize::from(max_concurrency) {
-            return None;
-        }
-        *available += 1;
-        drop(available);
-        Some(ActiveChunkLease {
-            node_id,
-            active_chunks: self.active_chunks.clone(),
-        })
+    pub(crate) fn try_acquire(&self, node_id: Uuid, max_concurrency: u16) -> Option<NodeLease> {
+        self.selector.try_acquire(node_id, max_concurrency)
     }
 
     fn at_capacity(&self, node_id: Uuid, max_concurrency: u16) -> bool {
-        self.active_chunks
-            .get(&node_id)
-            .is_some_and(|value| *value >= usize::from(max_concurrency))
+        self.selector.at_capacity(node_id, max_concurrency)
     }
 
-    fn observe_speed(
+    pub(crate) fn observe_node(
         &self,
         node_id: Uuid,
         bytes: u64,
         elapsed: std::time::Duration,
         success: bool,
     ) {
-        if success && bytes > 0 && elapsed.as_secs_f64() > 0.0 {
-            let sample = bytes as f64 / elapsed.as_secs_f64();
-            self.runtime_speeds
-                .entry(node_id)
-                .and_modify(|value| *value = *value * 0.7 + sample * 0.3)
-                .or_insert(sample);
-        } else if !success {
-            self.runtime_speeds
-                .entry(node_id)
-                .and_modify(|value| *value *= 0.5);
-        }
+        self.selector.observe(node_id, bytes, elapsed, success);
     }
-}
-
-fn speed_first_capacity(measured_bps: f64, success_rate: f64, active_chunks: usize) -> f64 {
-    let discovery_floor = 256.0 * 1024.0;
-    measured_bps.max(discovery_floor) * success_rate.clamp(0.05, 1.0).powi(2)
-        / (active_chunks + 1) as f64
 }
 
 fn capacity_backoff() -> std::time::Duration {
@@ -833,19 +773,6 @@ fn content_range_matches(headers: &HeaderMap, start: u64, end: u64, total: u64) 
                 && value.last_byte == end
                 && value.complete_length == total
     )
-}
-
-pub(crate) struct ActiveChunkLease {
-    node_id: Uuid,
-    active_chunks: Arc<DashMap<Uuid, usize>>,
-}
-
-impl Drop for ActiveChunkLease {
-    fn drop(&mut self) {
-        if let Some(mut value) = self.active_chunks.get_mut(&self.node_id) {
-            *value = value.saturating_sub(1);
-        }
-    }
 }
 
 async fn stream_response_to_file(
@@ -948,15 +875,6 @@ mod tests {
             parts.iter().map(|p| (p.start, p.end)).collect::<Vec<_>>(),
             vec![(0, 3), (4, 7), (8, 10)]
         );
-    }
-
-    #[test]
-    fn speed_first_prefers_capacity_not_only_raw_speed() {
-        let fast_idle = speed_first_capacity(8_000_000.0, 0.98, 0);
-        let fast_busy = speed_first_capacity(8_000_000.0, 0.98, 7);
-        let medium_idle = speed_first_capacity(2_000_000.0, 0.99, 0);
-        assert!(fast_idle > medium_idle);
-        assert!(medium_idle > fast_busy);
     }
 
     #[test]
