@@ -775,6 +775,39 @@ mod proxy_integration {
         }
 
         #[tokio::test]
+        async fn accepts_docker_mirror_namespace_query_and_reuses_blob_cache() {
+            let bytes = b"query-aware-blob".to_vec();
+            let fixture = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
+            let (state, _directory) = proxy_state(&[&fixture]).await;
+            let digest = digest(&bytes);
+            let path = blob_path(&digest);
+            let query_path = format!("{path}?ns=docker.io");
+            let router = registry_router(state.clone());
+
+            let first = request(router.clone(), Method::GET, &query_path, None).await;
+            assert_eq!(first.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(first.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+
+            let second = request(router, Method::GET, &path, None).await;
+            assert_eq!(second.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(second.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert_eq!(fixture.get_count(), 1);
+        }
+
+        #[tokio::test]
         async fn concurrent_stream_misses_share_one_upstream_transfer() {
             let bytes = vec![b's'; 1024 * 1024 + 17];
             let fixture = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;

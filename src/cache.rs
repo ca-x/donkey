@@ -139,6 +139,8 @@ impl CacheStore {
         hasher.update(cache_scope.as_bytes());
         hasher.update([0]);
         let public_identity = request_path
+            .split_once('?')
+            .map_or(request_path, |(path, _)| path)
             .rsplit_once("/blobs/")
             .map(|(_, digest)| digest)
             .filter(|digest| {
@@ -463,6 +465,15 @@ mod tests {
         );
         assert_ne!(anonymous, private);
         assert!(!private.contains("secret"));
+    }
+
+    #[test]
+    fn digest_cache_keys_ignore_registry_query_parameters() {
+        let path = format!("/v2/library/rust/blobs/sha256:{}", "a".repeat(64));
+        assert_eq!(
+            CacheStore::key("route", &path, None, false),
+            CacheStore::key("route", &format!("{path}?ns=docker.io"), None, false)
+        );
     }
 
     #[test]

@@ -85,7 +85,10 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
         ));
     }
     if upstream_path.contains("/blobs/") {
-        let digest = upstream_path
+        let blob_path = upstream_path
+            .split_once('?')
+            .map_or(upstream_path.as_str(), |(path, _)| path);
+        let digest = blob_path
             .rsplit_once("/blobs/")
             .map(|(_, digest)| digest)
             .ok_or_else(|| AppError::bad_request("invalid Blob path"))?;
