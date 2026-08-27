@@ -371,6 +371,7 @@ impl ImageTools {
         let mut runtime = self.runtime.write().await;
         runtime.max_export_bytes = config.max_export_bytes;
         runtime.export_ttl = config.export_ttl;
+        self.upstream.update_runtime(config).await;
     }
 
     pub fn router(self) -> Router {
