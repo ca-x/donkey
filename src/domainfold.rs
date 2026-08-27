@@ -110,14 +110,28 @@ pub async fn convert(db: &DatabaseConnection, raw: &str) -> ApiResult<ConvertOut
         .ok_or_else(|| AppError::bad_request("this domain has no acceleration mapping"))?;
 
     let upstream = Url::parse(&mapping.upstream_base).map_err(AppError::internal)?;
-    if !original.as_str().starts_with(upstream.as_str())
-        && original.host_str() != upstream.host_str()
+    if original.scheme() != upstream.scheme()
+        || original.host_str() != upstream.host_str()
+        || original.port_or_known_default() != upstream.port_or_known_default()
+        || upstream.username() != ""
+        || upstream.password().is_some()
     {
         return Err(AppError::bad_request(
             "URL does not match the mapping upstream",
         ));
     }
     let upstream_path = upstream.path().trim_end_matches('/');
+    if !upstream_path.is_empty()
+        && original.path() != upstream_path
+        && !original
+            .path()
+            .strip_prefix(upstream_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    {
+        return Err(AppError::bad_request(
+            "URL does not match the mapping upstream path",
+        ));
+    }
     let suffix = original
         .path()
         .strip_prefix(upstream_path)
@@ -317,6 +331,26 @@ mod tests {
             output.accelerated_url,
             "https://gh.example:5443/org/repo/releases/a.zip?download=1"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_same_host_paths_outside_mapping_prefix() {
+        let db = db::connect("sqlite::memory:").await.unwrap();
+        create(
+            &db,
+            MappingInput {
+                source_host: "downloads.example".into(),
+                upstream_base: "https://downloads.example/releases/".into(),
+                public_base: "https://mirror.example/".into(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        let error = convert(&db, "https://downloads.example/private/secret.tar.gz")
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
