@@ -381,6 +381,7 @@ async fn import_runtime(
     if let Some(settings) = export.settings.as_ref() {
         validate_runtime_settings(settings)?;
     }
+    validate_import_snapshot(&state, &export).await?;
     let mut route_ids = HashMap::new();
     for route in export.registry_routes {
         let input = crate::registry_routes::RegistryRouteInput {
@@ -462,6 +463,50 @@ async fn import_runtime(
         &effective_config(&state).await?,
         cache,
     )))
+}
+
+async fn validate_import_snapshot(
+    state: &AppState,
+    export: &RuntimeSettingsExport,
+) -> ApiResult<()> {
+    let mut keys = std::collections::HashSet::new();
+    for route in &export.registry_routes {
+        if !keys.insert(route.key.as_str()) {
+            return Err(crate::error::AppError::bad_request(format!(
+                "duplicate Registry route key '{}'",
+                route.key
+            )));
+        }
+        if route.key.trim().is_empty() || route.canonical_registry.trim().is_empty() {
+            return Err(crate::error::AppError::bad_request(
+                "Registry route key and canonical registry are required",
+            ));
+        }
+    }
+    let existing = state.registry_routes.list().await?;
+    for node in &export.nodes {
+        if node.auth_mode != "none" {
+            return Err(crate::error::AppError::bad_request(format!(
+                "node '{}' requires credentials after import",
+                node.name
+            )));
+        }
+        if !(1..=256).contains(&node.max_concurrency) {
+            return Err(crate::error::AppError::bad_request(format!(
+                "node '{}' has an invalid concurrency limit",
+                node.name
+            )));
+        }
+        if !keys.contains(node.registry_route.as_str())
+            && !existing.iter().any(|route| route.key == node.registry_route)
+        {
+            return Err(crate::error::AppError::bad_request(format!(
+                "unknown Registry route '{}'",
+                node.registry_route
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_runtime_settings(input: &RuntimeSettingsInput) -> ApiResult<()> {
