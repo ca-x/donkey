@@ -8,6 +8,7 @@ use http::{HeaderMap, Method, header};
 use moka::future::Cache;
 use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
+use tokio::sync::RwLock;
 use url::Url;
 use www_authenticate_parser::{Challenge, parse_header};
 
@@ -21,6 +22,7 @@ use crate::{
 #[derive(Clone)]
 pub struct UpstreamService {
     config: Arc<Config>,
+    timeout: Arc<RwLock<Duration>>,
     nodes: NodeService,
     tokens: Cache<String, TokenEntry>,
 }
@@ -64,10 +66,15 @@ struct TokenResponse {
 impl UpstreamService {
     pub fn new(config: Arc<Config>, nodes: NodeService) -> Self {
         Self {
+            timeout: Arc::new(RwLock::new(config.upstream_timeout)),
             config,
             nodes,
             tokens: Cache::builder().max_capacity(2_000).build(),
         }
+    }
+
+    pub async fn update_runtime(&self, config: &Config) {
+        *self.timeout.write().await = config.upstream_timeout;
     }
 
     pub async fn send(
@@ -130,7 +137,8 @@ impl UpstreamService {
             let redirect = redirect_base.join(location).map_err(AppError::internal)?;
             let validated = security::validate_target_url(redirect.as_str(), &self.config).await?;
             redirect_base = validated.url.clone();
-            let client = security::client_for(&validated, self.config.upstream_timeout)?;
+            let timeout = *self.timeout.read().await;
+            let client = security::client_for(&validated, timeout)?;
             let request = forward_headers(
                 client.request(method.clone(), validated.url),
                 headers,
@@ -150,7 +158,8 @@ impl UpstreamService {
     async fn send_once(&self, node: &NodeView, spec: RequestSpec<'_>) -> ApiResult<Response> {
         let mut validated = security::validate_target_url(spec.url.as_str(), &self.config).await?;
         self.apply_connect_ip(node, &mut validated)?;
-        let client = security::client_for(&validated, self.config.upstream_timeout)?;
+        let timeout = *self.timeout.read().await;
+        let client = security::client_for(&validated, timeout)?;
         let mut request = forward_headers(
             client.request(spec.method, validated.url),
             spec.headers,
