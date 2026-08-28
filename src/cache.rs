@@ -352,6 +352,10 @@ impl CacheStore {
         let Some(ttl) = ttl else {
             return Ok(0);
         };
+        // Expiry decisions must include hits that are still buffered in
+        // memory; otherwise a recently used object can be evicted using a
+        // stale durable last_accessed_at timestamp.
+        self.repository.flush_hits().await?;
         let cutoff = Utc::now() - chrono::Duration::from_std(ttl).map_err(AppError::internal)?;
         let mut freed = 0_u64;
         loop {
@@ -451,7 +455,7 @@ mod tests {
     use super::CacheStore;
     use crate::Config;
     use futures_util::future::try_join_all;
-    use sea_orm::EntityTrait;
+    use sea_orm::{ActiveModelTrait, ActiveValue, EntityTrait};
     use std::sync::Arc;
 
     #[test]
@@ -650,6 +654,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cache.stats().await.unwrap().hits, 32);
+    }
+
+    #[tokio::test]
+    async fn cleanup_flushes_pending_hits_before_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.cache_ttl = Some(std::time::Duration::from_secs(60));
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let cache = CacheStore::new(Arc::new(config), db.clone()).await.unwrap();
+        let temporary = directory.path().join("ttl-hit.partial");
+        tokio::fs::write(&temporary, b"recently hit").await.unwrap();
+        let key = "2".repeat(64);
+        cache
+            .admit(&key, &temporary, "application/octet-stream", None)
+            .await
+            .unwrap();
+        assert!(cache.get(&key).await.unwrap().is_some());
+
+        let entry = crate::db::cache_entry::Entity::find_by_id(&key)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let old_access = chrono::Utc::now() - chrono::Duration::hours(1);
+        crate::db::cache_entry::ActiveModel {
+            key: ActiveValue::Unchanged(entry.key),
+            media_type: ActiveValue::Unchanged(entry.media_type),
+            path: ActiveValue::Unchanged(entry.path),
+            size_bytes: ActiveValue::Unchanged(entry.size_bytes),
+            digest: ActiveValue::Unchanged(entry.digest),
+            hit_count: ActiveValue::Unchanged(entry.hit_count),
+            created_at: ActiveValue::Unchanged(entry.created_at),
+            last_accessed_at: ActiveValue::Set(old_access),
+        }
+        .update(&db)
+        .await
+        .unwrap();
+        let stored = crate::db::cache_entry::Entity::find_by_id(&key)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.last_accessed_at < chrono::Utc::now() - chrono::Duration::seconds(60));
+
+        assert_eq!(cache.cleanup_expired().await.unwrap(), 0);
+        let stored = crate::db::cache_entry::Entity::find_by_id(&key)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.hit_count, 1);
+        assert!(stored.last_accessed_at > old_access);
     }
 
     #[tokio::test]

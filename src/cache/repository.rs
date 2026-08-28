@@ -169,7 +169,7 @@ impl CacheRepository {
         self.pending_hits.remove(key);
     }
 
-    async fn flush_hits(&self) -> ApiResult<()> {
+    pub(super) async fn flush_hits(&self) -> ApiResult<()> {
         let keys = self
             .pending_hits
             .iter()
