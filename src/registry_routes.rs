@@ -570,6 +570,7 @@ mod tests {
                 enabled: true,
                 priority: 1,
                 cf_preferred: false,
+                connect_ip_type: "ip".into(),
                 connect_ip: None,
                 auth_mode: "none".into(),
                 auth_username: None,

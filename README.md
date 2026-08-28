@@ -141,6 +141,8 @@ https://registry-1.docker.io
 
 默认只接受解析到公开 IP 的 HTTPS 上游。内网 Registry 需要显式设置 `DONKEY_ALLOW_PRIVATE_UPSTREAMS=true`；HTTP 上游还需设置 `DONKEY_ALLOW_INSECURE_UPSTREAMS=true`。
 
+节点的「优选连接类型」可以选择 IP 或域名。选择域名时，Donkey 解析该域名的 A/AAAA 记录作为连接地址，同时保留「镜像端点」的 Host 和 TLS SNI。例如镜像端点为 `https://box.w0x7ce.eu/` 时，可将优选域名设为 `saas.sin.fan`；也可以直接填写某个具体 IP。两种类型互斥，旧配置默认按 IP 处理。
+
 客户端拉取示例（将域名替换为你的 Donkey Registry）：
 
 ```bash

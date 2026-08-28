@@ -122,6 +122,8 @@ pub struct NodeInput {
     pub max_concurrency: u16,
     #[serde(default)]
     pub cf_preferred: bool,
+    #[serde(default = "default_connect_ip_type")]
+    pub connect_ip_type: String,
     pub connect_ip: Option<String>,
     #[serde(default)]
     pub auth_mode: String,
@@ -161,6 +163,7 @@ struct NodeSafeView<'a> {
     enabled: bool,
     priority: i32,
     cf_preferred: bool,
+    connect_ip_type: &'a str,
     connect_ip: &'a Option<String>,
     auth_mode: &'a str,
     auth_username: &'a Option<String>,
@@ -183,6 +186,7 @@ impl Serialize for NodeView {
                 enabled: self.node.enabled,
                 priority: self.node.priority,
                 cf_preferred: self.node.cf_preferred,
+                connect_ip_type: &self.node.connect_ip_type,
                 connect_ip: &self.node.connect_ip,
                 auth_mode: &self.node.auth_mode,
                 auth_username: &self.node.auth_username,
@@ -211,6 +215,10 @@ fn default_priority() -> i32 {
 
 fn default_max_concurrency() -> u16 {
     8
+}
+
+fn default_connect_ip_type() -> String {
+    "ip".into()
 }
 
 impl NodeService {
@@ -284,9 +292,9 @@ impl NodeService {
         {
             return Err(AppError::conflict(NODE_URL_CONFLICT));
         }
-        if let Some(ip) = &input.connect_ip {
-            ip.parse::<std::net::IpAddr>()
-                .map_err(|_| AppError::bad_request("connect_ip must be an IP address"))?;
+        if let Some(target) = &input.connect_ip {
+            normalize_connect_ip_type(&input.connect_ip_type)?;
+            security::validate_connect_target_syntax(target, &input.connect_ip_type)?;
         }
         let auth_secret_enc = self.seal_secret(&input.auth_mode, input.auth_secret.as_deref())?;
         let now = Utc::now();
@@ -298,6 +306,7 @@ impl NodeService {
             enabled: input.enabled,
             priority: input.priority,
             cf_preferred: input.cf_preferred,
+            connect_ip_type: normalize_connect_ip_type(&input.connect_ip_type)?.to_owned(),
             connect_ip: input.connect_ip,
             auth_mode: normalized_auth_mode(&input.auth_mode)?.to_owned(),
             auth_username: trimmed(input.auth_username),
@@ -323,9 +332,9 @@ impl NodeService {
             .await?
             .ok_or_else(|| AppError::conflict(NODE_ROUTE_CONFLICT))?;
         let validated = security::validate_upstream(&input.url, &self.config).await?;
-        if let Some(ip) = &input.connect_ip {
-            ip.parse::<std::net::IpAddr>()
-                .map_err(|_| AppError::bad_request("connect_ip must be an IP address"))?;
+        if let Some(target) = &input.connect_ip {
+            normalize_connect_ip_type(&input.connect_ip_type)?;
+            security::validate_connect_target_syntax(target, &input.connect_ip_type)?;
         }
         let mut node = db::get_node(&self.db, id)
             .await?
@@ -343,6 +352,7 @@ impl NodeService {
         node.enabled = input.enabled;
         node.priority = input.priority;
         node.cf_preferred = input.cf_preferred;
+        node.connect_ip_type = normalize_connect_ip_type(&input.connect_ip_type)?.to_owned();
         node.connect_ip = input.connect_ip;
         node.auth_mode = normalized_auth_mode(&input.auth_mode)?.to_owned();
         node.auth_username = trimmed(input.auth_username);
@@ -745,6 +755,7 @@ pub(crate) fn validate_input(input: &NodeInput) -> ApiResult<()> {
             "max_concurrency must be between 1 and 64",
         ));
     }
+    normalize_connect_ip_type(&input.connect_ip_type)?;
     let mode = normalized_auth_mode(&input.auth_mode)?;
     if mode == "basic" && input.auth_username.as_deref().is_none_or(str::is_empty) {
         return Err(AppError::bad_request(
@@ -757,6 +768,16 @@ pub(crate) fn validate_input(input: &NodeInput) -> ApiResult<()> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn normalize_connect_ip_type(value: &str) -> ApiResult<&str> {
+    match value {
+        "" | "ip" => Ok("ip"),
+        "domain" => Ok("domain"),
+        _ => Err(AppError::bad_request(
+            "connect_ip_type must be ip or domain",
+        )),
+    }
 }
 
 fn normalized_auth_mode(mode: &str) -> ApiResult<&str> {
@@ -821,6 +842,7 @@ mod tests {
             priority: 10,
             max_concurrency: 4,
             cf_preferred: false,
+            connect_ip_type: "ip".into(),
             connect_ip: None,
             auth_mode: "none".into(),
             auth_username: None,
@@ -859,6 +881,7 @@ mod tests {
             enabled: true,
             priority: 100,
             cf_preferred: false,
+            connect_ip_type: "ip".into(),
             connect_ip: None,
             auth_mode: "none".into(),
             auth_username: None,
@@ -1010,6 +1033,7 @@ mod tests {
                 priority: 10,
                 max_concurrency: 4,
                 cf_preferred: false,
+                connect_ip_type: "ip".into(),
                 connect_ip: None,
                 auth_mode: "basic".into(),
                 auth_username: Some("1ms".into()),

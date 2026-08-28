@@ -12,6 +12,7 @@ use crate::{
     nodes::NodeService,
     registry_routes::RegistryRouteService,
     scheduler::{Scheduler, SchedulerAlgorithmKind},
+    transfer_metrics::TransferMetrics,
 };
 
 #[derive(Clone)]
@@ -26,6 +27,7 @@ pub struct AppState {
     pub scheduler: Scheduler,
     pub image_tools: crate::image_tools::ImageTools,
     pub traffic: crate::traffic::TrafficMetrics,
+    pub transfer_metrics: TransferMetrics,
     pub runtime_flags: RuntimeFlags,
 }
 
@@ -106,8 +108,15 @@ impl AppState {
         let nodes = NodeService::new(config.clone(), db.clone())?;
         let registry_routes = RegistryRouteService::new(db.clone());
         let auth = crate::auth::AuthService::new(config.clone(), db.clone()).await?;
-        let cache = CacheStore::new(config.clone(), db.clone()).await?;
-        let upstream = crate::upstream::UpstreamService::new(config.clone(), nodes.clone());
+        let transfer_metrics = TransferMetrics::new();
+        let cache =
+            CacheStore::new_with_metrics(config.clone(), db.clone(), transfer_metrics.clone())
+                .await?;
+        let upstream = crate::upstream::UpstreamService::new_with_metrics(
+            config.clone(),
+            nodes.clone(),
+            transfer_metrics.clone(),
+        );
         let scheduler = Scheduler::new_with_algorithm(
             config.clone(),
             nodes.clone(),
@@ -130,6 +139,7 @@ impl AppState {
             scheduler,
             image_tools,
             traffic,
+            transfer_metrics,
             runtime_flags,
         })
     }
@@ -167,6 +177,7 @@ mod tests {
                 priority: 1,
                 max_concurrency: 4,
                 cf_preferred: false,
+                connect_ip_type: "ip".into(),
                 connect_ip: None,
                 auth_mode: "basic".into(),
                 auth_username: Some("user".into()),

@@ -108,6 +108,30 @@ export function DashboardPage() {
           </Stack>
         </Paper>
       </div>
+
+      <Paper className="panel transfer-metrics-panel">
+        <Group justify="space-between" align="flex-start" mb="lg">
+          <Box>
+            <Title order={2}>{t('dashboard.transferMetrics')}</Title>
+            <Text size="sm" c="dimmed" mt={4}>{t('dashboard.transferMetricsDescription')}</Text>
+          </Box>
+          <Text size="xs" c="dimmed">{t('dashboard.metricsWindow', { seconds: data.transfer_metrics.window_seconds })}</Text>
+        </Group>
+        <SimpleGrid cols={{ base: 1, xs: 2, lg: 4 }} spacing="md">
+          <MetricCard label={t('dashboard.cacheHitRatio')} value={formatRatio(data.transfer_metrics.window.cache_hit_ratio)} detail={t('dashboard.cacheHitDetail', { hits: data.transfer_metrics.window.blob_get_hits, misses: data.transfer_metrics.window.blob_get_misses })} icon={<IconBolt size={18} />} />
+          <MetricCard label={t('dashboard.cacheBytesServed')} value={formatBytes(data.transfer_metrics.window.cache_bytes_served)} detail={t('dashboard.cacheAdmitted', { value: formatBytes(data.transfer_metrics.window.cache_bytes_admitted), failed: data.transfer_metrics.window.cache_admissions_failed })} icon={<IconDatabase size={18} />} />
+          <MetricCard label={t('dashboard.upstreamBytesFetched')} value={formatBytes(data.transfer_metrics.window.upstream_bytes_fetched)} detail={t('dashboard.upstreamRequests', { count: data.transfer_metrics.window.upstream_requests })} icon={<IconCloudCheck size={18} />} />
+          <MetricCard label={t('dashboard.coldP95')} value={formatMillis(data.transfer_metrics.window.cold_complete_ms.p95_ms)} detail={t('dashboard.warmP95', { value: formatMillis(data.transfer_metrics.window.warm_complete_ms.p95_ms) })} icon={<IconActivityHeartbeat size={18} />} />
+        </SimpleGrid>
+      </Paper>
     </Stack>
   )
+}
+
+function formatRatio(value: number | null) {
+  return value === null ? '—' : `${(value * 100).toFixed(1)}%`
+}
+
+function formatMillis(value: number | null) {
+  return value === null ? '—' : value > 60_000 ? '≥60 s' : `${value} ms`
 }

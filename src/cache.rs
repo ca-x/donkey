@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use crate::{
     config::{CachePolicy, Config},
     error::{ApiResult, AppError},
+    transfer_metrics::TransferMetrics,
 };
 
 mod object_store;
@@ -25,6 +26,7 @@ pub struct CacheStore {
     active_flights: Arc<DashMap<String, ()>>,
     runtime: Arc<RwLock<CacheRuntimeConfig>>,
     capacity_lock: Arc<Mutex<()>>,
+    metrics: TransferMetrics,
 }
 
 #[derive(Clone, Copy)]
@@ -94,6 +96,14 @@ impl Drop for CacheLease {
 
 impl CacheStore {
     pub async fn new(config: Arc<Config>, db: sea_orm::DatabaseConnection) -> ApiResult<Self> {
+        Self::new_with_metrics(config, db, TransferMetrics::new()).await
+    }
+
+    pub async fn new_with_metrics(
+        config: Arc<Config>,
+        db: sea_orm::DatabaseConnection,
+        metrics: TransferMetrics,
+    ) -> ApiResult<Self> {
         let objects = ObjectStore::open(&config.data_dir, config.partial_ttl).await?;
         let store = Self {
             objects,
@@ -113,6 +123,7 @@ impl CacheStore {
                 public_bearer_cache_enabled: config.public_bearer_cache_enabled,
             })),
             capacity_lock: Arc::new(Mutex::new(())),
+            metrics,
         };
         store.reconcile_startup().await?;
         Ok(store)
@@ -185,6 +196,10 @@ impl CacheStore {
         self.objects.temp_dir()
     }
 
+    pub fn metrics(&self) -> TransferMetrics {
+        self.metrics.clone()
+    }
+
     pub async fn get(&self, key: &str) -> ApiResult<Option<CachedObject>> {
         let Some(entry) = self.repository.find(key).await? else {
             return Ok(None);
@@ -209,6 +224,18 @@ impl CacheStore {
         }))
     }
 
+    pub async fn get_for_blob_request(&self, key: &str) -> ApiResult<Option<CachedObject>> {
+        let result = self.get(key).await?;
+        self.metrics.record_blob_get(result.is_some());
+        Ok(result)
+    }
+
+    pub async fn get_for_head_request(&self, key: &str) -> ApiResult<Option<CachedObject>> {
+        let result = self.get(key).await?;
+        self.metrics.record_blob_head(result.is_some());
+        Ok(result)
+    }
+
     pub async fn admit(
         &self,
         key: &str,
@@ -216,33 +243,42 @@ impl CacheStore {
         media_type: &str,
         digest: Option<String>,
     ) -> ApiResult<CachedObject> {
-        let incoming = tokio::fs::metadata(temporary).await?.len();
-        let _object_write_guard = self.objects.lock_writer().await?;
-        let _capacity_file_guard = self.objects.lock_capacity().await?;
-        let _capacity_guard = self.capacity_lock.lock().await;
-        self.reserve_capacity_locked(incoming, key).await?;
-        let size = self.objects.commit(key, temporary).await?;
-        let destination = self.object_path(key);
-        let now = Utc::now();
-        self.repository
-            .insert(CacheRecord {
+        self.metrics.record_cache_admission_started();
+        let result = async {
+            let incoming = tokio::fs::metadata(temporary).await?.len();
+            let _object_write_guard = self.objects.lock_writer().await?;
+            let _capacity_file_guard = self.objects.lock_capacity().await?;
+            let _capacity_guard = self.capacity_lock.lock().await;
+            self.reserve_capacity_locked(incoming, key).await?;
+            let size = self.objects.commit(key, temporary).await?;
+            let destination = self.object_path(key);
+            let now = Utc::now();
+            self.repository
+                .insert(CacheRecord {
+                    key: key.to_owned(),
+                    media_type: media_type.to_owned(),
+                    path: destination.to_string_lossy().into_owned(),
+                    size_bytes: size.min(i64::MAX as u64) as i64,
+                    digest: digest.clone(),
+                    hit_count: 0,
+                    created_at: now,
+                    last_accessed_at: now,
+                })
+                .await?;
+            Ok::<_, AppError>(CachedObject {
                 key: key.to_owned(),
+                path: destination,
+                size,
                 media_type: media_type.to_owned(),
-                path: destination.to_string_lossy().into_owned(),
-                size_bytes: size.min(i64::MAX as u64) as i64,
-                digest: digest.clone(),
-                hit_count: 0,
-                created_at: now,
-                last_accessed_at: now,
+                digest,
             })
-            .await?;
-        Ok(CachedObject {
-            key: key.to_owned(),
-            path: destination,
-            size,
-            media_type: media_type.to_owned(),
-            digest,
-        })
+        }
+        .await;
+        match &result {
+            Ok(object) => self.metrics.record_cache_admission_succeeded(object.size),
+            Err(_) => self.metrics.record_cache_admission_failed(),
+        }
+        result
     }
 
     pub async fn lock(&self, key: &str) -> ApiResult<CacheLease> {
@@ -706,6 +742,27 @@ mod tests {
             .unwrap();
         assert_eq!(stored.hit_count, 1);
         assert!(stored.last_accessed_at > old_access);
+    }
+
+    #[tokio::test]
+    async fn failed_admission_is_counted_without_affecting_the_request_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let cache = CacheStore::new(Arc::new(config), db).await.unwrap();
+        let result = cache
+            .admit(
+                &"3".repeat(64),
+                &directory.path().join("missing.partial"),
+                "application/octet-stream",
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+        let metrics = cache.metrics().snapshot().lifetime;
+        assert_eq!(metrics.cache_admissions_started, 1);
+        assert_eq!(metrics.cache_admissions_succeeded, 0);
+        assert_eq!(metrics.cache_admissions_failed, 1);
     }
 
     #[tokio::test]

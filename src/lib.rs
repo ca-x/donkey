@@ -21,6 +21,7 @@ pub mod server;
 pub mod state;
 pub mod static_files;
 pub mod traffic;
+pub mod transfer_metrics;
 pub mod upstream;
 
 pub use config::Config;

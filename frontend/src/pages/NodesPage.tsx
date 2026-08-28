@@ -9,6 +9,7 @@ import {
   NumberInput,
   Paper,
   PasswordInput,
+  Radio,
   Select,
   SimpleGrid,
   Stack,
@@ -55,6 +56,7 @@ function nodeInitialValues(registryRouteId: string): NodeInput {
     priority: 100,
     max_concurrency: 8,
     cf_preferred: false,
+    connect_ip_type: 'ip',
     connect_ip: null,
     auth_mode: 'none',
     auth_username: null,
@@ -191,6 +193,7 @@ function NodeDialog({ opened, value, initialRouteId, routes, close }: { opened: 
       priority: editing.node.priority,
       max_concurrency: editing.max_concurrency,
       cf_preferred: editing.node.cf_preferred,
+      connect_ip_type: editing.node.connect_ip_type,
       connect_ip: editing.node.connect_ip,
       auth_mode: editing.node.auth_mode,
       auth_username: editing.node.auth_username,
@@ -206,6 +209,7 @@ function NodeDialog({ opened, value, initialRouteId, routes, close }: { opened: 
       auth_secret: (v, values) => !editing && values.auth_mode !== 'none' && !v ? t('nodes.validationSecret') : null,
     },
   })
+  const [connectTargetType, setConnectTargetType] = useState<'ip' | 'domain'>(editing?.node.connect_ip_type === 'domain' ? 'domain' : 'ip')
 
   const save = useMutation({
     mutationFn: (input: NodeInput) => editing ? api.updateNode(editing.node.id, input) : api.createNode(input),
@@ -252,7 +256,23 @@ function NodeDialog({ opened, value, initialRouteId, routes, close }: { opened: 
               <NumberInput label={t('nodes.priority')} description={t('nodes.priorityDesc')} min={0} max={1000} {...form.getInputProps('priority')} />
               <NumberInput label={t('nodes.maxConcurrency')} description={t('concurrencyHelp.nodeDescription')} min={1} max={64} {...form.getInputProps('max_concurrency')} />
             </SimpleGrid>
-            <TextInput label={t('nodes.connectIp')} description={t('nodes.connectIpDesc')} {...form.getInputProps('connect_ip')} />
+            <Radio.Group
+              label={t('nodes.connectTargetType')}
+              value={connectTargetType}
+              onChange={(value) => {
+                const next = value as 'ip' | 'domain'
+                setConnectTargetType(next)
+                form.setFieldValue('connect_ip_type', next)
+                form.setFieldValue('connect_ip', null)
+              }}
+              name="connect-target-type"
+            >
+              <Group mt="xs" gap="lg">
+                <Radio value="ip" label={t('nodes.connectIpType')} />
+                <Radio value="domain" label={t('nodes.connectDomainType')} />
+              </Group>
+            </Radio.Group>
+            <TextInput label={t('nodes.connectIp')} description={t('nodes.connectIpDesc')} placeholder={connectTargetType === 'domain' ? 'saas.sin.fan' : '172.64.229.235'} {...form.getInputProps('connect_ip')} />
             <Group gap="xl">
               <Switch label={t('nodes.enableNode')} {...form.getInputProps('enabled', { type: 'checkbox' })} />
               <Switch label={t('nodes.cfip')} {...form.getInputProps('cf_preferred', { type: 'checkbox' })} />

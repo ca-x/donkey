@@ -36,6 +36,7 @@ export interface NodeModel {
   enabled: boolean
   priority: number
   cf_preferred: boolean
+  connect_ip_type: 'ip' | 'domain'
   connect_ip: string | null
   auth_mode: AuthMode
   auth_username: string | null
@@ -62,6 +63,7 @@ export interface NodeInput {
   priority: number
   max_concurrency: number
   cf_preferred: boolean
+  connect_ip_type: 'ip' | 'domain'
   connect_ip: string | null
   auth_mode: AuthMode
   auth_username: string | null
@@ -136,6 +138,43 @@ export interface DashboardData {
   retry_attempts: number
   last_chunk_size: number
   cooling_nodes: number
+  transfer_metrics: TransferMetricsSnapshot
+}
+
+export interface HistogramSnapshot {
+  bounds_ms: number[]
+  buckets: number[]
+  samples: number
+  p50_ms: number | null
+  p95_ms: number | null
+  p99_ms: number | null
+}
+
+export interface TransferMetricsView {
+  blob_get_requests: number
+  blob_get_hits: number
+  blob_get_misses: number
+  blob_head_requests: number
+  blob_head_hits: number
+  cache_hit_ratio: number | null
+  cache_bytes_served: number
+  cache_admissions_started: number
+  cache_admissions_succeeded: number
+  cache_admissions_failed: number
+  cache_bytes_admitted: number
+  upstream_requests: number
+  upstream_bytes_fetched: number
+  cold_ttfb_ms: HistogramSnapshot
+  cold_complete_ms: HistogramSnapshot
+  warm_ttfb_ms: HistogramSnapshot
+  warm_complete_ms: HistogramSnapshot
+}
+
+export interface TransferMetricsSnapshot {
+  started_at: string
+  window_seconds: number
+  lifetime: TransferMetricsView
+  window: TransferMetricsView
 }
 
 export interface HealthData {
@@ -211,6 +250,7 @@ export interface RuntimeSettingsExport {
     priority: number
     max_concurrency: number
     cf_preferred: boolean
+    connect_ip_type: 'ip' | 'domain'
     connect_ip: string | null
     auth_mode: AuthMode
     auth_username: string | null

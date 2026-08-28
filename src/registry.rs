@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use futures_util::StreamExt;
 use http_content_range::ContentRange;
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
@@ -110,13 +111,14 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
                     }),
                 )
                 .await;
-            if let Some(object) = state.cache.get(&key).await? {
-                return serve_cached(&state.cache, object, request).await;
+            if let Some(object) = state.cache.get_for_head_request(&key).await? {
+                return serve_cached(&state.cache, object, request, Instant::now(), true).await;
             }
         } else {
             // Keep the verified/cache-aware path for normal-sized blobs. If
             // it cannot produce a response promptly (large/slow layers),
             // switch to a streaming retry so Docker receives headers quickly.
+            let request_started = Instant::now();
             let stream_fallback_timeout = state.scheduler.stream_fallback_timeout().await;
             match tokio::time::timeout(
                 stream_fallback_timeout,
@@ -130,8 +132,15 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
             .await
             {
                 Ok(result) => {
-                    let object = result?;
-                    return serve_cached(&state.cache, object, request).await;
+                    let result = result?;
+                    return serve_cached(
+                        &state.cache,
+                        result.object,
+                        request,
+                        request_started,
+                        result.cache_hit,
+                    )
+                    .await;
                 }
                 Err(_) => {
                     return stream_blob(
@@ -140,6 +149,7 @@ async fn handle_inner(state: AppState, request: Request) -> ApiResult<Response> 
                         request.headers().clone(),
                         Some(digest),
                         nodes,
+                        request_started,
                     )
                     .await;
                 }
@@ -210,6 +220,7 @@ async fn stream_blob(
     headers: HeaderMap,
     expected_digest: Option<&str>,
     nodes: Vec<crate::nodes::NodeView>,
+    request_started: Instant,
 ) -> ApiResult<Response> {
     let nodes = state.scheduler.ordered_stream_nodes(&nodes, path).await;
     if nodes.is_empty() {
@@ -218,6 +229,7 @@ async fn stream_blob(
         ));
     }
     let cache = state.cache.clone();
+    let metrics = cache.metrics();
     let key = cache
         .request_key(
             &nodes[0].route.id.to_string(),
@@ -231,7 +243,14 @@ async fn stream_blob(
         )
         .await;
     if let Some(object) = cache.get(&key).await? {
-        return serve_cached(&cache, object, cached_get_request(path, &headers)?).await;
+        return serve_cached(
+            &cache,
+            object,
+            cached_get_request(path, &headers)?,
+            request_started,
+            false,
+        )
+        .await;
     }
     // Acquire the per-Blob lease before opening an upstream connection.  A
     // second request for the same uncached Blob now waits for the first relay,
@@ -239,7 +258,14 @@ async fn stream_blob(
     let lease = cache.lock(&key).await?;
     if let Some(object) = cache.get(&key).await? {
         drop(lease);
-        return serve_cached(&cache, object, cached_get_request(path, &headers)?).await;
+        return serve_cached(
+            &cache,
+            object,
+            cached_get_request(path, &headers)?,
+            request_started,
+            false,
+        )
+        .await;
     }
     let mut last_error = None;
     for (node_index, node) in nodes.iter().enumerate() {
@@ -307,6 +333,8 @@ async fn stream_blob(
                 node_service: state.nodes.clone(),
                 response: upstream,
                 _lease: lease,
+                request_started,
+                metrics: metrics.clone(),
             })
             .await;
         };
@@ -358,6 +386,7 @@ async fn stream_blob(
             parallel,
             scheduler: state.scheduler.clone(),
             range_failures: std::sync::Arc::new(DashMap::new()),
+            metrics: metrics.clone(),
         };
         tokio::spawn(async move {
             let errors = tx.clone();
@@ -371,7 +400,14 @@ async fn stream_blob(
         let body = futures_util::stream::unfold(rx, |mut rx| async {
             rx.recv().await.map(|chunk| (chunk, rx))
         });
-        let mut response = Response::new(Body::from_stream(body));
+        let body = track_body(
+            Body::from_stream(body),
+            metrics.clone(),
+            request_started,
+            false,
+            false,
+        );
+        let mut response = Response::new(body);
         *response.status_mut() = status;
         copy_response_headers(&response_headers, response.headers_mut());
         response.headers_mut().insert(
@@ -396,6 +432,8 @@ fn cached_get_request(path: &str, headers: &HeaderMap) -> ApiResult<Request> {
 async fn stream_unknown_blob(relay: UnknownBlobRelay) -> ApiResult<Response> {
     let status = relay.response.status();
     let response_headers = relay.response.headers().clone();
+    let request_started = relay.request_started;
+    let metrics = relay.metrics.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
     tokio::spawn(async move {
         let errors = tx.clone();
@@ -408,7 +446,14 @@ async fn stream_unknown_blob(relay: UnknownBlobRelay) -> ApiResult<Response> {
     let body = futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|chunk| (chunk, rx))
     });
-    let mut response = Response::new(Body::from_stream(body));
+    let body = track_body(
+        Body::from_stream(body),
+        metrics,
+        request_started,
+        false,
+        false,
+    );
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     copy_response_headers(&response_headers, response.headers_mut());
     response.headers_mut().remove(header::CONTENT_LENGTH);
@@ -433,6 +478,8 @@ async fn relay_unknown_blob(
         node_service,
         response,
         _lease,
+        request_started: _,
+        metrics,
     } = relay;
     let partial_dir = cache.temp_dir().join(&key);
     tokio::fs::create_dir_all(&partial_dir).await?;
@@ -456,6 +503,7 @@ async fn relay_unknown_blob(
             hasher.update(&chunk);
             file.write_all(&chunk).await?;
             transferred = transferred.saturating_add(chunk.len() as u64);
+            metrics.record_upstream_bytes(chunk.len() as u64);
             node_service.record_live_bytes(node.node.id, chunk.len() as u64);
             tx.send(Ok(chunk))
                 .await
@@ -514,6 +562,7 @@ struct StreamRelay {
     parallel: Option<crate::scheduler::StreamDownloadConfig>,
     scheduler: crate::scheduler::Scheduler,
     range_failures: std::sync::Arc<DashMap<uuid::Uuid, ()>>,
+    metrics: crate::transfer_metrics::TransferMetrics,
 }
 
 struct UnknownBlobRelay {
@@ -526,6 +575,8 @@ struct UnknownBlobRelay {
     node_service: crate::nodes::NodeService,
     response: reqwest::Response,
     _lease: CacheLease,
+    request_started: Instant,
+    metrics: crate::transfer_metrics::TransferMetrics,
 }
 
 struct ResumeRequest<'a> {
@@ -600,6 +651,7 @@ async fn relay_stream_blob(
         parallel,
         scheduler,
         range_failures,
+        metrics,
     } = relay;
     let complete_blob = window.start == 0 && window.end.checked_add(1) == Some(window.total);
     let stable_partial_dir = cache.temp_dir().join(&key);
@@ -726,6 +778,7 @@ async fn relay_stream_blob(
                     file.write_all(&chunk).await?;
                     offset += chunk.len() as u64;
                     transferred += chunk.len() as u64;
+                    metrics.record_upstream_bytes(chunk.len() as u64);
                     tx.send(Ok(chunk)).await.map_err(|_| {
                         AppError::Upstream("client disconnected during Blob stream".into())
                     })?;
@@ -941,6 +994,7 @@ struct ParallelChunkRequest {
     headers: std::sync::Arc<HeaderMap>,
     chunk: StreamChunk,
     range_failures: std::sync::Arc<DashMap<uuid::Uuid, ()>>,
+    metrics: crate::transfer_metrics::TransferMetrics,
 }
 
 async fn relay_parallel_ranges(relay: ParallelRelay<'_>) -> ApiResult<()> {
@@ -973,6 +1027,7 @@ async fn relay_parallel_ranges(relay: ParallelRelay<'_>) -> ApiResult<()> {
                 headers: headers.clone(),
                 chunk,
                 range_failures: relay.range_failures.clone(),
+                metrics: relay.scheduler.transfer_metrics(),
             })
         })
         .buffered(concurrency);
@@ -1062,6 +1117,7 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
                     request
                         .node_service
                         .record_live_bytes(node.node.id, chunk.len() as u64);
+                    request.metrics.record_upstream_bytes(chunk.len() as u64);
                     bytes.extend_from_slice(&chunk);
                 }
                 if bytes.len() as u64 != expected {
@@ -1125,14 +1181,22 @@ async fn serve_cached(
     cache: &CacheStore,
     object: CachedObject,
     request: Request,
+    request_started: Instant,
+    warm: bool,
 ) -> ApiResult<Response> {
     let guard = cache.lock(&object.key).await?;
     let method = request.method().clone();
+    let is_get = method == Method::GET;
     let uri = request.uri().clone();
     let headers = request.headers().clone();
     if let Some(digest) = object.digest.as_deref()
         && etag_matches(headers.get(header::IF_NONE_MATCH), digest)
     {
+        if is_get && warm {
+            let elapsed = request_started.elapsed();
+            cache.metrics().record_warm_ttfb(elapsed);
+            cache.metrics().record_warm_complete(elapsed);
+        }
         drop(guard);
         let mut response = StatusCode::NOT_MODIFIED.into_response();
         set_registry_validators(response.headers_mut(), digest);
@@ -1153,7 +1217,18 @@ async fn serve_cached(
         let _keep_alive = &guard;
         chunk
     });
-    let mut response = Response::from_parts(parts, Body::from_stream(guarded));
+    let body = if is_get {
+        track_body(
+            Body::from_stream(guarded),
+            cache.metrics(),
+            request_started,
+            warm,
+            true,
+        )
+    } else {
+        Body::from_stream(guarded)
+    };
+    let mut response = Response::from_parts(parts, body);
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         object
@@ -1169,6 +1244,57 @@ async fn serve_cached(
         set_registry_validators(response.headers_mut(), &digest);
     }
     Ok(response)
+}
+
+fn track_body(
+    body: Body,
+    metrics: crate::transfer_metrics::TransferMetrics,
+    started: Instant,
+    warm: bool,
+    count_cache_bytes: bool,
+) -> Body {
+    let stream = body.into_data_stream();
+    let stream = futures_util::stream::unfold(
+        (stream, false, false),
+        move |(mut stream, mut saw_first, mut failed)| {
+            let metrics = metrics.clone();
+            async move {
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        if !chunk.is_empty() {
+                            if !saw_first {
+                                if warm {
+                                    metrics.record_warm_ttfb(started.elapsed());
+                                } else {
+                                    metrics.record_cold_ttfb(started.elapsed());
+                                }
+                                saw_first = true;
+                            }
+                            if count_cache_bytes {
+                                metrics.record_cache_bytes_served(chunk.len() as u64);
+                            }
+                        }
+                        Some((Ok(chunk), (stream, saw_first, failed)))
+                    }
+                    Some(Err(error)) => {
+                        failed = true;
+                        Some((Err(error), (stream, saw_first, failed)))
+                    }
+                    None => {
+                        if !failed {
+                            if warm {
+                                metrics.record_warm_complete(started.elapsed());
+                            } else {
+                                metrics.record_cold_complete(started.elapsed());
+                            }
+                        }
+                        None
+                    }
+                }
+            }
+        },
+    );
+    Body::from_stream(stream)
 }
 
 fn set_registry_validators(headers: &mut HeaderMap, digest: &str) {
@@ -1231,7 +1357,10 @@ async fn proxy_passthrough(
                     upstream_response.status()
                 )));
             }
-            Ok::<_, AppError>(to_response(upstream_response))
+            Ok::<_, AppError>(to_response(
+                upstream_response,
+                Some(state.transfer_metrics.clone()),
+            ))
         }
         .await;
         match result {
@@ -1333,14 +1462,18 @@ fn path_and_query(uri: &http::Uri) -> String {
         .to_owned()
 }
 
-fn to_response(upstream: reqwest::Response) -> Response {
+fn to_response(
+    upstream: reqwest::Response,
+    metrics: Option<crate::transfer_metrics::TransferMetrics>,
+) -> Response {
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let body = Body::from_stream(
-        upstream
-            .bytes_stream()
-            .map(|chunk| chunk.map_err(std::io::Error::other)),
-    );
+    let body = Body::from_stream(upstream.bytes_stream().map(move |chunk| {
+        if let (Some(metrics), Ok(bytes)) = (&metrics, &chunk) {
+            metrics.record_upstream_bytes(bytes.len() as u64);
+        }
+        chunk.map_err(std::io::Error::other)
+    }));
     let mut response = Response::new(body);
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
@@ -1396,6 +1529,7 @@ mod tests {
                 priority: 1,
                 max_concurrency: 4,
                 cf_preferred: false,
+                connect_ip_type: "ip".into(),
                 connect_ip: None,
                 auth_mode: "none".into(),
                 auth_username: None,
@@ -1480,6 +1614,7 @@ mod tests {
                 priority: 1,
                 max_concurrency: 4,
                 cf_preferred: false,
+                connect_ip_type: "ip".into(),
                 connect_ip: None,
                 auth_mode: "none".into(),
                 auth_username: None,

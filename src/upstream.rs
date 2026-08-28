@@ -17,6 +17,7 @@ use crate::{
     error::{ApiResult, AppError},
     nodes::{NodeService, NodeView},
     security,
+    transfer_metrics::TransferMetrics,
 };
 
 #[derive(Clone)]
@@ -24,6 +25,7 @@ pub struct UpstreamService {
     config: Arc<Config>,
     timeout: Arc<RwLock<Duration>>,
     nodes: NodeService,
+    metrics: Option<TransferMetrics>,
     tokens: Cache<String, TokenEntry>,
     transports: Cache<String, NodeTransport>,
 }
@@ -72,10 +74,23 @@ struct TokenResponse {
 
 impl UpstreamService {
     pub fn new(config: Arc<Config>, nodes: NodeService) -> Self {
+        Self::build(config, nodes, None)
+    }
+
+    pub fn new_with_metrics(
+        config: Arc<Config>,
+        nodes: NodeService,
+        metrics: TransferMetrics,
+    ) -> Self {
+        Self::build(config, nodes, Some(metrics))
+    }
+
+    fn build(config: Arc<Config>, nodes: NodeService, metrics: Option<TransferMetrics>) -> Self {
         Self {
             timeout: Arc::new(RwLock::new(config.upstream_timeout)),
             config,
             nodes,
+            metrics,
             tokens: Cache::builder().max_capacity(2_000).build(),
             transports: Cache::builder()
                 .max_capacity(512)
@@ -133,6 +148,9 @@ impl UpstreamService {
         headers: &HeaderMap,
         range: RangeMode,
     ) -> ApiResult<Response> {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_upstream_request();
+        }
         let transport = self.node_transport(node).await?;
         let url = transport
             .base
@@ -241,7 +259,7 @@ impl UpstreamService {
             return Ok(transport);
         }
         let mut base = security::validate_upstream(&node.node.url, &self.config).await?;
-        self.apply_connect_ip(node, &mut base)?;
+        self.apply_connect_ip(node, &mut base).await?;
         let client = security::client_for(&base, timeout)?;
         let transport = NodeTransport { base, client };
         self.transports.insert(key, transport.clone()).await;
@@ -276,7 +294,7 @@ impl UpstreamService {
             }
         }
         let mut validated = security::validate_target_url(realm.as_str(), &self.config).await?;
-        self.apply_connect_ip(node, &mut validated)?;
+        self.apply_connect_ip(node, &mut validated).await?;
         let client = security::client_for(&validated, self.timeout().await)?;
         let request = client
             .get(validated.url)
@@ -328,7 +346,7 @@ impl UpstreamService {
         Ok(value)
     }
 
-    fn apply_connect_ip(
+    async fn apply_connect_ip(
         &self,
         node: &NodeView,
         upstream: &mut security::ValidatedUpstream,
@@ -342,13 +360,10 @@ impl UpstreamService {
         if node_host.as_deref() != upstream.url.host_str() {
             return Ok(());
         }
-        let ip = value
-            .parse()
-            .map_err(|_| AppError::bad_request("node connect_ip is invalid"))?;
-        if !self.config.allow_private_upstreams && security::is_non_public(ip) {
-            return Err(AppError::bad_request("private connect_ip is disabled"));
-        }
-        upstream.addresses = Arc::from([ip]);
+        let port = upstream.url.port_or_known_default().unwrap_or(443);
+        upstream.addresses =
+            security::resolve_connect_target(value, &node.node.connect_ip_type, port, &self.config)
+                .await?;
         Ok(())
     }
 

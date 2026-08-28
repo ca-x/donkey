@@ -435,6 +435,7 @@ mod proxy_integration {
                     priority: index as i32,
                     max_concurrency: 4,
                     cf_preferred: false,
+                    connect_ip_type: "ip".into(),
                     connect_ip: None,
                     auth_mode: "none".into(),
                     auth_username: None,
@@ -466,6 +467,7 @@ mod proxy_integration {
                     priority: index as i32,
                     max_concurrency: 4,
                     cf_preferred: false,
+                    connect_ip_type: "ip".into(),
                     connect_ip: None,
                     auth_mode: "header".into(),
                     auth_username: None,
@@ -682,6 +684,7 @@ mod proxy_integration {
                         priority: index as i32,
                         max_concurrency: 4,
                         cf_preferred: false,
+                        connect_ip_type: "ip".into(),
                         connect_ip: None,
                         auth_mode: "none".into(),
                         auth_username: None,
@@ -794,6 +797,14 @@ mod proxy_integration {
                 bytes
             );
             assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+            let first_metrics = state.transfer_metrics.snapshot().lifetime;
+            assert_eq!(first_metrics.blob_get_requests, 1);
+            assert_eq!(first_metrics.blob_get_hits, 0);
+            assert_eq!(first_metrics.blob_get_misses, 1);
+            assert_eq!(first_metrics.cache_admissions_succeeded, 1);
+            assert_eq!(first_metrics.cache_bytes_admitted, bytes.len() as u64);
+            assert_eq!(first_metrics.upstream_bytes_fetched, bytes.len() as u64);
+            assert_eq!(first_metrics.cache_bytes_served, bytes.len() as u64);
 
             let second = request(router, Method::GET, &path, None).await;
             assert_eq!(second.status(), StatusCode::OK);
@@ -805,6 +816,67 @@ mod proxy_integration {
                 bytes
             );
             assert_eq!(fixture.get_count(), 1);
+            let second_metrics = state.transfer_metrics.snapshot().lifetime;
+            assert_eq!(second_metrics.blob_get_requests, 2);
+            assert_eq!(second_metrics.blob_get_hits, 1);
+            assert_eq!(second_metrics.blob_get_misses, 1);
+            assert_eq!(second_metrics.cache_bytes_served, (bytes.len() * 2) as u64);
+            assert_eq!(second_metrics.upstream_bytes_fetched, bytes.len() as u64);
+        }
+
+        #[tokio::test]
+        #[ignore = "loopback-only cache timing diagnostic; not part of CI"]
+        async fn diagnostic_cache_cold_and_warm_percentiles() {
+            let samples = std::env::var("DONKEY_BENCHMARK_SAMPLES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(10)
+                .clamp(1, 100);
+            let bytes = vec![b'b'; 2 * 1024 * 1024 + 17];
+            let fixture = Fixture::start(FixtureBehavior::RangeUnsupported, bytes.clone()).await;
+            let (state, _directory) = proxy_state(&[&fixture]).await;
+            let path = blob_path(&digest(&bytes));
+            let router = registry_router(state.clone());
+            let mut cold = Vec::with_capacity(samples);
+            let mut warm = Vec::with_capacity(samples);
+
+            for _ in 0..samples {
+                state.cache.clear_all().await.unwrap();
+                let started = std::time::Instant::now();
+                let response = request(router.clone(), Method::GET, &path, None).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .len(),
+                    bytes.len()
+                );
+                cold.push(started.elapsed().as_millis());
+            }
+            for _ in 0..samples {
+                let started = std::time::Instant::now();
+                let response = request(router.clone(), Method::GET, &path, None).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .len(),
+                    bytes.len()
+                );
+                warm.push(started.elapsed().as_millis());
+            }
+
+            eprintln!(
+                "cache diagnostic: {}",
+                serde_json::json!({
+                    "samples": samples,
+                    "cold_ms": percentile_ms(&cold),
+                    "warm_ms": percentile_ms(&warm),
+                    "metrics": state.transfer_metrics.snapshot(),
+                })
+            );
         }
 
         #[tokio::test]
@@ -826,6 +898,7 @@ mod proxy_integration {
                     priority: 0,
                     max_concurrency: 4,
                     cf_preferred: false,
+                    connect_ip_type: "ip".into(),
                     connect_ip: None,
                     auth_mode: "none".into(),
                     auth_username: None,
@@ -879,6 +952,7 @@ mod proxy_integration {
                     priority: 0,
                     max_concurrency: 4,
                     cf_preferred: false,
+                    connect_ip_type: "ip".into(),
                     connect_ip: None,
                     auth_mode: "none".into(),
                     auth_username: None,
@@ -925,6 +999,7 @@ mod proxy_integration {
                     priority: 0,
                     max_concurrency: 4,
                     cf_preferred: false,
+                    connect_ip_type: "ip".into(),
                     connect_ip: None,
                     auth_mode: "none".into(),
                     auth_username: None,
@@ -1059,6 +1134,7 @@ mod proxy_integration {
                         priority: index as i32,
                         max_concurrency: 4,
                         cf_preferred: false,
+                        connect_ip_type: "ip".into(),
                         connect_ip: None,
                         auth_mode: "none".into(),
                         auth_username: None,
@@ -1121,6 +1197,7 @@ mod proxy_integration {
                         priority: index as i32,
                         max_concurrency: 4,
                         cf_preferred: false,
+                        connect_ip_type: "ip".into(),
                         connect_ip: None,
                         auth_mode: "none".into(),
                         auth_username: None,
@@ -1173,6 +1250,7 @@ mod proxy_integration {
                     priority: 0,
                     max_concurrency: 4,
                     cf_preferred: false,
+                    connect_ip_type: "ip".into(),
                     connect_ip: None,
                     auth_mode: "none".into(),
                     auth_username: None,
@@ -1197,6 +1275,7 @@ mod proxy_integration {
                     priority: 1,
                     max_concurrency: 4,
                     cf_preferred: false,
+                    connect_ip_type: "ip".into(),
                     connect_ip: None,
                     auth_mode: "none".into(),
                     auth_username: None,
@@ -1244,6 +1323,7 @@ mod proxy_integration {
                         priority: index as i32,
                         max_concurrency: 4,
                         cf_preferred: false,
+                        connect_ip_type: "ip".into(),
                         connect_ip: None,
                         auth_mode: "none".into(),
                         auth_username: None,
@@ -1298,6 +1378,7 @@ mod proxy_integration {
                         priority: index as i32,
                         max_concurrency: 2,
                         cf_preferred: false,
+                        connect_ip_type: "ip".into(),
                         connect_ip: None,
                         auth_mode: "none".into(),
                         auth_username: None,
@@ -1354,6 +1435,7 @@ mod proxy_integration {
                     priority: 0,
                     max_concurrency: 4,
                     cf_preferred: false,
+                    connect_ip_type: "ip".into(),
                     connect_ip: None,
                     auth_mode: "none".into(),
                     auth_username: None,
@@ -1405,6 +1487,7 @@ mod proxy_integration {
                         priority: index as i32,
                         max_concurrency: 4,
                         cf_preferred: false,
+                        connect_ip_type: "ip".into(),
                         connect_ip: None,
                         auth_mode: "none".into(),
                         auth_username: None,
@@ -1457,6 +1540,7 @@ mod proxy_integration {
                         priority: index as i32,
                         max_concurrency: 4,
                         cf_preferred: false,
+                        connect_ip_type: "ip".into(),
                         connect_ip: None,
                         auth_mode: "none".into(),
                         auth_username: None,
@@ -1510,6 +1594,7 @@ mod proxy_integration {
                         priority: index as i32,
                         max_concurrency: 1,
                         cf_preferred: false,
+                        connect_ip_type: "ip".into(),
                         connect_ip: None,
                         auth_mode: "none".into(),
                         auth_username: None,
@@ -1562,6 +1647,7 @@ mod proxy_integration {
                     priority: 0,
                     max_concurrency: 1,
                     cf_preferred: false,
+                    connect_ip_type: "ip".into(),
                     connect_ip: None,
                     auth_mode: "none".into(),
                     auth_username: None,
@@ -1636,6 +1722,7 @@ mod proxy_integration {
                         priority: index as i32,
                         max_concurrency: 2,
                         cf_preferred: false,
+                        connect_ip_type: "ip".into(),
                         connect_ip: None,
                         auth_mode: "none".into(),
                         auth_username: None,
@@ -1881,6 +1968,7 @@ mod proxy_integration {
                     priority: 0,
                     max_concurrency: 4,
                     cf_preferred: false,
+                    connect_ip_type: "ip".into(),
                     connect_ip: None,
                     auth_mode: "none".into(),
                     auth_username: None,
@@ -1904,5 +1992,15 @@ mod proxy_integration {
                     .is_empty()
             );
         }
+    }
+
+    fn percentile_ms(samples: &[u128]) -> serde_json::Value {
+        let mut values = samples.to_vec();
+        values.sort_unstable();
+        serde_json::json!({
+            "p50": values[(values.len() - 1) * 50 / 100],
+            "p95": values[(values.len() - 1) * 95 / 100],
+            "p99": values[(values.len() - 1) * 99 / 100],
+        })
     }
 }

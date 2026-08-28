@@ -281,6 +281,7 @@ async fn probe(
                 priority: index as i32,
                 max_concurrency: 4,
                 cf_preferred: false,
+                connect_ip_type: "ip".into(),
                 connect_ip: None,
                 auth_mode: "none".into(),
                 auth_username: None,

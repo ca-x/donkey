@@ -80,6 +80,7 @@ struct Dashboard {
     retry_attempts: u64,
     last_chunk_size: u64,
     cooling_nodes: usize,
+    transfer_metrics: crate::transfer_metrics::TransferMetricsSnapshot,
 }
 
 async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> {
@@ -91,6 +92,7 @@ async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> 
         .map(|node| node.live_bps)
         .fold(0_u64, u64::saturating_add);
     let scheduler = state.scheduler.stats();
+    let transfer_metrics = state.transfer_metrics.snapshot();
     Ok(Json(Dashboard {
         healthy_nodes: nodes
             .iter()
@@ -108,6 +110,7 @@ async fn dashboard(State(state): State<AppState>) -> ApiResult<Json<Dashboard>> 
         retry_attempts: scheduler.retry_attempts,
         last_chunk_size: scheduler.last_chunk_size,
         cooling_nodes: scheduler.cooling_nodes,
+        transfer_metrics,
     }))
 }
 
@@ -413,10 +416,16 @@ struct ExportNode {
     priority: i32,
     max_concurrency: u16,
     cf_preferred: bool,
+    #[serde(default = "default_connect_ip_type")]
+    connect_ip_type: String,
     connect_ip: Option<String>,
     auth_mode: String,
     auth_username: Option<String>,
     auth_header: Option<String>,
+}
+
+fn default_connect_ip_type() -> String {
+    "ip".into()
 }
 
 async fn update_runtime(
@@ -445,6 +454,7 @@ async fn export_runtime(State(state): State<AppState>) -> ApiResult<Json<Runtime
             priority: node.node.priority,
             max_concurrency: node.max_concurrency,
             cf_preferred: node.node.cf_preferred,
+            connect_ip_type: node.node.connect_ip_type,
             connect_ip: node.node.connect_ip,
             auth_mode: node.node.auth_mode,
             auth_username: node.node.auth_username,
@@ -625,6 +635,7 @@ async fn apply_runtime_snapshot(state: &AppState, export: &RuntimeSettingsExport
             priority: node.priority,
             max_concurrency: node.max_concurrency,
             cf_preferred: node.cf_preferred,
+            connect_ip_type: node.connect_ip_type.clone(),
             connect_ip: node.connect_ip.clone(),
             auth_mode: "none".into(),
             auth_username: None,
@@ -632,10 +643,8 @@ async fn apply_runtime_snapshot(state: &AppState, export: &RuntimeSettingsExport
             auth_secret: None,
         };
         crate::nodes::validate_input(&input)?;
-        if let Some(ip) = input.connect_ip.as_deref() {
-            ip.parse::<std::net::IpAddr>().map_err(|_| {
-                crate::error::AppError::bad_request("connect_ip must be an IP address")
-            })?;
+        if let Some(target) = input.connect_ip.as_deref() {
+            crate::security::validate_connect_target_syntax(target, &input.connect_ip_type)?;
         }
         let validated = crate::security::validate_upstream(&input.url, &state.config).await?;
         let canonical = validated.url.to_string();
@@ -651,6 +660,8 @@ async fn apply_runtime_snapshot(state: &AppState, export: &RuntimeSettingsExport
                 enabled: input.enabled && node.auth_mode == "none",
                 priority: input.priority,
                 cf_preferred: input.cf_preferred,
+                connect_ip_type: crate::nodes::normalize_connect_ip_type(&input.connect_ip_type)?
+                    .to_owned(),
                 connect_ip: input.connect_ip,
                 auth_mode: node.auth_mode.clone(),
                 auth_username: node.auth_username.clone(),
@@ -734,6 +745,7 @@ async fn apply_prepared_snapshot(
                 enabled: ActiveValue::Set(model.enabled),
                 priority: ActiveValue::Set(model.priority),
                 cf_preferred: ActiveValue::Set(model.cf_preferred),
+                connect_ip_type: ActiveValue::Set(model.connect_ip_type.clone()),
                 connect_ip: ActiveValue::Set(model.connect_ip.clone()),
                 auth_mode: ActiveValue::Set(model.auth_mode.clone()),
                 auth_username: ActiveValue::Set(model.auth_username.clone()),
@@ -969,6 +981,7 @@ mod tests {
             priority: 1,
             max_concurrency: 4,
             cf_preferred: false,
+            connect_ip_type: "ip".into(),
             connect_ip: None,
             auth_mode: "none".into(),
             auth_username: None,
@@ -1008,6 +1021,7 @@ mod tests {
             priority: 2,
             max_concurrency: 3,
             cf_preferred: false,
+            connect_ip_type: "ip".into(),
             connect_ip: None,
             auth_mode: "none".into(),
             auth_username: None,
@@ -1059,6 +1073,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_exposes_additive_transfer_metrics() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(crate::Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        state.transfer_metrics.record_blob_get(false);
+        state.transfer_metrics.record_blob_get(true);
+        state.transfer_metrics.record_cache_bytes_served(12);
+
+        let response = dashboard(State(state)).await.unwrap();
+        let value = serde_json::to_value(response.0).unwrap();
+        assert_eq!(value["cache_entries"], 0);
+        assert_eq!(
+            value["transfer_metrics"]["lifetime"]["blob_get_requests"],
+            2
+        );
+        assert_eq!(value["transfer_metrics"]["lifetime"]["blob_get_hits"], 1);
+        assert_eq!(
+            value["transfer_metrics"]["lifetime"]["cache_hit_ratio"],
+            0.5
+        );
+        assert_eq!(
+            value["transfer_metrics"]["lifetime"]["cache_bytes_served"],
+            12
+        );
+    }
+
+    #[tokio::test]
     async fn authenticated_import_disables_node_until_secret_is_reentered() {
         let directory = tempfile::tempdir().unwrap();
         let state = AppState::new(crate::Config::for_test(directory.path().to_owned()))
@@ -1077,6 +1119,7 @@ mod tests {
                 priority: 3,
                 max_concurrency: 8,
                 cf_preferred: false,
+                connect_ip_type: "ip".into(),
                 connect_ip: None,
                 auth_mode: "basic".into(),
                 auth_username: Some("robot".into()),
@@ -1111,6 +1154,7 @@ mod tests {
                 priority: 20,
                 max_concurrency: 4,
                 cf_preferred: false,
+                connect_ip_type: "ip".into(),
                 connect_ip: None,
                 auth_mode: "none".into(),
                 auth_username: None,

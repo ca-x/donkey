@@ -60,6 +60,7 @@ pub mod node {
         pub enabled: bool,
         pub priority: i32,
         pub cf_preferred: bool,
+        pub connect_ip_type: String,
         pub connect_ip: Option<String>,
         pub auth_mode: String,
         pub auth_username: Option<String>,
@@ -722,6 +723,13 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE TRIGGER IF NOT EXISTS trg_users_validate_update BEFORE UPDATE ON users WHEN NEW.role NOT IN ('admin', 'member') OR length(trim(NEW.identity_key)) = 0 OR length(trim(NEW.subject)) = 0 OR length(trim(NEW.display_name)) = 0 BEGIN SELECT RAISE(ABORT, 'invalid user'); END",
         ]),
     },
+    Migration {
+        version: 11,
+        name: "preferred connect target type",
+        action: MigrationAction::Statements(&[
+            "ALTER TABLE nodes ADD COLUMN connect_ip_type TEXT NOT NULL DEFAULT 'ip' CHECK(connect_ip_type IN ('ip', 'domain'))",
+        ]),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -879,6 +887,22 @@ async fn apply_migration(
     transaction: &DatabaseTransaction,
     migration: Migration,
 ) -> Result<(), DbErr> {
+    if migration.version == 11 {
+        let exists = transaction
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA table_info(nodes)".to_owned(),
+            ))
+            .await?
+            .iter()
+            .any(|row| {
+                row.try_get::<String>("", "name")
+                    .is_ok_and(|name| name == "connect_ip_type")
+            });
+        if exists {
+            return Ok(());
+        }
+    }
     match migration.action {
         MigrationAction::Statements(statements) => {
             for statement in statements {
@@ -987,6 +1011,7 @@ pub async fn save_node(db: &DatabaseConnection, model: node::Model) -> Result<no
         enabled: ActiveValue::Set(model.enabled),
         priority: ActiveValue::Set(model.priority),
         cf_preferred: ActiveValue::Set(model.cf_preferred),
+        connect_ip_type: ActiveValue::Set(model.connect_ip_type),
         connect_ip: ActiveValue::Set(model.connect_ip),
         auth_mode: ActiveValue::Set(model.auth_mode),
         auth_username: ActiveValue::Set(model.auth_username),
@@ -1800,6 +1825,7 @@ mod tests {
             enabled: true,
             priority: 10,
             cf_preferred: false,
+            connect_ip_type: "ip".into(),
             connect_ip: None,
             auth_mode: "none".into(),
             auth_username: None,
@@ -1883,6 +1909,7 @@ mod tests {
                 (8, 1),
                 (9, 1),
                 (10, 1),
+                (11, 1),
             ]
         );
         assert_expected_indexes(&db).await;
@@ -1919,7 +1946,7 @@ mod tests {
     #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_version() {
         const FAILING_MIGRATION: &[Migration] = &[Migration {
-            version: 11,
+            version: 12,
             name: "rollback test",
             action: MigrationAction::Statements(&[
                 "CREATE TABLE migration_rollback_marker (id INTEGER PRIMARY KEY)",
@@ -1951,6 +1978,7 @@ mod tests {
                 (8, 1),
                 (9, 1),
                 (10, 1),
+                (11, 1),
             ]
         );
     }
@@ -2038,6 +2066,7 @@ mod tests {
             enabled: true,
             priority: 1,
             cf_preferred: false,
+            connect_ip_type: "ip".into(),
             connect_ip: None,
             auth_mode: "none".into(),
             auth_username: None,
@@ -2164,6 +2193,7 @@ mod tests {
                 enabled: true,
                 priority: 10,
                 cf_preferred: false,
+                connect_ip_type: "ip".into(),
                 connect_ip: None,
                 auth_mode: "none".into(),
                 auth_username: None,

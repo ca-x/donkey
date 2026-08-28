@@ -27,6 +27,90 @@ pub async fn validate_target_url(
     validate_url(raw, config, false).await
 }
 
+/// Validate the optional connection override. It may be a literal IP address
+/// or a DNS hostname; URL syntax, ports, and credentials are deliberately not
+/// accepted here because the upstream URL remains the authority/SNI.
+pub fn validate_connect_target_syntax(raw: &str, target_type: &str) -> Result<(), AppError> {
+    let value = raw.trim();
+    if value.is_empty() || value.len() > 253 || value.chars().any(char::is_whitespace) {
+        return Err(AppError::bad_request(
+            "connect_ip must be an IP address or hostname",
+        ));
+    }
+    if value.parse::<IpAddr>().is_ok() {
+        if target_type != "ip" {
+            return Err(AppError::bad_request(
+                "connect_ip_type does not match target",
+            ));
+        }
+        return Ok(());
+    }
+    if target_type != "domain" {
+        return Err(AppError::bad_request(
+            "connect_ip_type does not match target",
+        ));
+    }
+    let host = value.strip_suffix('.').unwrap_or(value);
+    if host.is_empty()
+        || host.contains(['/', ':', '@', '[', ']', '?', '#', '%'])
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(AppError::bad_request(
+            "connect_ip must be an IP address or hostname",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a connection override and enforce the same public-address policy
+/// used for upstream URL validation. All returned addresses are pinned into
+/// the client so a DNS answer cannot change mid-request.
+pub async fn resolve_connect_target(
+    raw: &str,
+    target_type: &str,
+    port: u16,
+    config: &Config,
+) -> Result<Arc<[IpAddr]>, AppError> {
+    validate_connect_target_syntax(raw, target_type)?;
+    let value = raw.trim();
+    let addresses = if let Ok(ip) = value.parse::<IpAddr>() {
+        vec![ip]
+    } else {
+        let host = value
+            .strip_suffix('.')
+            .unwrap_or(value)
+            .to_ascii_lowercase();
+        lookup_host((host.as_str(), port))
+            .await
+            .map_err(|_| AppError::bad_request("connect_ip DNS lookup failed"))?
+            .map(|address| address.ip())
+            .collect()
+    };
+    let mut unique = Vec::with_capacity(addresses.len());
+    for ip in addresses {
+        if !config.allow_private_upstreams && is_non_public(ip) {
+            return Err(AppError::bad_request("private connect_ip is disabled"));
+        }
+        if !unique.contains(&ip) {
+            unique.push(ip);
+        }
+    }
+    if unique.is_empty() {
+        return Err(AppError::bad_request(
+            "connect_ip DNS returned no addresses",
+        ));
+    }
+    Ok(unique.into())
+}
+
 async fn validate_url(
     raw: &str,
     config: &Config,
@@ -175,5 +259,24 @@ mod tests {
             assert!(is_non_public(value.parse().unwrap()), "{value}");
         }
         assert!(!is_non_public("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validates_ip_and_dns_target_types() {
+        assert!(validate_connect_target_syntax("1.1.1.1", "ip").is_ok());
+        assert!(validate_connect_target_syntax("saas.sin.fan", "domain").is_ok());
+        assert!(validate_connect_target_syntax("saas.sin.fan", "ip").is_err());
+        assert!(validate_connect_target_syntax("1.1.1.1", "domain").is_err());
+        assert!(validate_connect_target_syntax("https://example.com", "domain").is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_private_dns_override() {
+        let mut config = Config::for_test(std::env::temp_dir());
+        config.allow_private_upstreams = false;
+        let error = resolve_connect_target("localhost", "domain", 443, &config)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("private connect_ip"));
     }
 }

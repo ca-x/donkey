@@ -43,6 +43,11 @@ pub struct Scheduler {
     capabilities: Cache<String, BlobCapabilities>,
 }
 
+pub(crate) struct BlobFetchResult {
+    pub object: CachedObject,
+    pub cache_hit: bool,
+}
+
 #[derive(Default)]
 struct SchedulerCounters {
     parallel_blobs: AtomicU64,
@@ -299,6 +304,10 @@ impl Scheduler {
         }
     }
 
+    pub(crate) fn transfer_metrics(&self) -> crate::transfer_metrics::TransferMetrics {
+        self.cache.metrics()
+    }
+
     pub(crate) fn record_parallel_blob(&self, chunk_size: u64) {
         self.stats.parallel_blobs.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -314,13 +323,13 @@ impl Scheduler {
         self.stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub async fn fetch_blob(
+    pub(crate) async fn fetch_blob(
         &self,
         request_path: &str,
         request_headers: &HeaderMap,
         expected_digest: Option<&str>,
         nodes: Vec<NodeView>,
-    ) -> ApiResult<CachedObject> {
+    ) -> ApiResult<BlobFetchResult> {
         if nodes.is_empty() {
             return Err(AppError::unavailable(
                 "resolved Registry route has no enabled nodes",
@@ -341,21 +350,30 @@ impl Scheduler {
                 public_route,
             )
             .await;
-        if let Some(object) = self.cache.get(&key).await? {
-            return Ok(object);
+        if let Some(object) = self.cache.get_for_blob_request(&key).await? {
+            return Ok(BlobFetchResult {
+                object,
+                cache_hit: true,
+            });
         }
 
         let guard = self.cache.lock(&key).await?;
         if let Some(object) = self.cache.get(&key).await? {
             drop(guard);
-            return Ok(object);
+            return Ok(BlobFetchResult {
+                object,
+                cache_hit: true,
+            });
         }
 
         let result = self
             .fetch_uncached(&key, request_path, request_headers, expected_digest, &nodes)
             .await;
         drop(guard);
-        result
+        result.map(|object| BlobFetchResult {
+            object,
+            cache_hit: false,
+        })
     }
 
     async fn fetch_uncached(
@@ -637,6 +655,7 @@ impl Scheduler {
                         destination,
                         total_size - offset,
                         Some((&self.nodes, node.node.id)),
+                        Some(self.cache.metrics()),
                     )
                     .await
                 }
@@ -917,6 +936,7 @@ impl Scheduler {
                             destination,
                             expected,
                             Some((&self.nodes, node.node.id)),
+                            Some(self.cache.metrics()),
                         )
                         .await
                     } else {
@@ -925,6 +945,7 @@ impl Scheduler {
                             destination,
                             Some(expected),
                             Some((&self.nodes, node.node.id)),
+                            Some(self.cache.metrics()),
                         )
                         .await
                     }
@@ -1040,6 +1061,7 @@ impl Scheduler {
                             destination,
                             end - start + 1,
                             Some((&self.nodes, node.node.id)),
+                            Some(self.cache.metrics()),
                         )
                         .await
                     } else {
@@ -1049,6 +1071,7 @@ impl Scheduler {
                             destination,
                             length,
                             Some((&self.nodes, node.node.id)),
+                            Some(self.cache.metrics()),
                         )
                         .await
                     }
@@ -1323,6 +1346,7 @@ async fn stream_response_to_file(
     destination: &Path,
     expected: Option<u64>,
     live: Option<(&NodeService, Uuid)>,
+    metrics: Option<crate::transfer_metrics::TransferMetrics>,
 ) -> ApiResult<()> {
     let mut file = File::create(destination).await?;
     let mut received = 0_u64;
@@ -1338,6 +1362,9 @@ async fn stream_response_to_file(
         if let Some((nodes, node_id)) = live {
             nodes.record_live_bytes(node_id, chunk.len() as u64);
         }
+        if let Some(metrics) = &metrics {
+            metrics.record_upstream_bytes(chunk.len() as u64);
+        }
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
@@ -1352,6 +1379,7 @@ async fn append_response_to_file(
     destination: &Path,
     expected: u64,
     live: Option<(&NodeService, Uuid)>,
+    metrics: Option<crate::transfer_metrics::TransferMetrics>,
 ) -> ApiResult<()> {
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
@@ -1367,6 +1395,9 @@ async fn append_response_to_file(
         }
         if let Some((nodes, node_id)) = live {
             nodes.record_live_bytes(node_id, chunk.len() as u64);
+        }
+        if let Some(metrics) = &metrics {
+            metrics.record_upstream_bytes(chunk.len() as u64);
         }
         file.write_all(&chunk).await?;
     }
