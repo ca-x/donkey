@@ -22,10 +22,10 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use moka::future::Cache;
 use openidconnect::{
-    AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
-    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, Scope,
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
+    AccessTokenHash, AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken,
+    EndpointMaybeSet, EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, SignatureVerificationError,
+    core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata},
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
@@ -34,7 +34,7 @@ use sea_orm::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
 
@@ -67,7 +67,8 @@ pub struct AuthService {
 }
 
 struct OidcRuntime {
-    client: OidcClient,
+    client: RwLock<OidcClient>,
+    refresh_lock: Mutex<()>,
     http: openidconnect::reqwest::Client,
     issuer: String,
     display_name: String,
@@ -129,27 +130,10 @@ impl AuthService {
                     .timeout(Duration::from_secs(20))
                     .build()
                     .map_err(AppError::internal)?;
-                let issuer = IssuerUrl::new(value.issuer.clone())
-                    .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?;
-                let metadata = CoreProviderMetadata::discover_async(issuer, &http)
-                    .await
-                    .map_err(|error| {
-                        AppError::internal(anyhow::anyhow!("OIDC discovery failed: {error}"))
-                    })?;
-                let discovered_issuer = metadata.issuer().to_string();
-                let client = CoreClient::from_provider_metadata(
-                    metadata,
-                    ClientId::new(value.client_id.clone()),
-                    Some(ClientSecret::new(
-                        value.client_secret.expose_secret().to_owned(),
-                    )),
-                )
-                .set_redirect_uri(
-                    RedirectUrl::new(value.redirect_url.clone())
-                        .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?,
-                );
+                let (client, discovered_issuer) = discover_oidc_client(value, &http).await?;
                 Some(Arc::new(OidcRuntime {
-                    client,
+                    client: RwLock::new(client),
+                    refresh_lock: Mutex::new(()),
                     http,
                     issuer: discovered_issuer,
                     display_name: value.display_name.clone(),
@@ -399,8 +383,8 @@ impl AuthService {
             .ok_or_else(|| AppError::not_found("OIDC provider"))?;
         let return_to = safe_return_to(&return_to);
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-        let (url, state, nonce) = runtime
-            .client
+        let client = runtime.client.read().await;
+        let (url, state, nonce) = client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
                 CsrfToken::new_random,
@@ -442,8 +426,8 @@ impl AuthService {
         if deleted.rows_affected != 1 || stored.expires_at <= Utc::now() {
             return Err(AppError::Unauthorized);
         }
-        let token_response = runtime
-            .client
+        let mut client = runtime.client.read().await.clone();
+        let token_response = client
             .exchange_code(AuthorizationCode::new(code))
             .map_err(|_| AppError::Unauthorized)?
             .set_pkce_verifier(PkceCodeVerifier::new(stored.pkce_verifier))
@@ -454,9 +438,34 @@ impl AuthService {
             .extra_fields()
             .id_token()
             .ok_or(AppError::Unauthorized)?;
-        let verifier = runtime.client.id_token_verifier();
+        let nonce = Nonce::new(stored.nonce);
+        if let Err(error) = verify_oidc_id_token(&client, id_token, &nonce) {
+            if !is_missing_signing_key(&error) {
+                return Err(AppError::Unauthorized);
+            }
+            let _refresh_guard = runtime.refresh_lock.lock().await;
+            client = runtime.client.read().await.clone();
+            if let Err(error) = verify_oidc_id_token(&client, id_token, &nonce) {
+                if !is_missing_signing_key(&error) {
+                    return Err(AppError::Unauthorized);
+                }
+                let config = self.config.oidc.as_ref().ok_or(AppError::Unauthorized)?;
+                let (refreshed, issuer) = discover_oidc_client(config, &runtime.http)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(?error, "OIDC signing key refresh failed");
+                        AppError::Unauthorized
+                    })?;
+                if issuer != runtime.issuer {
+                    return Err(AppError::Unauthorized);
+                }
+                *runtime.client.write().await = refreshed.clone();
+                client = refreshed;
+            }
+        }
+        let verifier = client.id_token_verifier();
         let claims = id_token
-            .claims(&verifier, &Nonce::new(stored.nonce))
+            .claims(&verifier, &nonce)
             .map_err(|_| AppError::Unauthorized)?;
         if let Some(expected_hash) = claims.access_token_hash() {
             let actual_hash = AccessTokenHash::from_token(
@@ -561,6 +570,47 @@ impl AuthService {
         ))
         .unwrap_or_else(|_| HeaderValue::from_static("donkey_session=; Max-Age=0"))
     }
+}
+
+async fn discover_oidc_client(
+    config: &crate::config::OidcConfig,
+    http: &openidconnect::reqwest::Client,
+) -> ApiResult<(OidcClient, String)> {
+    let issuer = IssuerUrl::new(config.issuer.clone())
+        .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?;
+    let metadata = CoreProviderMetadata::discover_async(issuer, http)
+        .await
+        .map_err(|error| AppError::internal(anyhow::anyhow!("OIDC discovery failed: {error}")))?;
+    let discovered_issuer = metadata.issuer().to_string();
+    let client = CoreClient::from_provider_metadata(
+        metadata,
+        ClientId::new(config.client_id.clone()),
+        Some(ClientSecret::new(
+            config.client_secret.expose_secret().to_owned(),
+        )),
+    )
+    .set_redirect_uri(
+        RedirectUrl::new(config.redirect_url.clone())
+            .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?,
+    );
+    Ok((client, discovered_issuer))
+}
+
+fn verify_oidc_id_token(
+    client: &OidcClient,
+    id_token: &CoreIdToken,
+    nonce: &Nonce,
+) -> Result<(), ClaimsVerificationError> {
+    id_token
+        .claims(&client.id_token_verifier(), nonce)
+        .map(|_| ())
+}
+
+fn is_missing_signing_key(error: &ClaimsVerificationError) -> bool {
+    matches!(
+        error,
+        ClaimsVerificationError::SignatureVerification(SignatureVerificationError::NoMatchingKey)
+    )
 }
 
 pub fn router(service: AuthService) -> Router {
@@ -827,6 +877,12 @@ fn safe_return_to(value: &str) -> String {
 mod tests {
     use super::*;
     use httpmock::prelude::*;
+    use openidconnect::{
+        Audience, EndUserEmail, JsonWebKeyId, PrivateSigningKey, StandardClaims, SubjectIdentifier,
+        core::{
+            CoreEdDsaPrivateSigningKey, CoreIdToken, CoreIdTokenClaims, CoreJwsSigningAlgorithm,
+        },
+    };
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -1096,6 +1152,117 @@ mod tests {
         ));
         discovery.assert_async().await;
         jwks.assert_async().await;
+        token.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn oidc_login_refreshes_rotated_signing_keys_without_restart() {
+        const SIGNING_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MC4CAQAwBQYDK2VwBCIEICWeYPLxoZKHZlQ6rkBi11E9JwchynXtljATLqym/XS9\n\
+-----END PRIVATE KEY-----";
+
+        let issuer = MockServer::start_async().await;
+        let base = issuer.base_url();
+        let discovery = issuer
+            .mock_async(|when, then| {
+                when.method(GET).path("/.well-known/openid-configuration");
+                then.status(200).json_body(serde_json::json!({
+                    "issuer": base,
+                    "authorization_endpoint": format!("{base}/authorize"),
+                    "token_endpoint": format!("{base}/token"),
+                    "jwks_uri": format!("{base}/jwks"),
+                    "response_types_supported": ["code"],
+                    "subject_types_supported": ["public"],
+                    "id_token_signing_alg_values_supported": ["EdDSA"]
+                }));
+            })
+            .await;
+        let stale_jwks = issuer
+            .mock_async(|when, then| {
+                when.method(GET).path("/jwks");
+                then.status(200)
+                    .json_body(serde_json::json!({ "keys": [] }));
+            })
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.oidc = Some(crate::config::OidcConfig {
+            issuer: base.clone(),
+            client_id: "donkey-test".into(),
+            client_secret: SecretString::from("client-secret"),
+            redirect_url: "http://127.0.0.1/callback".into(),
+            display_name: "Test OIDC".into(),
+        });
+        let db = crate::db::connect(&config.database_url).await.unwrap();
+        let service = AuthService::new(Arc::new(config), db.clone())
+            .await
+            .unwrap();
+        stale_jwks.assert_calls_async(1).await;
+        stale_jwks.delete_async().await;
+
+        let signing_key = CoreEdDsaPrivateSigningKey::from_ed25519_pem(
+            SIGNING_KEY,
+            Some(JsonWebKeyId::new("rotated-key".into())),
+        )
+        .unwrap();
+        let fresh_jwks = issuer
+            .mock_async(|when, then| {
+                when.method(GET).path("/jwks");
+                then.status(200).json_body(serde_json::json!({
+                    "keys": [signing_key.as_verification_key()]
+                }));
+            })
+            .await;
+        let url = url::Url::parse(&service.oidc_authorize_url("/".into()).await.unwrap()).unwrap();
+        let query = url.query_pairs().collect::<HashMap<_, _>>();
+        let state = query["state"].to_string();
+        let stored = oidc_login_state::Entity::find_by_id(token_hash(&state))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = Utc::now();
+        let claims = CoreIdTokenClaims::new(
+            IssuerUrl::new(base.clone()).unwrap(),
+            vec![Audience::new("donkey-test".into())],
+            now + chrono::Duration::minutes(5),
+            now,
+            StandardClaims::new(SubjectIdentifier::new("rotated-user".into()))
+                .set_email(Some(EndUserEmail::new("rotated@example.com".into())))
+                .set_email_verified(Some(true)),
+            Default::default(),
+        )
+        .set_nonce(Some(Nonce::new(stored.nonce)));
+        let id_token = CoreIdToken::new(
+            claims,
+            &signing_key,
+            CoreJwsSigningAlgorithm::EdDsa,
+            None,
+            None,
+        )
+        .unwrap();
+        let token = issuer
+            .mock_async(|when, then| {
+                when.method(POST).path("/token");
+                then.status(200).json_body(serde_json::json!({
+                    "access_token": "access-token",
+                    "token_type": "Bearer",
+                    "expires_in": 300,
+                    "id_token": serde_json::to_value(id_token).unwrap()
+                }));
+            })
+            .await;
+
+        let (principal, session, return_to) = service
+            .finish_oidc("authorization-code".into(), state)
+            .await
+            .unwrap();
+
+        assert_eq!(principal.username, "rotated@example.com");
+        assert!(!session.is_empty());
+        assert_eq!(return_to, "/");
+        discovery.assert_calls_async(2).await;
+        fresh_jwks.assert_calls_async(1).await;
         token.assert_async().await;
     }
 
