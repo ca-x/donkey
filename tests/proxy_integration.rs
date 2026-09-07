@@ -57,6 +57,7 @@ mod proxy_integration {
         behavior: FixtureBehavior,
         bytes: Arc<Vec<u8>>,
         stats: Arc<FixtureStats>,
+        head_gate: Option<Arc<tokio::sync::Barrier>>,
     }
 
     struct Fixture {
@@ -67,10 +68,19 @@ mod proxy_integration {
 
     impl Fixture {
         async fn start(behavior: FixtureBehavior, bytes: Vec<u8>) -> Self {
+            Self::start_with_gate(behavior, bytes, None).await
+        }
+
+        async fn start_with_gate(
+            behavior: FixtureBehavior,
+            bytes: Vec<u8>,
+            head_gate: Option<Arc<tokio::sync::Barrier>>,
+        ) -> Self {
             let state = FixtureState {
                 behavior,
                 bytes: Arc::new(bytes),
                 stats: Arc::new(FixtureStats::default()),
+                head_gate,
             };
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -146,6 +156,9 @@ mod proxy_integration {
         match *request.method() {
             Method::HEAD => {
                 state.stats.head_count.fetch_add(1, Ordering::Relaxed);
+                if let Some(gate) = &state.head_gate {
+                    gate.wait().await;
+                }
                 fixture_response(
                     StatusCode::OK,
                     &state.bytes,
@@ -309,7 +322,7 @@ mod proxy_integration {
     async fn throttled_ranged_or_whole(
         bytes: &[u8],
         requested_range: Option<String>,
-        stats: &FixtureStats,
+        stats: &Arc<FixtureStats>,
     ) -> Response {
         const NETWORK_CHUNK: usize = 256 * 1024;
         const CHUNK_DELAY: std::time::Duration = std::time::Duration::from_millis(40);
@@ -336,16 +349,21 @@ mod proxy_integration {
             stats.active_requests.fetch_sub(1, Ordering::Relaxed);
             Body::from(body)
         } else {
+            let active = stats.active_requests.fetch_add(1, Ordering::Relaxed) + 1;
+            stats
+                .max_active_requests
+                .fetch_max(active, Ordering::Relaxed);
+            let activity = WholeRequestActivity(stats.clone());
             let chunks = body
                 .chunks(NETWORK_CHUNK)
                 .map(bytes::Bytes::copy_from_slice)
                 .collect::<Vec<_>>();
             Body::from_stream(futures_util::stream::unfold(
-                chunks.into_iter(),
-                |mut chunks| async move {
+                (chunks.into_iter(), activity),
+                |(mut chunks, activity)| async move {
                     let chunk = chunks.next()?;
                     tokio::time::sleep(CHUNK_DELAY).await;
-                    Some((Ok::<_, std::io::Error>(chunk), chunks))
+                    Some((Ok::<_, std::io::Error>(chunk), (chunks, activity)))
                 },
             ))
         };
@@ -371,6 +389,14 @@ mod proxy_integration {
             );
         }
         response
+    }
+
+    struct WholeRequestActivity(Arc<FixtureStats>);
+
+    impl Drop for WholeRequestActivity {
+        fn drop(&mut self) {
+            self.0.active_requests.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     fn parse_range(value: &str) -> Option<(u64, u64)> {
@@ -551,6 +577,39 @@ mod proxy_integration {
 
     mod range {
         use super::*;
+
+        #[tokio::test]
+        async fn capability_probes_run_concurrently() {
+            let bytes = b"abcdefghijklmnop".to_vec();
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            let first = Fixture::start_with_gate(
+                FixtureBehavior::ValidRange,
+                bytes.clone(),
+                Some(gate.clone()),
+            )
+            .await;
+            let second =
+                Fixture::start_with_gate(FixtureBehavior::ValidRange, bytes.clone(), Some(gate))
+                    .await;
+            let (state, _directory) = proxy_state(&[&first, &second]).await;
+            let path = blob_path(&digest(&bytes));
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                request(registry_router(state), Method::GET, &path, None),
+            )
+            .await
+            .expect("both HEAD requests must start before either can complete");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            assert_eq!(first.head_count(), 1);
+            assert_eq!(second.head_count(), 1);
+        }
 
         #[tokio::test]
         async fn reconstructs_exact_bytes_from_multiple_ranges() {
@@ -1116,12 +1175,22 @@ mod proxy_integration {
 
         #[tokio::test]
         async fn resumes_partial_blob_from_another_node() {
+            assert_resume_after_failure(FixtureBehavior::DropAfterPrefix, 12).await;
+        }
+
+        #[tokio::test]
+        async fn resumes_from_zero_after_discarding_an_invalid_partial() {
+            assert_resume_after_failure(FixtureBehavior::WrongContentRange, 0).await;
+        }
+
+        async fn assert_resume_after_failure(behavior: FixtureBehavior, healthy_start: u64) {
             let bytes = vec![b'x'; 8 * 1024 * 1024 + 4];
-            let failing = Fixture::start(FixtureBehavior::DropAfterPrefix, bytes.clone()).await;
+            let failing = Fixture::start(behavior, bytes.clone()).await;
             let healthy = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
             let directory = tempfile::tempdir().unwrap();
             let mut config = Config::for_test(directory.path().to_owned());
             config.parallel_threshold = bytes.len() as u64 + 1;
+            config.scheduler_policy = donkey::config::SchedulerPolicy::SpeedFirst;
             let state = AppState::new(config).await.unwrap();
             for (index, fixture) in [&failing, &healthy].into_iter().enumerate() {
                 state
@@ -1167,13 +1236,14 @@ mod proxy_integration {
                     .as_ref(),
                 bytes
             );
-            let healthy_ranges = healthy.ranges().await;
-            assert!(healthy_ranges.iter().any(|range| {
-                range
-                    .as_deref()
-                    .and_then(parse_range)
-                    .is_some_and(|(start, _)| start >= 8)
-            }));
+            assert_eq!(
+                failing.ranges().await,
+                vec![Some(format!("bytes=8-{}", bytes.len() - 1))]
+            );
+            assert_eq!(
+                healthy.ranges().await,
+                vec![Some(format!("bytes={healthy_start}-{}", bytes.len() - 1))]
+            );
             assert_eq!(state.cache.stats().await.unwrap().entries, 1);
         }
 
@@ -1631,11 +1701,72 @@ mod proxy_integration {
 
         #[tokio::test]
         async fn whole_download_waits_for_node_capacity() {
+            assert_whole_download_waits_for_node_capacity(false).await;
+        }
+
+        #[tokio::test]
+        async fn streaming_download_waits_for_node_capacity() {
+            assert_whole_download_waits_for_node_capacity(true).await;
+        }
+
+        #[tokio::test]
+        async fn stalled_stream_clients_release_node_capacity() {
+            for behavior in [
+                FixtureBehavior::RangeUnsupported,
+                FixtureBehavior::ChunkedWhole,
+            ] {
+                let bytes = vec![b's'; 4 * 1024 * 1024];
+                let fixture = Fixture::start(behavior, bytes.clone()).await;
+                let (state, _directory) = proxy_state(&[&fixture]).await;
+                let mut config = (*state.config).clone();
+                config.stream_fallback_timeout = std::time::Duration::ZERO;
+                config.upstream_timeout = std::time::Duration::from_secs(1);
+                state.scheduler.update_runtime(&config).await;
+                state.upstream.update_runtime(&config).await;
+                let node = state.nodes.list().await.unwrap().remove(0);
+                donkey::db::set_node_max_concurrency(&state.db, node.node.id, 1)
+                    .await
+                    .unwrap();
+                let router = registry_router(state);
+                let path = blob_path(&digest(&bytes));
+                let mut first_headers = HeaderMap::new();
+                first_headers.insert(header::AUTHORIZATION, "Bearer stalled".parse().unwrap());
+                let stalled =
+                    request_with_headers(router.clone(), Method::GET, &path, first_headers).await;
+                assert_eq!(stalled.status(), StatusCode::OK);
+                let mut second_headers = HeaderMap::new();
+                second_headers.insert(header::AUTHORIZATION, "Bearer reading".parse().unwrap());
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    let response =
+                        request_with_headers(router, Method::GET, &path, second_headers).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(
+                        to_bytes(response.into_body(), usize::MAX)
+                            .await
+                            .unwrap()
+                            .as_ref(),
+                        bytes
+                    );
+                })
+                .await
+                .expect("a stalled client must release its node slot");
+                // Even if the error cannot fit in the full data queue, a
+                // client that resumes reading must observe a failed stream.
+                tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+                assert!(to_bytes(stalled.into_body(), usize::MAX).await.is_err());
+                assert_eq!(fixture.get_count(), 2);
+            }
+        }
+
+        async fn assert_whole_download_waits_for_node_capacity(streaming: bool) {
             let bytes = vec![b'w'; 1024 * 1024];
             let fixture = Fixture::start(FixtureBehavior::ThrottledWhole, bytes.clone()).await;
             let directory = tempfile::tempdir().unwrap();
             let mut config = Config::for_test(directory.path().to_owned());
             config.parallel_threshold = 1;
+            if streaming {
+                config.stream_fallback_timeout = std::time::Duration::ZERO;
+            }
             let state = AppState::new(config).await.unwrap();
             state
                 .nodes
@@ -1679,6 +1810,7 @@ mod proxy_integration {
 
             tokio::join!(pull("Bearer first-whole"), pull("Bearer second-whole"));
             assert_eq!(fixture.get_count(), 2);
+            assert_eq!(fixture.max_active_requests(), 1);
         }
 
         #[tokio::test]

@@ -605,8 +605,8 @@ impl Scheduler {
         self.record_resume();
         let mut last_error = None;
         let policy = self.runtime.read().await.scheduler_policy;
-        let mut capacity_wait = capacity_backoff_policy();
         loop {
+            let capacity_changed = self.capacity_changed();
             let mut attempted = false;
             let offset = tokio::fs::metadata(destination).await?.len();
             if offset >= total_size {
@@ -623,11 +623,24 @@ impl Scheduler {
                 policy,
             );
             for node in candidates {
-                if self.at_capacity(node.node.id, node.max_concurrency) {
+                let Some(lease) = self.try_acquire(node.node.id, node.max_concurrency) else {
                     continue;
-                }
-                let lease = self.acquire(node.node.id, node.max_concurrency).await;
+                };
                 attempted = true;
+                // A previous source may have appended bytes before failing,
+                // or an integrity error may have discarded the partial file.
+                let offset = match tokio::fs::metadata(destination).await {
+                    Ok(metadata) => metadata.len(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(error) => return Err(error.into()),
+                };
+                if offset >= total_size {
+                    return if offset == total_size {
+                        Ok(())
+                    } else {
+                        Err(AppError::Integrity)
+                    };
+                }
                 let started = Instant::now();
                 let result = async {
                     let response = self
@@ -650,14 +663,25 @@ impl Scheduler {
                     {
                         return Err(AppError::Integrity);
                     }
-                    append_response_to_file(
-                        response,
-                        destination,
-                        total_size - offset,
-                        Some((&self.nodes, node.node.id)),
-                        Some(self.cache.metrics()),
-                    )
-                    .await
+                    if offset == 0 {
+                        stream_response_to_file(
+                            response,
+                            destination,
+                            Some(total_size),
+                            Some((&self.nodes, node.node.id)),
+                            Some(self.cache.metrics()),
+                        )
+                        .await
+                    } else {
+                        append_response_to_file(
+                            response,
+                            destination,
+                            total_size - offset,
+                            Some((&self.nodes, node.node.id)),
+                            Some(self.cache.metrics()),
+                        )
+                        .await
+                    }
                 }
                 .await;
                 let bytes = tokio::fs::metadata(destination)
@@ -683,13 +707,71 @@ impl Scheduler {
             if attempted {
                 break;
             }
-            use backoff::backoff::Backoff;
-            let delay = capacity_wait
-                .next_backoff()
-                .unwrap_or_else(|| std::time::Duration::from_millis(250));
-            tokio::time::sleep(delay).await;
+            capacity_changed.await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed resume".into())))
+    }
+
+    async fn detect_node_capabilities(
+        &self,
+        node: &NodeView,
+        request_path: &str,
+        request_headers: &HeaderMap,
+    ) -> ApiResult<BlobCapabilities> {
+        let capability_key = format!(
+            "{}:{}:{}",
+            node.node.id,
+            node.node.updated_at.timestamp_millis(),
+            request_path
+        );
+        let started = Instant::now();
+        if let Some(value) = self.capabilities.get(&capability_key).await {
+            return Ok(value);
+        }
+        let result = async {
+            let response = self
+                .upstream
+                .send(
+                    node,
+                    http::Method::HEAD,
+                    request_path,
+                    request_headers,
+                    RangeMode::Suppress,
+                )
+                .await?;
+            if response.status().is_success()
+                && let Some(capabilities) = capabilities_from_head(&response)
+            {
+                Ok(capabilities)
+            } else {
+                let probe = self
+                    .upstream
+                    .send(
+                        node,
+                        http::Method::GET,
+                        request_path,
+                        request_headers,
+                        RangeMode::Exact(0, 0),
+                    )
+                    .await?;
+                capabilities_from_probe(&probe).ok_or_else(|| {
+                    AppError::Upstream(format!(
+                        "{} does not expose Blob length or Range metadata",
+                        node.node.name
+                    ))
+                })
+            }
+        }
+        .await;
+        if let Ok(value) = &result {
+            self.capabilities
+                .insert(capability_key, value.clone())
+                .await;
+        }
+        self.nodes
+            .record_transfer(node.node.id, 0, started.elapsed(), result.is_ok())
+            .await;
+        result
     }
 
     async fn detect_capabilities(
@@ -701,62 +783,22 @@ impl Scheduler {
         let mut last_error = None;
         let mut baseline: Option<BlobCapabilities> = None;
         let mut compatible = Vec::new();
-        for node in nodes {
-            let capability_key = format!(
-                "{}:{}:{}",
-                node.node.id,
-                node.node.updated_at.timestamp_millis(),
-                request_path
-            );
-            let started = Instant::now();
-            let result = if let Some(value) = self.capabilities.get(&capability_key).await {
-                Ok(value)
-            } else {
-                let result = async {
-                    let response = self
-                        .upstream
-                        .send(
-                            node,
-                            http::Method::HEAD,
-                            request_path,
-                            request_headers,
-                            RangeMode::Suppress,
-                        )
-                        .await?;
-                    if response.status().is_success()
-                        && let Some(capabilities) = capabilities_from_head(&response)
-                    {
-                        Ok(capabilities)
-                    } else {
-                        let probe = self
-                            .upstream
-                            .send(
-                                node,
-                                http::Method::GET,
-                                request_path,
-                                request_headers,
-                                RangeMode::Exact(0, 0),
-                            )
-                            .await?;
-                        capabilities_from_probe(&probe).ok_or_else(|| {
-                            AppError::Upstream(format!(
-                                "{} does not expose Blob length or Range metadata",
-                                node.node.name
-                            ))
-                        })
-                    }
-                }
-                .await;
-                if let Ok(value) = &result {
-                    self.capabilities
-                        .insert(capability_key, value.clone())
+        // Probe a bounded batch concurrently, retaining route order for the
+        // size baseline and fallback list regardless of response timing.
+        let mut probes = stream::iter(nodes.to_vec())
+            .map(|node| {
+                let scheduler = self.clone();
+                let path = request_path.to_owned();
+                let headers = request_headers.clone();
+                async move {
+                    let result = scheduler
+                        .detect_node_capabilities(&node, &path, &headers)
                         .await;
+                    (node, result)
                 }
-                result
-            };
-            self.nodes
-                .record_transfer(node.node.id, 0, started.elapsed(), result.is_ok())
-                .await;
+            })
+            .buffered(8);
+        while let Some((node, result)) = probes.next().await {
             match result {
                 Ok(value) => {
                     let compatible_with_baseline = baseline
@@ -817,7 +859,12 @@ impl Scheduler {
                 let nodes = request.nodes.to_vec();
                 let request_path = request.request_path.to_owned();
                 let request_headers = request.request_headers.clone();
-                let part_path = request.temp_dir.join(format!("{:08}.part", chunk.index));
+                // A retry may choose a different chunk size. Persist the byte
+                // range identity so an old layout cannot supply a wrong prefix.
+                let part_path = request.temp_dir.join(format!(
+                    "{}-{}-{}.part",
+                    chunk.total_size, chunk.start, chunk.end
+                ));
                 async move {
                     if tokio::fs::metadata(&part_path)
                         .await
@@ -867,8 +914,8 @@ impl Scheduler {
         policy: SchedulerPolicy,
     ) -> ApiResult<()> {
         let mut last_error = None;
-        let mut capacity_wait = capacity_backoff_policy();
         loop {
+            let capacity_changed = self.capacity_changed();
             let mut attempted = false;
             let candidates = self.ordered_nodes_with_context(
                 nodes,
@@ -881,10 +928,9 @@ impl Scheduler {
                 policy,
             );
             for node in candidates {
-                if self.at_capacity(node.node.id, node.max_concurrency) {
+                let Some(lease) = self.try_acquire(node.node.id, node.max_concurrency) else {
                     continue;
-                }
-                let lease = self.acquire(node.node.id, node.max_concurrency).await;
+                };
                 attempted = true;
                 let started = Instant::now();
                 let existing = tokio::fs::metadata(destination)
@@ -974,11 +1020,7 @@ impl Scheduler {
             if attempted {
                 break;
             }
-            use backoff::backoff::Backoff;
-            let delay = capacity_wait
-                .next_backoff()
-                .unwrap_or_else(|| std::time::Duration::from_millis(250));
-            tokio::time::sleep(delay).await;
+            capacity_changed.await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed a chunk".into())))
     }
@@ -993,8 +1035,8 @@ impl Scheduler {
     ) -> ApiResult<()> {
         let mut last_error = None;
         let policy = self.runtime.read().await.scheduler_policy;
-        let mut capacity_wait = capacity_backoff_policy();
         loop {
+            let capacity_changed = self.capacity_changed();
             let mut attempted = false;
             let candidates = self.ordered_nodes_with_context(
                 nodes,
@@ -1007,11 +1049,10 @@ impl Scheduler {
                 policy,
             );
             for node in candidates {
-                if self.at_capacity(node.node.id, node.max_concurrency) {
+                let Some(lease) = self.try_acquire(node.node.id, node.max_concurrency) else {
                     continue;
-                }
+                };
                 attempted = true;
-                let lease = self.acquire(node.node.id, node.max_concurrency).await;
                 let started = Instant::now();
                 let existing = if let Some(total) = total_size.filter(|total| *total > 0) {
                     tokio::fs::metadata(destination)
@@ -1103,11 +1144,7 @@ impl Scheduler {
             if attempted {
                 break;
             }
-            use backoff::backoff::Backoff;
-            let delay = capacity_wait
-                .next_backoff()
-                .unwrap_or_else(|| std::time::Duration::from_millis(250));
-            tokio::time::sleep(delay).await;
+            capacity_changed.await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed".into())))
     }
@@ -1173,27 +1210,12 @@ impl Scheduler {
         self.selector.order_with_context(nodes, context, policy)
     }
 
-    async fn acquire(&self, node_id: Uuid, max_concurrency: u16) -> NodeLease {
-        use backoff::backoff::Backoff;
-
-        let mut policy = capacity_backoff_policy();
-        loop {
-            if let Some(lease) = self.try_acquire(node_id, max_concurrency) {
-                return lease;
-            }
-            let delay = policy
-                .next_backoff()
-                .unwrap_or_else(|| std::time::Duration::from_millis(250));
-            tokio::time::sleep(delay).await;
-        }
-    }
-
     pub(crate) fn try_acquire(&self, node_id: Uuid, max_concurrency: u16) -> Option<NodeLease> {
         self.selector.try_acquire(node_id, max_concurrency)
     }
 
-    fn at_capacity(&self, node_id: Uuid, max_concurrency: u16) -> bool {
-        self.selector.at_capacity(node_id, max_concurrency)
+    pub(crate) fn capacity_changed(&self) -> impl Future<Output = ()> + Send + use<> {
+        self.selector.capacity_changed()
     }
 
     pub(crate) fn observe_node(
@@ -1205,14 +1227,6 @@ impl Scheduler {
     ) {
         self.selector.observe(node_id, bytes, elapsed, success);
     }
-}
-
-fn capacity_backoff_policy() -> backoff::ExponentialBackoff {
-    backoff::ExponentialBackoffBuilder::new()
-        .with_initial_interval(std::time::Duration::from_millis(10))
-        .with_max_interval(std::time::Duration::from_millis(250))
-        .with_max_elapsed_time(None)
-        .build()
 }
 
 fn effective_chunk_size(
@@ -1449,6 +1463,73 @@ async fn verify_file(path: &Path, expected_digest: &str) -> ApiResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn changing_chunk_layout_does_not_reuse_bytes_from_another_offset() {
+        let server = httpmock::MockServer::start_async().await;
+        let bytes = b"abcdefghijklmnop";
+        for chunk_size in [4, 8] {
+            for chunk in chunks(bytes.len() as u64, chunk_size) {
+                server
+                    .mock_async(|when, then| {
+                        when.method(httpmock::Method::GET)
+                            .path("/v2/test/blobs/data")
+                            .header("range", format!("bytes={}-{}", chunk.start, chunk.end));
+                        then.status(206)
+                            .header(
+                                "content-range",
+                                format!("bytes {}-{}/16", chunk.start, chunk.end),
+                            )
+                            .body(&bytes[chunk.start as usize..=chunk.end as usize]);
+                    })
+                    .await;
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let node = state
+            .nodes
+            .create(crate::nodes::NodeInput {
+                name: "layout".into(),
+                url: server.base_url(),
+                registry_route_id: crate::registry_routes::DOCKER_HUB_ROUTE_ID,
+                enabled: true,
+                priority: 0,
+                max_concurrency: 4,
+                cf_preferred: false,
+                connect_ip_type: "ip".into(),
+                connect_ip: None,
+                auth_mode: "none".into(),
+                auth_username: None,
+                auth_header: None,
+                auth_secret: None,
+            })
+            .await
+            .unwrap();
+        let nodes = [node];
+        let headers = HeaderMap::new();
+        let merged = directory.path().join("merged");
+        for chunk_size in [4, 8] {
+            let mut runtime = test_runtime(false);
+            runtime.chunk_size = chunk_size;
+            state
+                .scheduler
+                .download_parallel(ParallelDownloadRequest {
+                    nodes: &nodes,
+                    request_path: "/v2/test/blobs/data",
+                    request_headers: &headers,
+                    total_size: bytes.len() as u64,
+                    temp_dir: directory.path(),
+                    merged: &merged,
+                    runtime,
+                })
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(&merged).await.unwrap(), bytes);
+        }
+    }
 
     fn test_runtime(adaptive: bool) -> SchedulerRuntimeConfig {
         SchedulerRuntimeConfig {

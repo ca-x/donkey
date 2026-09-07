@@ -559,11 +559,13 @@ impl NodeService {
                     .add(sample * 0.15),
             )
             .filter(node_metric::Column::NodeId.eq(id));
-        if success && elapsed.as_secs_f64() > 0.0 {
+        if success {
+            update = update.col_expr(node_metric::Column::Healthy, Expr::value(true));
+        }
+        if success && bytes > 0 && elapsed.as_secs_f64() > 0.0 {
             let bps = (bytes as f64 / elapsed.as_secs_f64()).min(i64::MAX as f64) as i64;
             let byte_count = std::cmp::min(bytes, i64::MAX as u64) as i64;
             update = update
-                .col_expr(node_metric::Column::Healthy, Expr::value(true))
                 .col_expr(node_metric::Column::CurrentBps, Expr::value(bps))
                 .col_expr(
                     node_metric::Column::SpeedBps,
@@ -979,6 +981,14 @@ mod tests {
         assert_eq!(metric.current_bps, 3_000);
         assert_eq!(metric.speed_bps, 1_600);
         assert!(metric.last_checked_at.is_none());
+
+        service
+            .record_transfer(node.node.id, 0, std::time::Duration::from_millis(20), true)
+            .await;
+        let after_probe = db::metric_for(&db, node.node.id).await.unwrap().unwrap();
+        assert_eq!(after_probe.speed_bps, metric.speed_bps);
+        assert_eq!(after_probe.current_bps, metric.current_bps);
+        assert_eq!(after_probe.total_bytes, metric.total_bytes);
     }
 
     #[tokio::test]

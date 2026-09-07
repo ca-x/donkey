@@ -158,7 +158,7 @@ impl BlobPlanner {
         // bandwidth without spending the Blob on speculative ranges.  A
         // single Range-capable node may still use its configured connection
         // capacity because that does not duplicate the source across nodes.
-        if range_nodes.len() > 1
+        if (range_nodes.len() > 1 || !best_single.supports_range)
             && !self.config.allow_unmeasured_parallel
             && (benefit.is_none()
                 || benefit.is_some_and(|value| value < self.config.min_parallel_benefit))
@@ -247,6 +247,31 @@ mod tests {
             success_rate: 1.0,
             cooling: false,
         }
+    }
+
+    #[test]
+    fn fast_whole_source_beats_a_single_slow_range_source() {
+        let blob = BlobMeta {
+            digest: "sha256:abc".into(),
+            size: 128 * 1024 * 1024,
+            media_type: "application/octet-stream".into(),
+        };
+        let plan = BlobPlanner::new(PlannerConfig::default())
+            .plan(
+                &blob,
+                false,
+                &[
+                    node("https://fast", Some(200 * 1024 * 1024), false),
+                    node("https://slow", Some(1024 * 1024), true),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            plan.strategy,
+            DownloadStrategy::SingleRequest {
+                node_url: "https://fast".into()
+            }
+        );
     }
 
     #[test]

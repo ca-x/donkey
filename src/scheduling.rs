@@ -60,55 +60,32 @@ impl SchedulerAlgorithm for CurrentAlgorithm {
             SchedulerPolicy::Balanced => {
                 let measured = candidates.iter().any(|candidate| candidate.measured);
                 if measured {
-                    if let Some(index) = candidates
+                    candidates.sort_by(|left, right| {
+                        effective_capacity(right)
+                            .total_cmp(&effective_capacity(left))
+                            .then_with(|| left.node.node.priority.cmp(&right.node.node.priority))
+                            .then_with(|| left.node.node.url.cmp(&right.node.node.url))
+                    });
+                    let max_capacity = candidates
                         .iter()
-                        .position(|candidate| candidate.recently_recovered)
-                    {
-                        candidates.rotate_left(index);
-                    } else {
-                        let unmeasured = candidates
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, candidate)| (!candidate.measured).then_some(index))
-                            .collect::<Vec<_>>();
-                        if !unmeasured.is_empty() {
-                            let selected =
-                                unmeasured[(context.sequence as usize) % unmeasured.len()];
-                            candidates.rotate_left(selected);
-                        } else {
-                            candidates.sort_by(|left, right| {
-                                effective_capacity(right)
-                                    .total_cmp(&effective_capacity(left))
-                                    .then_with(|| {
-                                        left.node.node.priority.cmp(&right.node.node.priority)
-                                    })
-                                    .then_with(|| left.node.node.url.cmp(&right.node.node.url))
-                            });
-                            let max_capacity = candidates
-                                .iter()
-                                .map(|candidate| effective_capacity(candidate))
-                                .fold(0.0, f64::max)
-                                .max(1.0);
-                            // A modulo ticket is biased when the first node has a
-                            // large weight (for example, all 13 chunks can land
-                            // in its first 100 tickets).  Weighted rendezvous
-                            // hashing gives every request a deterministic winner
-                            // while preserving the relative capacities.
-                            let selected = candidates
-                                .iter()
-                                .enumerate()
-                                .map(|(index, candidate)| {
-                                    let weight =
-                                        (effective_capacity(candidate) / max_capacity).max(0.001);
-                                    let unit = rendezvous_unit(context.sequence, candidate);
-                                    (index, -unit.ln() / weight)
-                                })
-                                .min_by(|left, right| left.1.total_cmp(&right.1))
-                                .map(|(index, _)| index)
-                                .unwrap_or(0);
-                            candidates.rotate_left(selected);
-                        }
-                    }
+                        .map(effective_capacity)
+                        .fold(0.0, f64::max)
+                        .max(1.0);
+                    // Weighted rendezvous hashing spreads even a short batch
+                    // across nodes in proportion to their effective capacity.
+                    let selected = candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(index, candidate)| {
+                            let weight = (effective_capacity(candidate) / max_capacity).max(0.001);
+                            let unit = rendezvous_unit(context.sequence, candidate);
+                            (index, -unit.ln() / weight)
+                        })
+                        .min_by(|left, right| left.1.total_cmp(&right.1))
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    // Promote the winner without demoting the fastest fallback.
+                    candidates[..=selected].rotate_right(1);
                 } else if !candidates.is_empty() {
                     let offset = context.sequence as usize % candidates.len();
                     candidates.rotate_left(offset);
@@ -121,6 +98,7 @@ impl SchedulerAlgorithm for CurrentAlgorithm {
                     .then_with(|| left.node.node.url.cmp(&right.node.node.url))
             }),
         }
+        promote_exploration(&mut candidates, context.sequence);
         candidates
             .into_iter()
             .map(|candidate| candidate.node)
@@ -149,10 +127,35 @@ impl SchedulerAlgorithm for ProjectedCompletionAlgorithm {
                 .then_with(|| left.node.node.priority.cmp(&right.node.node.priority))
                 .then_with(|| left.node.node.url.cmp(&right.node.node.url))
         });
+        promote_exploration(&mut candidates, context.sequence);
         candidates
             .into_iter()
             .map(|candidate| candidate.node)
             .collect()
+    }
+}
+
+// Reserve one in eight scheduling tickets for idle unknown/recovered nodes.
+// Keeping an in-flight probe out of this lane prevents cold-start batches
+// from filling every connection on a node before its first sample arrives.
+fn promote_exploration(candidates: &mut [ScheduleCandidate<'_>], sequence: u64) {
+    if !sequence.is_multiple_of(8) || !candidates.iter().any(|candidate| candidate.measured) {
+        return;
+    }
+    let selected = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.active == 0
+                && candidate.max_concurrency > 0
+                && (!candidate.measured || candidate.recently_recovered)
+        })
+        .max_by(|(_, left), (_, right)| {
+            rendezvous_unit(sequence, left).total_cmp(&rendezvous_unit(sequence, right))
+        })
+        .map(|(index, _)| index);
+    if let Some(selected) = selected {
+        candidates[..=selected].rotate_right(1);
     }
 }
 
@@ -265,6 +268,67 @@ mod tests {
 
     const fn latency_for_test(priority: i32) -> i32 {
         priority * 10
+    }
+
+    #[test]
+    fn exploration_is_bounded_and_available_for_both_algorithms_and_policies() {
+        let fast = node(Uuid::new_v4(), 1);
+        let unknown = node(Uuid::new_v4(), 2);
+        for algorithm in [
+            &CurrentAlgorithm as &dyn SchedulerAlgorithm,
+            &ProjectedCompletionAlgorithm,
+        ] {
+            for policy in [SchedulerPolicy::Balanced, SchedulerPolicy::SpeedFirst] {
+                for recovered in [false, true] {
+                    let mut probes = 0;
+                    for sequence in 0..256 {
+                        let mut probe = candidate(&unknown, 0.0, 10);
+                        probe.measured = recovered;
+                        probe.recently_recovered = recovered;
+                        let ordered = algorithm.order(
+                            vec![candidate(&fast, 16.0 * 1024.0 * 1024.0, 10), probe],
+                            ScheduleContext {
+                                sequence,
+                                blob_size: 64 * 1024 * 1024,
+                                range_required: true,
+                                chunk: Some((0, 2 * 1024 * 1024 - 1)),
+                            },
+                            policy,
+                        );
+                        probes += usize::from(ordered[0].node.id == unknown.node.id);
+                    }
+                    assert!(
+                        (16..64).contains(&probes),
+                        "{} {policy:?} recovered={recovered}: {probes}/256 exploration requests",
+                        algorithm.name(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn busy_unmeasured_nodes_do_not_receive_forced_exploration() {
+        let fast = node(Uuid::new_v4(), 1);
+        let unknown = node(Uuid::new_v4(), 2);
+        let mut probes = 0;
+        for sequence in 0..256 {
+            let mut probe = candidate(&unknown, 0.0, 10);
+            probe.measured = false;
+            probe.active = 1;
+            let ordered = CurrentAlgorithm.order(
+                vec![candidate(&fast, 16.0 * 1024.0 * 1024.0, 10), probe],
+                ScheduleContext {
+                    sequence,
+                    blob_size: 64 * 1024 * 1024,
+                    range_required: true,
+                    chunk: Some((0, 2 * 1024 * 1024 - 1)),
+                },
+                SchedulerPolicy::Balanced,
+            );
+            probes += usize::from(ordered[0].node.id == unknown.node.id);
+        }
+        assert!(probes < 16, "busy node received {probes}/256 requests");
     }
 
     #[test]

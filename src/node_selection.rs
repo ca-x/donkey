@@ -18,6 +18,7 @@ use crate::{
 pub(crate) struct NodeSelector {
     speeds: Arc<DashMap<Uuid, Arc<Mutex<SpeedWindow>>>>,
     active: Arc<DashMap<Uuid, usize>>,
+    capacity_changed: Arc<tokio::sync::Notify>,
     failures: Arc<DashMap<Uuid, FailureState>>,
     recovered: Arc<DashMap<Uuid, Instant>>,
     algorithm: Arc<RwLock<Arc<dyn SchedulerAlgorithm>>>,
@@ -94,6 +95,7 @@ impl NodeSelector {
         Self {
             speeds: Arc::new(DashMap::new()),
             active: Arc::new(DashMap::new()),
+            capacity_changed: Arc::new(tokio::sync::Notify::new()),
             failures: Arc::new(DashMap::new()),
             recovered: Arc::new(DashMap::new()),
             algorithm: Arc::new(RwLock::new(algorithm)),
@@ -190,13 +192,22 @@ impl NodeSelector {
         Some(NodeLease {
             node_id,
             active: self.active.clone(),
+            capacity_changed: self.capacity_changed.clone(),
         })
     }
 
-    pub(crate) fn at_capacity(&self, node_id: Uuid, max_concurrency: u16) -> bool {
-        self.active
-            .get(&node_id)
-            .is_some_and(|value| *value >= usize::from(max_concurrency))
+    // Construct before scanning candidates so a release during the scan
+    // cannot be missed, even if the returned future has not yet been polled.
+    pub(crate) fn capacity_changed(&self) -> impl Future<Output = ()> + Send + use<> {
+        let notified = self.capacity_changed.clone().notified_owned();
+        async move {
+            // Cooldowns and per-Blob Range exclusions can change without a
+            // lease being released. Keep a low-frequency recheck for them.
+            tokio::select! {
+                () = notified => {},
+                () = tokio::time::sleep(Duration::from_millis(250)) => {},
+            }
+        }
     }
 
     pub(crate) fn observe(
@@ -281,6 +292,7 @@ impl NodeSelector {
 pub(crate) struct NodeLease {
     node_id: Uuid,
     active: Arc<DashMap<Uuid, usize>>,
+    capacity_changed: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for NodeLease {
@@ -288,6 +300,7 @@ impl Drop for NodeLease {
         if let Some(mut value) = self.active.get_mut(&self.node_id) {
             *value = value.saturating_sub(1);
         }
+        self.capacity_changed.notify_waiters();
     }
 }
 
@@ -363,6 +376,28 @@ mod tests {
         assert!(selector.try_acquire(id, 1).is_none());
         drop(first);
         assert!(selector.try_acquire(id, 1).is_some());
+    }
+
+    #[tokio::test]
+    async fn capacity_release_wakes_all_waiters_even_before_they_are_polled() {
+        let selector = NodeSelector::new();
+        let id = Uuid::new_v4();
+        let lease = selector.try_acquire(id, 1).unwrap();
+        let first = selector.capacity_changed();
+        let second = selector.capacity_changed();
+        drop(lease);
+        // Ready immediately, without waiting for the periodic recheck.
+        assert!(futures_util::FutureExt::now_or_never(first).is_some());
+        assert!(futures_util::FutureExt::now_or_never(second).is_some());
+        assert!(selector.try_acquire(id, 1).is_some());
+    }
+
+    #[tokio::test]
+    async fn capacity_wait_rechecks_state_without_a_lease_release() {
+        let selector = NodeSelector::new();
+        tokio::time::timeout(Duration::from_secs(1), selector.capacity_changed())
+            .await
+            .expect("cooldown and Range eligibility changes must not wait forever");
     }
 
     #[test]
