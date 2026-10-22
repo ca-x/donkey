@@ -12,6 +12,8 @@ import type {
   RuntimeSettingsExport,
   RegistryCredential,
   ImageJob,
+  ImageInspectInput,
+  ImageInspection,
   ImageJobInput,
   ImageSyncRule,
   ImageFileEntry,
@@ -110,6 +112,13 @@ export const api = {
   createImageCredential: (input: { name: string; registry: string; auth_mode: string; username: string | null; secret: string }) => request<RegistryCredential>('/image-tools/credentials', { method: 'POST', body: json(input) }),
   updateImageCredential: (id: string, input: { name: string; registry: string; auth_mode: string; username: string | null; secret: string }) => request<RegistryCredential>(`/image-tools/credentials/${id}`, { method: 'PUT', body: json(input) }),
   deleteImageCredential: (id: string) => request<void>(`/image-tools/credentials/${id}`, { method: 'DELETE' }),
+  inspectImage: (input: ImageInspectInput) => {
+    const params = new URLSearchParams()
+    for (const [key, value] of Object.entries(input)) {
+      if (value != null && value !== '') params.set(key, value)
+    }
+    return request<ImageInspection>(`/image-tools/inspect?${params}`)
+  },
   imageJobs: () => request<ImageJob[]>('/image-tools/jobs?limit=200'),
   createImageJob: (input: ImageJobInput, idempotencyKey?: string) => request<ImageJob>('/image-tools/jobs', { method: 'POST', headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined, body: json(input) }),
   cancelImageJob: (id: string) => request<void>(`/image-tools/jobs/${id}`, { method: 'DELETE' }),

@@ -4,6 +4,9 @@ import {
   Box,
   Button,
   Checkbox,
+  Code,
+  ScrollArea,
+  Table,
   Group,
   Modal,
   Paper,
@@ -66,7 +69,7 @@ const baseJob: ImageJobInput = {
 export function ImageToolsPage() {
   const { t } = useTranslation()
   const canWrite = useAuth().role === 'admin'
-  const [tab, setTab] = useState<string | null>('content')
+  const [tab, setTab] = useState<string | null>('inspect')
   const [credentialOpen, setCredentialOpen] = useState(false)
   const jobs = useQuery({
     queryKey: ['image-jobs'],
@@ -88,6 +91,7 @@ export function ImageToolsPage() {
     />
     <Tabs value={tab} onChange={setTab} variant="default" className="node-tabs image-tools-tabs">
       <Tabs.List>
+        <Tabs.Tab value="inspect" leftSection={<IconSearch size={15} />}>{t('imageTools.inspect')}</Tabs.Tab>
         <Tabs.Tab value="content" leftSection={<IconSearch size={15} />}>{t('imageTools.content')}</Tabs.Tab>
         <Tabs.Tab value="export" disabled={!canWrite} leftSection={<IconArchive size={15} />}>{t('imageTools.export')}</Tabs.Tab>
         <Tabs.Tab value="copy" disabled={!canWrite} leftSection={<IconCopy size={15} />}>{t('imageTools.copy')}</Tabs.Tab>
@@ -95,6 +99,7 @@ export function ImageToolsPage() {
         <Tabs.Tab value="tasks" leftSection={<IconRoute size={15} />}>{t('imageTools.tasks')}</Tabs.Tab>
       </Tabs.List>
     </Tabs>
+    {tab === 'inspect' && <InspectPanel nodes={nodes.data!} credentials={credentials.data!} />}
     {tab === 'content' && <ContentPanel jobs={jobs.data!} nodes={nodes.data!} credentials={credentials.data!} canWrite={canWrite} />}
     {tab === 'export' && <JobPanel kind="export" nodes={nodes.data!} credentials={credentials.data!} />}
     {tab === 'copy' && <CopyPanel nodes={nodes.data!} credentials={credentials.data!} openCredentials={() => setCredentialOpen(true)} />}
@@ -110,6 +115,45 @@ function sourceNodeOptions(nodes: NodeView[], direct: string) {
 
 function credentialOptions(credentials: RegistryCredential[], empty: string) {
   return [{ value: '', label: empty }, ...credentials.map((credential) => ({ value: credential.id, label: `${credential.name} · ${credential.registry}` }))]
+}
+
+function InspectPanel({ nodes, credentials }: { nodes: NodeView[]; credentials: RegistryCredential[] }) {
+  const { t } = useTranslation()
+  const form = useForm<ImageJobInput>({ mode: 'controlled', initialValues: { ...baseJob } })
+  const inspect = useMutation({ mutationFn: api.inspectImage, onError: notifyError(t) })
+  const image = inspect.data
+  return <Stack gap="md">
+    <Paper className="panel image-tool-flow">
+      <form onSubmit={form.onSubmit((value) => inspect.mutate({
+        source_ref: value.source_ref, source_node_id: value.source_node_id,
+        source_credential_id: value.source_credential_id,
+        platform_os: value.platform_os, platform_arch: value.platform_arch,
+      }))}>
+        <Stack gap="md">
+          <Text size="sm" c="dimmed">{t('imageTools.inspectHint')}</Text>
+          <ImageSourceFields form={form} nodes={nodes} credentials={credentials} />
+          <Group justify="flex-end"><Button type="submit" loading={inspect.isPending} leftSection={<IconSearch size={17} />}>{t('imageTools.inspect')}</Button></Group>
+        </Stack>
+      </form>
+    </Paper>
+    {inspect.error && <Text role="alert" c="red">{inspect.error.message}</Text>}
+    {image && !inspect.isPending && !inspect.isError && <Paper className="panel">
+      <Stack gap="md" aria-live="polite">
+        <Text fw={680} style={{ overflowWrap: 'anywhere' }}>{image.source_ref}</Text>
+        <SimpleGrid cols={{ base: 1, sm: 3 }}>
+          <Box><Text size="xs" c="dimmed">{t('imageTools.platform')}</Text><Text>{image.config.os ?? '—'}/{image.config.architecture ?? '—'}</Text></Box>
+          <Box><Text size="xs" c="dimmed">{t('imageTools.compressedSize')}</Text><Text>{formatBytes(image.total_bytes)}</Text></Box>
+          <Box><Text size="xs" c="dimmed">{t('imageTools.layers')}</Text><Text>{image.manifest.layers.length}</Text></Box>
+        </SimpleGrid>
+        <Box><Text size="xs" c="dimmed">Digest</Text><Text size="sm" style={{ overflowWrap: 'anywhere' }}>{image.digest}</Text></Box>
+        {image.index_digest && <Box><Text size="xs" c="dimmed">{t('imageTools.indexDigest')}</Text><Text size="sm" style={{ overflowWrap: 'anywhere' }}>{image.index_digest}</Text></Box>}
+        <ScrollArea><Table miw={580}><Table.Thead><Table.Tr><Table.Th>{t('imageTools.layers')}</Table.Th><Table.Th>{t('imageTools.compressedSize')}</Table.Th></Table.Tr></Table.Thead>
+          <Table.Tbody>{image.manifest.layers.map((layer, index) => <Table.Tr key={`${index}-${layer.digest}`}><Table.Td><Text size="xs" ff="monospace">{layer.digest}</Text></Table.Td><Table.Td>{formatBytes(layer.size)}</Table.Td></Table.Tr>)}</Table.Tbody>
+        </Table></ScrollArea>
+        <Box><Text size="sm" fw={620} mb="xs">{t('imageTools.imageConfig')}</Text><ScrollArea mah={320}><Code block>{JSON.stringify(image.config, null, 2)}</Code></ScrollArea></Box>
+      </Stack>
+    </Paper>}
+  </Stack>
 }
 
 function JobPanel({ kind, nodes, credentials }: { kind: 'export' | 'extract'; nodes: NodeView[]; credentials: RegistryCredential[] }) {

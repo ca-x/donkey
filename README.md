@@ -44,7 +44,7 @@ Donkey 是一个 Rust 编写的 OCI / Docker Registry 拉取代理。它支持�
 - 节点凭据使用 AES-256-GCM 加密后存入 SQLite。
 - 可选 Registry Basic 认证，兼容 `docker login`。CONNECT 使用独立 Basic 认证和目标白名单。
 - 独立登录页、本地 Argon2id 管理员、服务端会话和 OIDC Authorization Code + PKCE。
-- 镜像内容浏览、单文件下载、Docker/OCI 离线包、跨 Registry 复制和 Cron 同步。
+- 免拉取镜像信息预览、镜像内容浏览、单文件下载、Docker/OCI 离线包、跨 Registry 增量复制和 Cron 同步。
 - React + Mantine 管理界面，中英文、浅色 / 暗色主题和移动端布局。
 - Linux amd64 / arm64、Windows amd64、macOS arm64 二进制和多架构容器构建。
 
@@ -157,11 +157,12 @@ docker pull registry.example.com/ghcr/owner/image:tag
 
 ## 镜像工具
 
-「镜像工具」是单独页面，公共 `/v2` 拉取代理仍然只读。辅助 worker 可以：
+「镜像工具」是单独页面，公共 `/v2` 拉取代理仍然只读。镜像工具支持：
 
+- 免拉取查看镜像 digest、平台、压缩体积、layer 列表和原始配置；仅读取 manifest/config，不下载镜像层，也不创建任务或产物。
 - 按平台解析镜像并浏览合并后的 rootfs，下载单个普通文件。
 - 生成 Docker archive 或 OCI archive 离线包。
-- 把镜像复制到 Aliyun ACR、CNB、GHCR、Harbor 等 OCI Registry。
+- 把镜像复制到 Aliyun ACR、CNB、GHCR、Harbor 等 OCI Registry。先检查目标 Blob，已有 layer 跳过下载和上传；缺失 layer 优先复用本地共享 Blob，否则逐层使用临时文件传输并立即清理，不保留完整复制布局。
 - 用 Cron 和 IANA 时区定期检查 mutable tag；源 digest 未变化时跳过重复复制。
 - 接受 `Idempotency-Key` 的 API 任务，支持取消、重试和重启恢复。
 
@@ -182,6 +183,18 @@ curl -b cookie.txt -H 'Content-Type: application/json' \
   -d '{"kind":"export","source_ref":"docker.io/library/alpine:latest","source_node_id":null,"source_credential_id":null,"destination_ref":null,"destination_credential_id":null,"platform_os":"linux","platform_arch":"amd64","output_format":"oci"}' \
   http://127.0.0.1:5003/api/image-tools/jobs
 ```
+
+信息预览也支持只读成员访问，可使用与管理界面相同的会话：
+
+```bash
+curl -b cookie.txt --get \
+  --data-urlencode 'source_ref=docker.io/library/alpine:latest' \
+  --data-urlencode 'platform_os=linux' \
+  --data-urlencode 'platform_arch=amd64' \
+  http://127.0.0.1:5003/api/image-tools/inspect
+```
+
+可选 `source_node_id` 或 `source_credential_id`，两者互斥。预览不受镜像总大小配额限制，因为不下载 layer；实际复制的单个缺失 layer 仍受 `DONKEY_MAX_EXPORT_BYTES` 限制。复制进度包含已确认存在的 Blob 字节，并非实际网络传输量。
 
 镜像工具数据使用 `DONKEY_MAX_EXPORT_BYTES` 总配额和 `DONKEY_EXPORT_TTL` 保留期。共享 layer 按 digest 去重；过期任务目录和不再引用的共享 Blob 会回收。
 

@@ -335,3 +335,17 @@ export interface ImageFileEntry {
   kind: 'directory' | 'file' | 'symlink'
   size: number
 }
+
+export type ImageInspectInput = Pick<ImageJobInput,
+  'source_ref' | 'source_node_id' | 'source_credential_id' | 'platform_os' | 'platform_arch'>
+
+export interface ImageInspection {
+  source_ref: string
+  digest: string
+  index_digest: string | null
+  total_bytes: number
+  manifest: {
+    layers: { digest: string; size: number; mediaType: string }[]
+  }
+  config: { os?: string; architecture?: string; created?: string; [key: string]: unknown }
+}

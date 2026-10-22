@@ -2,6 +2,8 @@ minimumReleaseAge: 1440
 onlyBuiltDependencies: []
 overrides:
   use-sync-external-store: 1.6.0
+  brace-expansion@^2: 2.1.7
+  brace-expansion@^5: 5.0.12
 minimumReleaseAgeExclude:
   - '@mantine/core@9.5.2'
   - '@mantine/form@9.5.2'

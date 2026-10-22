@@ -60,7 +60,7 @@ use archive::{build_docker_archive, build_oci_archive};
 use artifacts::ArtifactStore;
 use files::{FileBrowser, FileEntry};
 use job_store::{JOB_LEASE_MINUTES, JobStore};
-use registry::{DestinationRegistryAdapter, SourceRegistryAdapter, image_client};
+use registry::{DestinationRegistryAdapter, PulledManifest, SourceRegistryAdapter, image_client};
 
 #[derive(Clone)]
 pub struct ImageTools {
@@ -473,6 +473,7 @@ impl ImageTools {
                 "/credentials/{id}",
                 put(update_credential).delete(delete_credential),
             )
+            .route("/inspect", get(inspect_image))
             .route("/jobs", get(list_jobs).post(create_job))
             .route("/jobs/{id}", get(get_job).delete(cancel_job))
             .route("/jobs/{id}/purge", axum::routing::delete(purge_job))
@@ -647,47 +648,99 @@ impl ImageTools {
         job: &image_job::Model,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> ApiResult<JobOutcome> {
-        let prepared = self.prepare_image(job).await?;
-        self.update_job_manifest(job.id, &prepared).await?;
+        let resolved = self.resolve_image(job).await?;
+        self.jobs
+            .update_manifest(
+                job.id,
+                &resolved.pulled.digest,
+                resolved.pulled.index_digest.as_deref(),
+                image_size(&resolved.pulled.manifest),
+            )
+            .await?;
         self.check_cancelled(job.id).await?;
-        if JobKind::parse(&job.kind) == Some(JobKind::Copy)
-            && self
-                .copy_already_completed(job, &prepared.manifest_digest)
+        if JobKind::parse(&job.kind) == Some(JobKind::Copy) {
+            if self
+                .copy_already_completed(job, &resolved.pulled.digest)
                 .await?
-        {
-            return Ok(JobOutcome::Skipped);
-        }
-        match JobKind::parse(&job.kind) {
-            Some(JobKind::Export) => self.export_image(job, &prepared, cancellation).await?,
-            Some(JobKind::Extract) => self.extract_image(job, &prepared).await?,
-            Some(JobKind::Copy) => self.copy_image(job, &prepared).await?,
-            _ => return Err(AppError::bad_request("unsupported image job kind")),
+            {
+                return Ok(JobOutcome::Skipped);
+            }
+            self.copy_image(job, &resolved).await?;
+        } else {
+            let prepared = self.prepare_resolved_image(job, resolved).await?;
+            match JobKind::parse(&job.kind) {
+                Some(JobKind::Export) => self.export_image(job, &prepared, cancellation).await?,
+                Some(JobKind::Extract) => self.extract_image(job, &prepared).await?,
+                _ => return Err(AppError::bad_request("unsupported image job kind")),
+            }
         }
         self.enforce_storage_quota(job.id).await?;
         Ok(JobOutcome::Completed)
     }
 
-    async fn prepare_image(&self, job: &image_job::Model) -> ApiResult<PreparedImage> {
+    async fn resolve_image(&self, job: &image_job::Model) -> ApiResult<ResolvedImage> {
         let logical: Reference = job
             .source_ref
             .parse()
             .map_err(|_| AppError::bad_request("invalid source image reference"))?;
         if let Some(node_id) = job.source_node_id {
-            return self.prepare_image_via_node(job, &logical, node_id).await;
+            return self.resolve_image_via_node(job, &logical, node_id).await;
         }
         let (source, auth) = self.source_transport(&logical, job).await?;
         let source = SourceRegistryAdapter::new(source, auth, &job.platform_os, &job.platform_arch);
         let pulled = source.pull_manifest().await?;
-        let manifest = pulled.manifest;
-        let digest = pulled.digest;
-        let config_json = pulled.config_json;
-        let index_digest = pulled.index_digest;
-        let total_bytes = manifest
-            .layers
-            .iter()
-            .map(|layer| layer.size.max(0) as u64)
-            .sum::<u64>()
-            .saturating_add(manifest.config.size.max(0) as u64);
+        Ok(ResolvedImage {
+            pulled,
+            source: ImageSource::Direct(Box::new(source)),
+        })
+    }
+
+    #[cfg(test)]
+    async fn prepare_image_via_node(
+        &self,
+        job: &image_job::Model,
+        logical: &Reference,
+        node_id: Uuid,
+    ) -> ApiResult<PreparedImage> {
+        let resolved = self.resolve_image_via_node(job, logical, node_id).await?;
+        self.prepare_resolved_image(job, resolved).await
+    }
+
+    async fn pull_source_blob(
+        &self,
+        source: &ImageSource,
+        job: &image_job::Model,
+        layer: &oci_client::manifest::OciDescriptor,
+        path: &Path,
+    ) -> ApiResult<()> {
+        match source {
+            ImageSource::Direct(source) => source.pull_blob(layer, File::create(path).await?).await,
+            ImageSource::Node(node) => {
+                let logical: Reference = job
+                    .source_ref
+                    .parse()
+                    .map_err(|_| AppError::bad_request("invalid source image reference"))?;
+                self.download_node_blob(node, logical.repository(), layer, path)
+                    .await
+            }
+        }
+    }
+
+    async fn prepare_resolved_image(
+        &self,
+        job: &image_job::Model,
+        resolved: ResolvedImage,
+    ) -> ApiResult<PreparedImage> {
+        let ResolvedImage {
+            pulled:
+                PulledManifest {
+                    manifest,
+                    config_json,
+                    ..
+                },
+            source,
+        } = resolved;
+        let total_bytes = image_size(&manifest);
         let max_export_bytes = self.runtime.read().await.max_export_bytes;
         if total_bytes > max_export_bytes {
             return Err(AppError::bad_request(
@@ -720,8 +773,7 @@ impl ImageTools {
                     .artifacts
                     .begin_blob_write(job.id, &layer.digest)
                     .await?;
-                source
-                    .pull_blob(layer, File::create(guard.temporary_path()).await?)
+                self.pull_source_blob(&source, job, layer, guard.temporary_path())
                     .await?;
                 guard.commit().await?;
             }
@@ -734,21 +786,18 @@ impl ImageTools {
         write_layout(&layout, &manifest).await?;
         Ok(PreparedImage {
             manifest,
-            manifest_digest: digest,
-            index_digest,
             config_json,
             layout,
             layer_paths,
-            total_bytes,
         })
     }
 
-    async fn prepare_image_via_node(
+    async fn resolve_image_via_node(
         &self,
         job: &image_job::Model,
         logical: &Reference,
         node_id: Uuid,
-    ) -> ApiResult<PreparedImage> {
+    ) -> ApiResult<ResolvedImage> {
         let node = self.nodes.registry_node(node_id).await?;
         let logical_registry =
             crate::registry_routes::normalize_registry_authority(logical.resolve_registry())?;
@@ -811,19 +860,6 @@ impl ImageTools {
             }
         };
 
-        let total_bytes = manifest
-            .layers
-            .iter()
-            .map(|layer| layer.size.max(0) as u64)
-            .sum::<u64>()
-            .saturating_add(manifest.config.size.max(0) as u64);
-        let max_export_bytes = self.runtime.read().await.max_export_bytes;
-        if total_bytes > max_export_bytes {
-            return Err(AppError::bad_request(
-                "image exceeds DONKEY_MAX_EXPORT_BYTES",
-            ));
-        }
-
         let config_path = format!(
             "/v2/{}/blobs/{}",
             logical.repository(),
@@ -847,55 +883,14 @@ impl ImageTools {
         let config_json = String::from_utf8(config_bytes)
             .map_err(|_| AppError::Upstream("image config is not UTF-8 JSON".into()))?;
 
-        let job_root = self.artifacts.job_root(job.id);
-        let layout = job_root.join("layout");
-        tokio::fs::create_dir_all(layout.join("blobs/sha256")).await?;
-        let layout_config = blob_path(&layout, &manifest.config.digest)?;
-        let shared_config = self.artifacts.shared_blob_path(&manifest.config.digest)?;
-        if tokio::fs::metadata(&shared_config).await.is_err() {
-            self.artifacts
-                .write_blob_bytes(job.id, &manifest.config.digest, config_json.as_bytes())
-                .await?;
-        }
-        link_or_copy(&shared_config, &layout_config).await?;
-
-        self.set_progress(job.id, "downloading", 0, total_bytes)
-            .await?;
-        let mut downloaded = manifest.config.size.max(0) as u64;
-        let mut layer_paths = Vec::new();
-        for layer in &manifest.layers {
-            self.check_cancelled(job.id).await?;
-            let path = blob_path(&layout, &layer.digest)?;
-            let shared = self.artifacts.shared_blob_path(&layer.digest)?;
-            if tokio::fs::metadata(&shared).await.is_err() {
-                let guard = self
-                    .artifacts
-                    .begin_blob_write(job.id, &layer.digest)
-                    .await?;
-                let result = self
-                    .download_node_blob(&node, logical.repository(), layer, guard.temporary_path())
-                    .await;
-                if result.is_err() {
-                    let _ = tokio::fs::remove_file(guard.temporary_path()).await;
-                }
-                result?;
-                guard.commit().await?;
-            }
-            link_or_copy(&shared, &path).await?;
-            downloaded = downloaded.saturating_add(layer.size.max(0) as u64);
-            self.set_progress(job.id, "downloading", downloaded, total_bytes)
-                .await?;
-            layer_paths.push(path);
-        }
-        write_layout(&layout, &manifest).await?;
-        Ok(PreparedImage {
-            manifest,
-            manifest_digest,
-            index_digest,
-            config_json,
-            layout,
-            layer_paths,
-            total_bytes,
+        Ok(ResolvedImage {
+            pulled: PulledManifest {
+                manifest,
+                digest: manifest_digest,
+                index_digest,
+                config_json,
+            },
+            source: ImageSource::Node(Box::new(node)),
         })
     }
 
@@ -1134,7 +1129,7 @@ impl ImageTools {
         ))
     }
 
-    async fn copy_image(&self, job: &image_job::Model, image: &PreparedImage) -> ApiResult<()> {
+    async fn copy_image(&self, job: &image_job::Model, image: &ResolvedImage) -> ApiResult<()> {
         self.set_stage(job.id, "copying").await?;
         let destination_raw = job
             .destination_ref
@@ -1157,7 +1152,7 @@ impl ImageTools {
     async fn copy_to_registry(
         &self,
         job: &image_job::Model,
-        image: &PreparedImage,
+        image: &ResolvedImage,
         destination: &Reference,
         auth: &RegistryAuth,
         client: &Client,
@@ -1165,24 +1160,55 @@ impl ImageTools {
         let destination = DestinationRegistryAdapter::new(client, destination, auth);
         destination.authenticate().await?;
 
-        for (layer, path) in image.manifest.layers.iter().zip(&image.layer_paths) {
+        let image_manifest = &image.pulled.manifest;
+        let total = image_size(image_manifest);
+        self.set_progress(job.id, "copying", 0, total).await?;
+        let mut progress = 0u64;
+        for layer in &image_manifest.layers {
             self.check_cancelled(job.id).await?;
             if !destination.blob_exists(&layer.digest).await? {
-                destination.push_file(path, &layer.digest).await?;
+                // Hold the GC lock while reading a shared Blob or transferring a temporary one.
+                // A copied layer does not need a retained local layout or a second disk copy.
+                let guard = self
+                    .artifacts
+                    .begin_blob_write(job.id, &layer.digest)
+                    .await?;
+                let shared = self.artifacts.shared_blob_path(&layer.digest)?;
+                if tokio::fs::metadata(&shared).await.is_ok() {
+                    destination.push_file(&shared, &layer.digest).await?;
+                } else {
+                    if layer.size.max(0) as u64 > self.runtime.read().await.max_export_bytes {
+                        return Err(AppError::bad_request(
+                            "layer exceeds DONKEY_MAX_EXPORT_BYTES",
+                        ));
+                    }
+                    self.pull_source_blob(&image.source, job, layer, guard.temporary_path())
+                        .await?;
+                    self.check_cancelled(job.id).await?;
+                    destination
+                        .push_file(guard.temporary_path(), &layer.digest)
+                        .await?;
+                }
             }
+            progress = progress.saturating_add(layer.size.max(0) as u64);
+            self.set_progress(job.id, "copying", progress, total)
+                .await?;
         }
+        self.check_cancelled(job.id).await?;
         if !destination
-            .blob_exists(&image.manifest.config.digest)
+            .blob_exists(&image_manifest.config.digest)
             .await?
         {
             destination
                 .push_bytes(
-                    image.config_json.as_bytes().to_vec(),
-                    &image.manifest.config.digest,
+                    image.pulled.config_json.as_bytes().to_vec(),
+                    &image_manifest.config.digest,
                 )
                 .await?;
         }
-        destination.push_manifest(image.manifest.clone()).await
+        self.check_cancelled(job.id).await?;
+        destination.push_manifest(image_manifest.clone()).await?;
+        self.set_progress(job.id, "copying", total, total).await
     }
 
     async fn copy_already_completed(
@@ -1225,17 +1251,6 @@ impl ImageTools {
                 "unsupported Registry credential mode",
             )),
         }
-    }
-
-    async fn update_job_manifest(&self, id: Uuid, image: &PreparedImage) -> ApiResult<()> {
-        self.jobs
-            .update_manifest(
-                id,
-                &image.manifest_digest,
-                image.index_digest.as_deref(),
-                image.total_bytes,
-            )
-            .await
     }
 
     async fn set_progress(&self, id: Uuid, stage: &str, current: u64, total: u64) -> ApiResult<()> {
@@ -1510,14 +1525,97 @@ async fn renew_job_lease(
     }
 }
 
+enum ImageSource {
+    Direct(Box<SourceRegistryAdapter>),
+    Node(Box<NodeView>),
+}
+
+struct ResolvedImage {
+    pulled: PulledManifest,
+    source: ImageSource,
+}
+
+fn image_size(manifest: &OciImageManifest) -> u64 {
+    manifest
+        .layers
+        .iter()
+        .fold(manifest.config.size.max(0) as u64, |size, layer| {
+            size.saturating_add(layer.size.max(0) as u64)
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectInput {
+    source_ref: String,
+    source_node_id: Option<Uuid>,
+    source_credential_id: Option<Uuid>,
+    #[serde(default = "default_linux")]
+    platform_os: String,
+    #[serde(default = "default_amd64")]
+    platform_arch: String,
+}
+
+#[derive(Serialize)]
+struct ImageInspection {
+    source_ref: String,
+    digest: String,
+    index_digest: Option<String>,
+    total_bytes: u64,
+    manifest: OciImageManifest,
+    config: serde_json::Value,
+}
+
+fn parse_inspection_config(raw: &str) -> ApiResult<serde_json::Value> {
+    let config: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_| AppError::Upstream("invalid image config JSON".into()))?;
+    if !config.is_object()
+        || ["os", "architecture"]
+            .iter()
+            .any(|key| config.get(key).is_some_and(|value| !value.is_string()))
+    {
+        return Err(AppError::Upstream(
+            "invalid image config platform fields".into(),
+        ));
+    }
+    Ok(config)
+}
+
+async fn inspect_image(
+    State(service): State<ImageTools>,
+    Query(input): Query<InspectInput>,
+) -> ApiResult<Json<ImageInspection>> {
+    let input = JobInput {
+        kind: "extract".into(),
+        source_ref: input.source_ref,
+        source_node_id: input.source_node_id,
+        source_credential_id: input.source_credential_id,
+        platform_os: input.platform_os,
+        platform_arch: input.platform_arch,
+        destination_ref: None,
+        destination_credential_id: None,
+        output_format: None,
+    };
+    validate_job(&input)?;
+    // Reuse source validation and authentication without creating a job or any files.
+    let job = pending_job(input, JobKind::Extract, None, Utc::now());
+    let resolved = service.resolve_image(&job).await?;
+    let pulled = resolved.pulled;
+    let config = parse_inspection_config(&pulled.config_json)?;
+    Ok(Json(ImageInspection {
+        source_ref: job.source_ref,
+        digest: pulled.digest,
+        index_digest: pulled.index_digest,
+        total_bytes: image_size(&pulled.manifest),
+        manifest: pulled.manifest,
+        config,
+    }))
+}
+
 struct PreparedImage {
     manifest: OciImageManifest,
-    manifest_digest: String,
-    index_digest: Option<String>,
     config_json: String,
     layout: PathBuf,
     layer_paths: Vec<PathBuf>,
-    total_bytes: u64,
 }
 
 enum JobOutcome {
@@ -3112,20 +3210,80 @@ mod tests {
             )
             .await
             .unwrap();
+        let max_export_bytes = service.runtime.read().await.max_export_bytes;
+        service.runtime.write().await.max_export_bytes = 1;
+        let Json(inspection) = inspect_image(
+            State(service.clone()),
+            Query(InspectInput {
+                source_ref: job.source_ref.clone(),
+                source_node_id: job.source_node_id,
+                source_credential_id: None,
+                platform_os: "linux".into(),
+                platform_arch: "amd64".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inspection.digest, manifest_digest);
+        assert_eq!(
+            inspection.total_bytes,
+            (config_bytes.len() + layer_bytes.len()) as u64
+        );
+        assert_eq!(inspection.config["architecture"], "amd64");
+        layer_mock.assert_calls_async(0).await;
+        assert_eq!(
+            image_job::Entity::find()
+                .all(&service.db)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(service.artifacts.usage().await.unwrap(), 0);
+        assert!(!service.artifacts.job_root(job.id).exists());
+        service.runtime.write().await.max_export_bytes = max_export_bytes;
+
+        let mut previous = test_job(JobStatus::Completed, None);
+        previous.kind = "copy".into();
+        previous.source_ref = job.source_ref.clone();
+        previous.source_node_id = job.source_node_id;
+        previous.destination_ref = Some("registry.example/team/test:latest".into());
+        previous.resolved_digest = Some(manifest_digest.clone());
+        previous
+            .clone()
+            .into_active_model()
+            .insert(&service.db)
+            .await
+            .unwrap();
+        let mut repeated = previous;
+        repeated.id = Uuid::new_v4();
+        repeated.status = "pending".into();
+        repeated
+            .clone()
+            .into_active_model()
+            .insert(&service.db)
+            .await
+            .unwrap();
+        let outcome = service
+            .process_job(&repeated, tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, JobOutcome::Skipped));
+        layer_mock.assert_calls_async(0).await;
+        assert!(!service.artifacts.job_root(repeated.id).exists());
+        assert_eq!(service.artifacts.usage().await.unwrap(), 0);
         let reference = job.source_ref.parse().unwrap();
         let image = service
             .prepare_image_via_node(&job, &reference, node.node.id)
             .await
             .unwrap();
-
-        assert_eq!(image.manifest_digest, manifest_digest);
         assert_eq!(image.config_json.as_bytes(), config_bytes);
         assert_eq!(
             tokio::fs::read(&image.layer_paths[0]).await.unwrap(),
             layer_bytes
         );
-        manifest_mock.assert_async().await;
-        config_mock.assert_async().await;
+        manifest_mock.assert_calls_async(3).await;
+        config_mock.assert_calls_async(3).await;
         layer_mock.assert_async().await;
     }
 
@@ -3302,20 +3460,27 @@ mod tests {
             },
             layers: vec![oci_client::manifest::OciDescriptor {
                 media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
-                digest: layer_digest,
+                digest: layer_digest.clone(),
                 size: layer_bytes.len() as i64,
                 ..Default::default()
             }],
             ..Default::default()
         };
-        let prepared = PreparedImage {
-            manifest,
-            manifest_digest: "sha256:manifest".into(),
-            index_digest: None,
-            config_json: String::from_utf8(config_bytes.to_vec()).unwrap(),
-            layout: directory.path().join("layout"),
-            layer_paths: vec![layer_path],
-            total_bytes: (config_bytes.len() + layer_bytes.len()) as u64,
+        let shared = service.artifacts.shared_blob_path(&layer_digest).unwrap();
+        tokio::fs::write(&shared, layer_bytes).await.unwrap();
+        let prepared = ResolvedImage {
+            pulled: PulledManifest {
+                manifest,
+                digest: "sha256:manifest".into(),
+                index_digest: None,
+                config_json: String::from_utf8(config_bytes.to_vec()).unwrap(),
+            },
+            source: ImageSource::Direct(Box::new(SourceRegistryAdapter::new(
+                "localhost/library/source:latest".parse().unwrap(),
+                RegistryAuth::Anonymous,
+                "linux",
+                "amd64",
+            ))),
         };
         let destination: Reference = destination_ref.parse().unwrap();
         let client = Client::new(ClientConfig {
@@ -3340,6 +3505,216 @@ mod tests {
         chunks.assert_calls_async(2).await;
         finishes.assert_calls_async(2).await;
         manifest_push.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn copy_checks_destination_before_download_and_cleans_temporary_layers() {
+        for (exists, upload_fails, oversize) in [
+            (true, false, false),
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let source = MockServer::start_async().await;
+            let target = MockServer::start_async().await;
+            let bytes = b"streamed temporary layer";
+            let digest = format!("sha256:{:x}", Sha256::digest(bytes));
+            let config_bytes = b"{}";
+            let config_digest = format!("sha256:{:x}", Sha256::digest(config_bytes));
+            let source_layer = source
+                .mock_async(|when, then| {
+                    when.method(GET)
+                        .path(format!("/v2/library/test/blobs/{digest}"));
+                    then.status(200).body(bytes);
+                })
+                .await;
+            target
+                .mock_async(|when, then| {
+                    when.method(GET).path("/v2/");
+                    then.status(200);
+                })
+                .await;
+            let layer_head = target
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::HEAD)
+                        .path(format!("/v2/team/test/blobs/{digest}"));
+                    then.status(if exists { 200 } else { 404 });
+                })
+                .await;
+            target
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::HEAD)
+                        .path(format!("/v2/team/test/blobs/{config_digest}"));
+                    then.status(200);
+                })
+                .await;
+            let location = format!("{}/upload/session", target.base_url());
+            let begin = target
+                .mock_async(|when, then| {
+                    when.method(POST).path("/v2/team/test/blobs/uploads/");
+                    then.status(202).header("location", &location);
+                })
+                .await;
+            target
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::PATCH).path("/upload/session");
+                    then.status(if upload_fails { 400 } else { 202 })
+                        .header("location", &location);
+                })
+                .await;
+            target
+                .mock_async(|when, then| {
+                    when.method(PUT)
+                        .path("/upload/session")
+                        .query_param_exists("digest");
+                    then.status(201).header("location", &location);
+                })
+                .await;
+            let publish = target
+                .mock_async(|when, then| {
+                    when.method(PUT).path("/v2/team/test/manifests/latest");
+                    then.status(201).header(
+                        "location",
+                        format!("{}/v2/team/test/manifests/latest", target.base_url()),
+                    );
+                })
+                .await;
+            let (directory, service) = test_service().await;
+            if oversize {
+                service.runtime.write().await.max_export_bytes = 1;
+            }
+            let node = service
+                .nodes
+                .create(crate::nodes::NodeInput {
+                    name: "source mirror".into(),
+                    url: source.base_url(),
+                    registry_route_id: crate::registry_routes::DOCKER_HUB_ROUTE_ID,
+                    enabled: true,
+                    priority: 1,
+                    max_concurrency: 4,
+                    cf_preferred: false,
+                    connect_ip_type: "ip".into(),
+                    connect_ip: None,
+                    auth_mode: "none".into(),
+                    auth_username: None,
+                    auth_header: None,
+                    auth_secret: None,
+                })
+                .await
+                .unwrap();
+            let mut job = test_job(JobStatus::Pending, None);
+            job.source_ref = "docker.io/library/test:latest".into();
+            let manifest: OciImageManifest = serde_json::from_value(serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": 2 },
+                "layers": [{ "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": digest, "size": bytes.len() }]
+            })).unwrap();
+            let resolved = ResolvedImage {
+                pulled: PulledManifest {
+                    manifest,
+                    digest: "sha256:manifest".into(),
+                    index_digest: None,
+                    config_json: "{}".into(),
+                },
+                source: ImageSource::Node(Box::new(node)),
+            };
+            let client = Client::new(ClientConfig {
+                protocol: oci_client::client::ClientProtocol::Http,
+                ..Default::default()
+            });
+            let destination: Reference = format!("{}/team/test:latest", target.address())
+                .parse()
+                .unwrap();
+            let result = service
+                .copy_to_registry(
+                    &job,
+                    &resolved,
+                    &destination,
+                    &RegistryAuth::Anonymous,
+                    &client,
+                )
+                .await;
+            assert_eq!(result.is_err(), upload_fails || oversize, "{result:?}");
+            layer_head.assert_calls_async(1).await;
+            source_layer
+                .assert_calls_async(if exists || oversize { 0 } else { 1 })
+                .await;
+            begin
+                .assert_calls_async(if exists || oversize { 0 } else { 1 })
+                .await;
+            publish
+                .assert_calls_async(if upload_fails || oversize { 0 } else { 1 })
+                .await;
+            assert!(!service.artifacts.job_root(job.id).exists());
+            assert!(
+                !service
+                    .artifacts
+                    .shared_blob_path(&digest)
+                    .unwrap()
+                    .exists()
+            );
+            assert_eq!(
+                std::fs::read_dir(directory.path().join("image-tools/partials"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_invalid_config_shapes() {
+        for raw in [
+            "null",
+            "[]",
+            "42",
+            "{",
+            r#"{"os":{}}"#,
+            r#"{"architecture":17}"#,
+        ] {
+            assert!(matches!(
+                parse_inspection_config(raw),
+                Err(AppError::Upstream(_))
+            ));
+        }
+        assert!(parse_inspection_config(r#"{"os":"linux","architecture":"amd64"}"#).is_ok());
+    }
+
+    #[tokio::test]
+    async fn inspection_validates_source_and_platform_without_creating_jobs() {
+        let (_directory, service) = test_service().await;
+        for (source_ref, node_id, credential_id, arch) in [
+            ("bad reference!", None, None, "amd64"),
+            (
+                "alpine:latest",
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                "amd64",
+            ),
+            ("alpine:latest", None, None, "unknown"),
+        ] {
+            let result = inspect_image(
+                State(service.clone()),
+                Query(InspectInput {
+                    source_ref: source_ref.into(),
+                    source_node_id: node_id,
+                    source_credential_id: credential_id,
+                    platform_os: "linux".into(),
+                    platform_arch: arch.into(),
+                }),
+            )
+            .await;
+            assert!(matches!(result, Err(AppError::BadRequest(_))));
+        }
+        assert!(
+            image_job::Entity::find()
+                .all(&service.db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(service.artifacts.usage().await.unwrap(), 0);
     }
 
     #[tokio::test]
