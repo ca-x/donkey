@@ -17,6 +17,7 @@ use crate::{
     error::{ApiResult, AppError},
     node_selection::{NodeLease, NodeSelector},
     nodes::{NodeService, NodeView},
+    resource_budget::{GLOBAL_STREAM_MEMORY_BYTES, STREAM_MEMORY_BYTES, StreamMemoryBudget},
     upstream::{RangeMode, UpstreamService},
 };
 use futures_util::{StreamExt, stream};
@@ -28,7 +29,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::RwLock,
+    sync::{RwLock, Semaphore},
 };
 use uuid::Uuid;
 
@@ -41,6 +42,7 @@ pub struct Scheduler {
     selector: NodeSelector,
     stats: Arc<SchedulerCounters>,
     capabilities: Cache<String, BlobCapabilities>,
+    stream_memory: Arc<Semaphore>,
 }
 
 pub(crate) struct BlobFetchResult {
@@ -107,20 +109,19 @@ pub struct StreamDownloadConfig {
     pub parallel_threshold: u64,
 }
 
-const MAX_IN_MEMORY_PARALLEL_BYTES: u64 = 64 * 1024 * 1024;
-
 #[derive(Clone, Debug)]
 struct BlobCapabilities {
-    size: u64,
+    size: Option<u64>,
     supports_range: bool,
     media_type: String,
 }
 
 struct DetectedCapabilities {
-    size: u64,
+    size: Option<u64>,
     media_type: String,
     nodes: Vec<NodeView>,
     range_nodes: Vec<NodeView>,
+    pending_nodes: Vec<NodeView>,
     fallback_nodes: Vec<NodeView>,
 }
 
@@ -173,12 +174,13 @@ impl Scheduler {
             SchedulerAlgorithmKind::parse(&config.scheduler_algorithm)
                 .unwrap_or(SchedulerAlgorithmKind::Current)
         });
-        let selector = match algorithm {
-            SchedulerAlgorithmKind::Current => NodeSelector::new(),
-            SchedulerAlgorithmKind::ProjectedCompletion => NodeSelector::with_algorithm(Arc::new(
-                crate::scheduling::ProjectedCompletionAlgorithm,
-            )),
+        let implementation: Arc<dyn crate::scheduling::SchedulerAlgorithm> = match algorithm {
+            SchedulerAlgorithmKind::Current => Arc::new(crate::scheduling::CurrentAlgorithm),
+            SchedulerAlgorithmKind::ProjectedCompletion => {
+                Arc::new(crate::scheduling::ProjectedCompletionAlgorithm)
+            }
         };
+        let selector = NodeSelector::with_capacity(implementation, nodes.capacity.clone());
         Self {
             runtime: Arc::new(RwLock::new(SchedulerRuntimeConfig {
                 chunk_size: config.chunk_size,
@@ -199,6 +201,7 @@ impl Scheduler {
                 .max_capacity(10_000)
                 .time_to_live(std::time::Duration::from_secs(600))
                 .build(),
+            stream_memory: Arc::new(Semaphore::new(GLOBAL_STREAM_MEMORY_BYTES as usize)),
         }
     }
 
@@ -308,6 +311,10 @@ impl Scheduler {
         self.cache.metrics()
     }
 
+    pub(crate) fn stream_memory_budget(&self) -> StreamMemoryBudget {
+        StreamMemoryBudget::new(self.stream_memory.clone())
+    }
+
     pub(crate) fn record_parallel_blob(&self, chunk_size: u64) {
         self.stats.parallel_blobs.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -388,6 +395,7 @@ impl Scheduler {
         let detected = self
             .detect_capabilities(nodes, request_path, request_headers)
             .await?;
+        let size = detected.size.unwrap_or_default();
         let node_capacity: usize = detected
             .range_nodes
             .iter()
@@ -428,29 +436,37 @@ impl Scheduler {
             },
             ..PlannerConfig::default()
         });
-        let plan = match planner.plan(
-            &BlobMeta {
-                digest: expected_digest.unwrap_or_default().to_owned(),
-                size: detected.size,
-                media_type: detected.media_type.clone(),
-            },
-            false,
-            &snapshots,
-        ) {
-            Ok(plan) => plan,
-            Err(PlannerError::NoUsableNodes) => BlobDownloadPlan {
+        let plan = if size == 0 {
+            BlobDownloadPlan {
                 strategy: DownloadStrategy::SingleRequest {
-                    node_url: detected
-                        .nodes
-                        .first()
-                        .map(|node| node.node.url.clone())
-                        .ok_or_else(|| AppError::unavailable("no compatible nodes"))?,
+                    node_url: detected.nodes[0].node.url.clone(),
                 },
-            },
-            Err(PlannerError::InvalidConfiguration) => {
-                return Err(AppError::internal(anyhow::anyhow!(
-                    "invalid Blob planner configuration"
-                )));
+            }
+        } else {
+            match planner.plan(
+                &BlobMeta {
+                    digest: expected_digest.unwrap_or_default().to_owned(),
+                    size,
+                    media_type: detected.media_type.clone(),
+                },
+                false,
+                &snapshots,
+            ) {
+                Ok(plan) => plan,
+                Err(PlannerError::NoUsableNodes) => BlobDownloadPlan {
+                    strategy: DownloadStrategy::SingleRequest {
+                        node_url: detected
+                            .nodes
+                            .first()
+                            .map(|node| node.node.url.clone())
+                            .ok_or_else(|| AppError::unavailable("no compatible nodes"))?,
+                    },
+                },
+                Err(PlannerError::InvalidConfiguration) => {
+                    return Err(AppError::internal(anyhow::anyhow!(
+                        "invalid Blob planner configuration"
+                    )));
+                }
             }
         };
         let (can_parallel, planned_chunk_size, preferred_single) = match plan {
@@ -468,13 +484,13 @@ impl Scheduler {
         let fallback_nodes = preferred_single
             .as_deref()
             .map(|preferred| {
-                let mut nodes = detected.fallback_nodes.clone();
+                let mut nodes = detected.nodes.clone();
                 if let Some(index) = nodes.iter().position(|node| node.node.url == preferred) {
                     nodes.rotate_left(index);
                 }
                 nodes
             })
-            .unwrap_or_else(|| detected.fallback_nodes.clone());
+            .unwrap_or_else(|| detected.nodes.clone());
 
         let partial_dir = self.cache.temp_dir().join(key);
         tokio::fs::create_dir_all(&partial_dir).await?;
@@ -483,8 +499,8 @@ impl Scheduler {
             self.record_parallel_blob(runtime.chunk_size);
             tracing::info!(
                 path = request_path,
-                size = detected.size,
-                chunks = chunks(detected.size, runtime.chunk_size).len(),
+                size,
+                chunks = chunks(size, runtime.chunk_size).len(),
                 nodes = detected.range_nodes.len(),
                 "starting parallel Blob fetch"
             );
@@ -493,7 +509,7 @@ impl Scheduler {
                     nodes: &detected.range_nodes,
                     request_path,
                     request_headers,
-                    total_size: detected.size,
+                    total_size: size,
                     temp_dir: &partial_dir,
                     merged: &merged,
                     runtime,
@@ -508,40 +524,46 @@ impl Scheduler {
                 let _ = tokio::fs::remove_file(&merged).await;
                 self.download_whole(
                     &fallback_nodes,
+                    &detected.pending_nodes,
                     request_path,
                     request_headers,
                     &merged,
-                    Some(detected.size),
+                    detected.size,
                 )
                 .await?;
             }
         } else if !detected.range_nodes.is_empty()
-            && detected.size >= runtime.resumable_threshold
+            && size >= runtime.resumable_threshold
             && tokio::fs::metadata(&merged)
                 .await
-                .is_ok_and(|metadata| metadata.len() > 0 && metadata.len() < detected.size)
+                .is_ok_and(|metadata| metadata.len() > 0 && metadata.len() < size)
         {
             self.download_resume(
                 &detected.range_nodes,
+                &detected.pending_nodes,
                 request_path,
                 request_headers,
-                detected.size,
+                size,
                 &merged,
             )
             .await?;
         } else {
             self.download_whole(
                 &fallback_nodes,
+                &detected.pending_nodes,
                 request_path,
                 request_headers,
                 &merged,
-                Some(detected.size),
+                detected.size,
             )
             .await?;
         }
 
         let actual_size = tokio::fs::metadata(&merged).await?.len();
-        if detected.size > 0 && actual_size != detected.size {
+        if detected
+            .size
+            .is_some_and(|expected| actual_size != expected)
+        {
             if let Some(digest) = expected_digest
                 && detected.fallback_nodes.len() > 1
             {
@@ -551,7 +573,7 @@ impl Scheduler {
                     request_headers,
                     &merged,
                     digest,
-                    Some(detected.size),
+                    detected.size,
                 )
                 .await?;
             } else {
@@ -574,7 +596,7 @@ impl Scheduler {
                 request_headers,
                 &merged,
                 digest,
-                Some(detected.size),
+                detected.size,
             )
             .await?;
         }
@@ -597,6 +619,7 @@ impl Scheduler {
     async fn download_resume(
         &self,
         nodes: &[NodeView],
+        pending_nodes: &[NodeView],
         request_path: &str,
         request_headers: &HeaderMap,
         total_size: u64,
@@ -605,109 +628,118 @@ impl Scheduler {
         self.record_resume();
         let mut last_error = None;
         let policy = self.runtime.read().await.scheduler_policy;
-        loop {
-            let capacity_changed = self.capacity_changed();
-            let mut attempted = false;
-            let offset = tokio::fs::metadata(destination).await?.len();
-            if offset >= total_size {
-                return Ok(());
+        for group in [nodes, pending_nodes] {
+            if group.is_empty() {
+                continue;
             }
-            let candidates = self.ordered_nodes_with_context(
-                nodes,
-                crate::scheduling::ScheduleContext {
-                    sequence: Self::sequence_for(request_path, offset),
-                    blob_size: total_size,
-                    range_required: true,
-                    chunk: Some((offset, total_size - 1)),
-                },
-                policy,
-            );
-            for node in candidates {
-                let Some(lease) = self.try_acquire(node.node.id, node.max_concurrency) else {
-                    continue;
-                };
-                attempted = true;
-                // A previous source may have appended bytes before failing,
-                // or an integrity error may have discarded the partial file.
+            loop {
+                let capacity_changed = self.capacity_changed();
+                let mut attempted = false;
                 let offset = match tokio::fs::metadata(destination).await {
                     Ok(metadata) => metadata.len(),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
                     Err(error) => return Err(error.into()),
                 };
                 if offset >= total_size {
-                    return if offset == total_size {
-                        Ok(())
-                    } else {
-                        Err(AppError::Integrity)
+                    return Ok(());
+                }
+                let candidates = self.ordered_nodes_with_context(
+                    group,
+                    crate::scheduling::ScheduleContext {
+                        sequence: Self::sequence_for(request_path, offset),
+                        blob_size: total_size,
+                        range_required: true,
+                        chunk: Some((offset, total_size - 1)),
+                    },
+                    policy,
+                );
+                for node in candidates {
+                    let Some(lease) = self.try_acquire(node.node.id, node.max_concurrency) else {
+                        continue;
                     };
-                }
-                let started = Instant::now();
-                let result = async {
-                    let response = self
-                        .upstream
-                        .send(
-                            node,
-                            http::Method::GET,
-                            request_path,
-                            request_headers,
-                            RangeMode::Exact(offset, total_size - 1),
-                        )
-                        .await?;
-                    if response.status() != StatusCode::PARTIAL_CONTENT
-                        || !content_range_matches(
-                            response.headers(),
-                            offset,
-                            total_size - 1,
-                            total_size,
-                        )
-                    {
-                        return Err(AppError::Integrity);
+                    attempted = true;
+                    // A previous source may have appended bytes before failing,
+                    // or an integrity error may have discarded the partial file.
+                    let offset = match tokio::fs::metadata(destination).await {
+                        Ok(metadata) => metadata.len(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                        Err(error) => return Err(error.into()),
+                    };
+                    if offset >= total_size {
+                        return if offset == total_size {
+                            Ok(())
+                        } else {
+                            Err(AppError::Integrity)
+                        };
                     }
-                    if offset == 0 {
-                        stream_response_to_file(
-                            response,
-                            destination,
-                            Some(total_size),
-                            Some((&self.nodes, node.node.id)),
-                            Some(self.cache.metrics()),
-                        )
-                        .await
-                    } else {
-                        append_response_to_file(
-                            response,
-                            destination,
-                            total_size - offset,
-                            Some((&self.nodes, node.node.id)),
-                            Some(self.cache.metrics()),
-                        )
-                        .await
-                    }
-                }
-                .await;
-                let bytes = tokio::fs::metadata(destination)
-                    .await
-                    .map(|m| m.len().saturating_sub(offset))
-                    .unwrap_or(0);
-                self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
-                drop(lease);
-                self.nodes
-                    .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
-                    .await;
-                match result {
-                    Ok(()) => return Ok(()),
-                    Err(error) => {
-                        self.record_retry();
-                        if matches!(&error, AppError::Integrity) {
-                            let _ = tokio::fs::remove_file(destination).await;
+                    let started = Instant::now();
+                    let result = async {
+                        let response = self
+                            .upstream
+                            .send(
+                                node,
+                                http::Method::GET,
+                                request_path,
+                                request_headers,
+                                RangeMode::Exact(offset, total_size - 1),
+                            )
+                            .await?;
+                        if response.status() != StatusCode::PARTIAL_CONTENT
+                            || !content_range_matches(
+                                response.headers(),
+                                offset,
+                                total_size - 1,
+                                total_size,
+                            )
+                        {
+                            return Err(AppError::Integrity);
                         }
-                        last_error = Some(error)
+                        if offset == 0 {
+                            stream_response_to_file(
+                                response,
+                                destination,
+                                Some(total_size),
+                                Some((&self.nodes, node.node.id)),
+                                Some(self.cache.metrics()),
+                            )
+                            .await
+                        } else {
+                            append_response_to_file(
+                                response,
+                                destination,
+                                total_size - offset,
+                                Some((&self.nodes, node.node.id)),
+                                Some(self.cache.metrics()),
+                            )
+                            .await
+                        }
+                    }
+                    .await;
+                    let bytes = tokio::fs::metadata(destination)
+                        .await
+                        .map(|m| m.len().saturating_sub(offset))
+                        .unwrap_or(0);
+                    self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
+                    drop(lease);
+                    self.nodes
+                        .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
+                        .await;
+                    match result {
+                        Ok(()) => return Ok(()),
+                        Err(error) => {
+                            self.record_retry();
+                            if matches!(&error, AppError::Integrity) {
+                                let _ = tokio::fs::remove_file(destination).await;
+                            }
+                            last_error = Some(error)
+                        }
                     }
                 }
+                if attempted {
+                    break;
+                }
+                capacity_changed.await;
             }
-            if attempted {
-                break;
-            }
-            capacity_changed.await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed resume".into())))
     }
@@ -729,6 +761,7 @@ impl Scheduler {
             return Ok(value);
         }
         let result = async {
+            let _lease = self.nodes.acquire_probe(node).await?;
             let response = self
                 .upstream
                 .send(
@@ -783,8 +816,9 @@ impl Scheduler {
         let mut last_error = None;
         let mut baseline: Option<BlobCapabilities> = None;
         let mut compatible = Vec::new();
-        // Probe a bounded batch concurrently, retaining route order for the
-        // size baseline and fallback list regardless of response timing.
+        let mut observed = std::collections::HashSet::new();
+        let parallel_threshold = self.runtime.read().await.parallel_threshold;
+        let mut discovery_deadline = None;
         let mut probes = stream::iter(nodes.to_vec())
             .map(|node| {
                 let scheduler = self.clone();
@@ -797,8 +831,20 @@ impl Scheduler {
                     (node, result)
                 }
             })
-            .buffered(8);
-        while let Some((node, result)) = probes.next().await {
+            .buffer_unordered(8);
+        loop {
+            let next = if let Some(deadline) = discovery_deadline {
+                match tokio::time::timeout_at(deadline, probes.next()).await {
+                    Ok(next) => next,
+                    Err(_) => break,
+                }
+            } else {
+                probes.next().await
+            };
+            let Some((node, result)) = next else {
+                break;
+            };
+            observed.insert(node.node.id);
             match result {
                 Ok(value) => {
                     let compatible_with_baseline = baseline
@@ -809,6 +855,15 @@ impl Scheduler {
                             baseline = Some(value.clone());
                         }
                         compatible.push((node.clone(), value));
+                        let Some(size) = baseline.as_ref().and_then(|value| value.size) else {
+                            break;
+                        };
+                        if size < parallel_threshold {
+                            break;
+                        }
+                        discovery_deadline.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(100)
+                        });
                     }
                 }
                 Err(error) => {
@@ -822,22 +877,27 @@ impl Scheduler {
                 .iter()
                 .filter(|(_, capabilities)| capabilities.supports_range)
                 .map(|(node, _)| node.clone())
-                .collect();
+                .collect::<Vec<_>>();
             let compatible_nodes = compatible
                 .into_iter()
                 .map(|(node, _)| node)
                 .collect::<Vec<_>>();
+            let pending = nodes
+                .iter()
+                .filter(|node| !observed.contains(&node.node.id));
+            let pending_nodes = pending.clone().cloned().collect();
+            let fallback_nodes = compatible_nodes
+                .iter()
+                .cloned()
+                .chain(pending.cloned())
+                .collect();
             return Ok(DetectedCapabilities {
                 size: baseline.size,
                 media_type: baseline.media_type,
                 nodes: compatible_nodes.clone(),
                 range_nodes,
-                // A node that failed capability detection is not a safe
-                // fallback: retrying it for every chunk amplifies failures
-                // and can duplicate upstream traffic.  Keep only nodes that
-                // agreed on the Blob size; Range-capable nodes are included
-                // here as they can also serve a complete request.
-                fallback_nodes: compatible_nodes.clone(),
+                pending_nodes,
+                fallback_nodes,
             });
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("capability detection failed".into())))
@@ -1028,6 +1088,7 @@ impl Scheduler {
     async fn download_whole(
         &self,
         nodes: &[NodeView],
+        pending_nodes: &[NodeView],
         request_path: &str,
         request_headers: &HeaderMap,
         destination: &Path,
@@ -1035,116 +1096,122 @@ impl Scheduler {
     ) -> ApiResult<()> {
         let mut last_error = None;
         let policy = self.runtime.read().await.scheduler_policy;
-        loop {
-            let capacity_changed = self.capacity_changed();
-            let mut attempted = false;
-            let candidates = self.ordered_nodes_with_context(
-                nodes,
-                crate::scheduling::ScheduleContext {
-                    sequence: Self::sequence_for(request_path, total_size.unwrap_or_default()),
-                    blob_size: total_size.unwrap_or_default(),
-                    range_required: false,
-                    chunk: None,
-                },
-                policy,
-            );
-            for node in candidates {
-                let Some(lease) = self.try_acquire(node.node.id, node.max_concurrency) else {
-                    continue;
-                };
-                attempted = true;
-                let started = Instant::now();
-                let existing = if let Some(total) = total_size.filter(|total| *total > 0) {
-                    tokio::fs::metadata(destination)
-                        .await
-                        .ok()
-                        .and_then(|metadata| (metadata.len() < total).then_some(metadata.len()))
-                } else {
-                    None
-                };
-                let result = async {
-                    let range = existing.and_then(|offset| {
-                        total_size.and_then(|total| total.checked_sub(1).map(|end| (offset, end)))
-                    });
-                    let response = self
-                        .upstream
-                        .send(
-                            node,
-                            http::Method::GET,
-                            request_path,
-                            request_headers,
-                            range.map_or(RangeMode::Suppress, |(start, end)| {
-                                RangeMode::Exact(start, end)
-                            }),
-                        )
-                        .await?;
-                    if !response.status().is_success() {
-                        return Err(AppError::Upstream(format!(
-                            "{} returned {}",
-                            node.node.name,
-                            response.status()
-                        )));
-                    }
-                    if let Some(start) = existing {
-                        let Some(total) = total_size else {
-                            return Err(AppError::Integrity);
-                        };
-                        let Some(end) = total.checked_sub(1) else {
-                            return Err(AppError::Integrity);
-                        };
-                        if response.status() != StatusCode::PARTIAL_CONTENT
-                            || !content_range_matches(response.headers(), start, end, total)
-                        {
-                            return Err(AppError::Integrity);
-                        }
-                        append_response_to_file(
-                            response,
-                            destination,
-                            end - start + 1,
-                            Some((&self.nodes, node.node.id)),
-                            Some(self.cache.metrics()),
-                        )
-                        .await
+        for group in [nodes, pending_nodes] {
+            if group.is_empty() {
+                continue;
+            }
+            loop {
+                let capacity_changed = self.capacity_changed();
+                let mut attempted = false;
+                let candidates = self.ordered_nodes_with_context(
+                    group,
+                    crate::scheduling::ScheduleContext {
+                        sequence: Self::sequence_for(request_path, total_size.unwrap_or_default()),
+                        blob_size: total_size.unwrap_or_default(),
+                        range_required: false,
+                        chunk: None,
+                    },
+                    policy,
+                );
+                for node in candidates {
+                    let Some(lease) = self.try_acquire(node.node.id, node.max_concurrency) else {
+                        continue;
+                    };
+                    attempted = true;
+                    let started = Instant::now();
+                    let existing = if let Some(total) = total_size.filter(|total| *total > 0) {
+                        tokio::fs::metadata(destination)
+                            .await
+                            .ok()
+                            .and_then(|metadata| (metadata.len() < total).then_some(metadata.len()))
                     } else {
-                        let length = response.content_length();
-                        stream_response_to_file(
-                            response,
-                            destination,
-                            length,
-                            Some((&self.nodes, node.node.id)),
-                            Some(self.cache.metrics()),
-                        )
-                        .await
-                    }
-                }
-                .await;
-                let bytes = tokio::fs::metadata(destination)
-                    .await
-                    .map(|m| m.len().saturating_sub(existing.unwrap_or(0)))
-                    .unwrap_or(0);
-                self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
-                drop(lease);
-                self.nodes
-                    .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
-                    .await;
-                match result {
-                    Ok(()) => return Ok(()),
-                    Err(error) => {
-                        self.record_retry();
-                        // Keep a transport-truncated file for a future request to
-                        // resume. Integrity failures are unsafe to resume and
-                        // must start from a clean file.
-                        if matches!(&error, AppError::Integrity) {
-                            let _ = tokio::fs::remove_file(destination).await;
+                        None
+                    };
+                    let result = async {
+                        let range = existing.and_then(|offset| {
+                            total_size
+                                .and_then(|total| total.checked_sub(1).map(|end| (offset, end)))
+                        });
+                        let response = self
+                            .upstream
+                            .send(
+                                node,
+                                http::Method::GET,
+                                request_path,
+                                request_headers,
+                                range.map_or(RangeMode::Suppress, |(start, end)| {
+                                    RangeMode::Exact(start, end)
+                                }),
+                            )
+                            .await?;
+                        if !response.status().is_success() {
+                            return Err(AppError::Upstream(format!(
+                                "{} returned {}",
+                                node.node.name,
+                                response.status()
+                            )));
                         }
-                        last_error = Some(error);
+                        if let Some(start) = existing {
+                            let Some(total) = total_size else {
+                                return Err(AppError::Integrity);
+                            };
+                            let Some(end) = total.checked_sub(1) else {
+                                return Err(AppError::Integrity);
+                            };
+                            if response.status() != StatusCode::PARTIAL_CONTENT
+                                || !content_range_matches(response.headers(), start, end, total)
+                            {
+                                return Err(AppError::Integrity);
+                            }
+                            append_response_to_file(
+                                response,
+                                destination,
+                                end - start + 1,
+                                Some((&self.nodes, node.node.id)),
+                                Some(self.cache.metrics()),
+                            )
+                            .await
+                        } else {
+                            let length = response.content_length();
+                            stream_response_to_file(
+                                response,
+                                destination,
+                                length,
+                                Some((&self.nodes, node.node.id)),
+                                Some(self.cache.metrics()),
+                            )
+                            .await
+                        }
+                    }
+                    .await;
+                    let bytes = tokio::fs::metadata(destination)
+                        .await
+                        .map(|m| m.len().saturating_sub(existing.unwrap_or(0)))
+                        .unwrap_or(0);
+                    self.observe_node(node.node.id, bytes, started.elapsed(), result.is_ok());
+                    drop(lease);
+                    self.nodes
+                        .record_transfer(node.node.id, bytes, started.elapsed(), result.is_ok())
+                        .await;
+                    match result {
+                        Ok(()) => return Ok(()),
+                        Err(error) => {
+                            self.record_retry();
+                            // Keep a transport-truncated file for a future request to
+                            // resume. Integrity failures are unsafe to resume and
+                            // must start from a clean file.
+                            if matches!(&error, AppError::Integrity) {
+                                let _ = tokio::fs::remove_file(destination).await;
+                            }
+                            last_error = Some(error);
+                        }
                     }
                 }
+                if attempted {
+                    break;
+                }
+                capacity_changed.await;
             }
-            if attempted {
-                break;
-            }
-            capacity_changed.await;
         }
         Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed".into())))
     }
@@ -1175,6 +1242,7 @@ impl Scheduler {
             let result = match self
                 .download_whole(
                     std::slice::from_ref(node),
+                    &[],
                     request_path,
                     request_headers,
                     destination,
@@ -1252,7 +1320,7 @@ fn effective_chunk_size(
 }
 
 fn bounded_stream_concurrency(chunk_size: u64, desired: usize) -> usize {
-    let memory_slots = MAX_IN_MEMORY_PARALLEL_BYTES
+    let memory_slots = u64::from(STREAM_MEMORY_BYTES)
         .checked_div(chunk_size.max(1))
         .unwrap_or(1)
         .max(1)
@@ -1271,7 +1339,7 @@ fn effective_concurrency(runtime: SchedulerRuntimeConfig, node_capacity: usize) 
 
 fn capabilities_from_head(response: &reqwest::Response) -> Option<BlobCapabilities> {
     Some(BlobCapabilities {
-        size: positive_content_length(response.headers())?,
+        size: Some(positive_content_length(response.headers())?),
         supports_range: identity_encoded(response)
             && response
                 .headers()
@@ -1310,14 +1378,14 @@ fn capabilities_from_probe(response: &reqwest::Response) -> Option<BlobCapabilit
             return None;
         }
         return Some(BlobCapabilities {
-            size: range.complete_length,
+            size: Some(range.complete_length),
             supports_range: identity_encoded(response),
             media_type: response_media_type(response),
         });
     }
     if response.status().is_success() {
-        return response.content_length().map(|size| BlobCapabilities {
-            size,
+        return Some(BlobCapabilities {
+            size: response.content_length(),
             supports_range: false,
             media_type: response_media_type(response),
         });
@@ -1463,6 +1531,106 @@ async fn verify_file(path: &Path, expected_digest: &str) -> ApiResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unknown_length_success_remains_a_usable_single_source() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let router = axum::Router::new().fallback(|| async {
+                axum::body::Body::from_stream(stream::iter([Ok::<_, std::io::Error>(
+                    bytes::Bytes::from_static(b"unknown length"),
+                )]))
+            });
+            axum::serve(listener, router).await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+        assert!(response.content_length().is_none());
+        let capabilities = capabilities_from_probe(&response)
+            .expect("unknown length must disable ranges, not discard a successful source");
+        assert!(!capabilities.supports_range);
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn small_blob_discovery_does_not_wait_for_an_unrelated_slow_node() {
+        let fast = httpmock::MockServer::start_async().await;
+        let slow = httpmock::MockServer::start_async().await;
+        for (server, delay) in [(&fast, 0), (&slow, 2_000)] {
+            server
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::HEAD)
+                        .path("/v2/audit/blobs/data");
+                    then.status(200)
+                        .header("content-length", "1024")
+                        .delay(std::time::Duration::from_millis(delay));
+                })
+                .await;
+            server
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::GET)
+                        .path("/v2/audit/blobs/data");
+                    then.status(200)
+                        .body(vec![b'f'; 1024])
+                        .delay(std::time::Duration::from_millis(delay));
+                })
+                .await;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(directory.path().to_owned());
+        config.scheduler_policy = SchedulerPolicy::SpeedFirst;
+        let state = crate::AppState::new(config).await.unwrap();
+        let mut nodes = Vec::new();
+        for (priority, server) in [&fast, &slow].into_iter().enumerate() {
+            nodes.push(
+                state
+                    .nodes
+                    .create(crate::nodes::NodeInput {
+                        name: format!("discovery-{priority}"),
+                        url: server.base_url(),
+                        registry_route_id: crate::registry_routes::DOCKER_HUB_ROUTE_ID,
+                        enabled: true,
+                        priority: 1 - priority as i32,
+                        max_concurrency: 1,
+                        cf_preferred: false,
+                        connect_ip_type: "ip".into(),
+                        connect_ip: None,
+                        auth_mode: "none".into(),
+                        auth_username: None,
+                        auth_header: None,
+                        auth_secret: None,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let headers = HeaderMap::new();
+        let detected = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            state
+                .scheduler
+                .detect_capabilities(&nodes, "/v2/audit/blobs/data", &headers),
+        )
+        .await
+        .expect("a ready source must not wait for unrelated probe completion")
+        .unwrap();
+        assert!(
+            detected
+                .nodes
+                .iter()
+                .any(|node| node.node.id == nodes[0].node.id)
+        );
+        assert_eq!(state.nodes.capacity.active(nodes[1].node.id), 0);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            state
+                .scheduler
+                .fetch_blob("/v2/audit/blobs/data", &headers, None, nodes),
+        )
+        .await
+        .expect("unprobed nodes must not displace an available confirmed source")
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn changing_chunk_layout_does_not_reuse_bytes_from_another_offset() {

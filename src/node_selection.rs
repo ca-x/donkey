@@ -11,14 +11,16 @@ use uuid::Uuid;
 use crate::{
     config::SchedulerPolicy,
     nodes::NodeView,
+    resource_budget::NodeCapacity,
     scheduling::{ScheduleCandidate, ScheduleContext, SchedulerAlgorithm},
 };
+
+pub(crate) use crate::resource_budget::NodeLease;
 
 #[derive(Clone)]
 pub(crate) struct NodeSelector {
     speeds: Arc<DashMap<Uuid, Arc<Mutex<SpeedWindow>>>>,
-    active: Arc<DashMap<Uuid, usize>>,
-    capacity_changed: Arc<tokio::sync::Notify>,
+    capacity: NodeCapacity,
     failures: Arc<DashMap<Uuid, FailureState>>,
     recovered: Arc<DashMap<Uuid, Instant>>,
     algorithm: Arc<RwLock<Arc<dyn SchedulerAlgorithm>>>,
@@ -87,15 +89,23 @@ impl SpeedWindow {
 }
 
 impl NodeSelector {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::with_algorithm(Arc::new(crate::scheduling::CurrentAlgorithm))
     }
 
+    #[cfg(test)]
     pub(crate) fn with_algorithm(algorithm: Arc<dyn SchedulerAlgorithm>) -> Self {
+        Self::with_capacity(algorithm, NodeCapacity::default())
+    }
+
+    pub(crate) fn with_capacity(
+        algorithm: Arc<dyn SchedulerAlgorithm>,
+        capacity: NodeCapacity,
+    ) -> Self {
         Self {
             speeds: Arc::new(DashMap::new()),
-            active: Arc::new(DashMap::new()),
-            capacity_changed: Arc::new(tokio::sync::Notify::new()),
+            capacity,
             failures: Arc::new(DashMap::new()),
             recovered: Arc::new(DashMap::new()),
             algorithm: Arc::new(RwLock::new(algorithm)),
@@ -161,11 +171,7 @@ impl NodeSelector {
                 capacity_bps: self.measured_speed(node),
                 latency_ms: node.metric.latency_ms.max(0) as u64,
                 success_rate: node.metric.success_rate,
-                active: self
-                    .active
-                    .get(&node.node.id)
-                    .map(|value| *value)
-                    .unwrap_or(0),
+                active: self.capacity.active(node.node.id),
                 max_concurrency: usize::from(node.max_concurrency),
                 measured: self.speeds.contains_key(&node.node.id) || node.metric.speed_bps > 0,
                 recently_recovered: self
@@ -183,31 +189,13 @@ impl NodeSelector {
     }
 
     pub(crate) fn try_acquire(&self, node_id: Uuid, max_concurrency: u16) -> Option<NodeLease> {
-        let mut active = self.active.entry(node_id).or_insert(0);
-        if *active >= usize::from(max_concurrency) {
-            return None;
-        }
-        *active += 1;
-        drop(active);
-        Some(NodeLease {
-            node_id,
-            active: self.active.clone(),
-            capacity_changed: self.capacity_changed.clone(),
-        })
+        self.capacity.try_acquire(node_id, max_concurrency)
     }
 
     // Construct before scanning candidates so a release during the scan
     // cannot be missed, even if the returned future has not yet been polled.
     pub(crate) fn capacity_changed(&self) -> impl Future<Output = ()> + Send + use<> {
-        let notified = self.capacity_changed.clone().notified_owned();
-        async move {
-            // Cooldowns and per-Blob Range exclusions can change without a
-            // lease being released. Keep a low-frequency recheck for them.
-            tokio::select! {
-                () = notified => {},
-                () = tokio::time::sleep(Duration::from_millis(250)) => {},
-            }
-        }
+        self.capacity.changed()
     }
 
     pub(crate) fn observe(
@@ -289,21 +277,6 @@ impl NodeSelector {
     }
 }
 
-pub(crate) struct NodeLease {
-    node_id: Uuid,
-    active: Arc<DashMap<Uuid, usize>>,
-    capacity_changed: Arc<tokio::sync::Notify>,
-}
-
-impl Drop for NodeLease {
-    fn drop(&mut self) {
-        if let Some(mut value) = self.active.get_mut(&self.node_id) {
-            *value = value.saturating_sub(1);
-        }
-        self.capacity_changed.notify_waiters();
-    }
-}
-
 #[cfg(test)]
 fn speed_first_capacity(
     measured_bps: f64,
@@ -376,6 +349,18 @@ mod tests {
         assert!(selector.try_acquire(id, 1).is_none());
         drop(first);
         assert!(selector.try_acquire(id, 1).is_some());
+    }
+
+    #[test]
+    fn resource_budget_bounds_connections_across_all_nodes() {
+        let selector = NodeSelector::new();
+        let mut leases = (0..64)
+            .map(|_| selector.try_acquire(Uuid::new_v4(), 1).unwrap())
+            .collect::<Vec<_>>();
+        let next_node = Uuid::new_v4();
+        assert!(selector.try_acquire(next_node, 1).is_none());
+        leases.pop();
+        assert!(selector.try_acquire(next_node, 1).is_some());
     }
 
     #[tokio::test]

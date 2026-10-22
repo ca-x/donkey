@@ -13,6 +13,8 @@ must read its plan fully, honor the STOP conditions, and update its status.
 | 003 | Make image-job transitions conditional and recoverable | P1 | M | 002 | DONE (`faa72fb`, `c22e2bf`, `88e5692`) |
 | 004 | Restore immediate, accessible UI feedback | P1 | M | — | DONE (`82591bb`, `5b598fc`) |
 | 005 | Model registry origins and mirror endpoint groups | P1 | L | 002, 003 | DONE (`19e51ab`…`1071d9f`) |
+| 006 | Lightweight image inspection and incremental registry copy | P1 | M | 005 | DONE (`a43ec74`) |
+| 007 | Harden network retries and shared resource scheduling | P1 | L | 001, 005, 006 | DONE (`v0.4.1`) |
 
 Status values: PROPOSED | TODO | IN PROGRESS | DONE | BLOCKED | REJECTED.
 

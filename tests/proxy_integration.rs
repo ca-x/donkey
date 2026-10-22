@@ -31,8 +31,14 @@ mod proxy_integration {
     #[derive(Clone, Copy)]
     enum FixtureBehavior {
         ValidRange,
+        DelayedHeadRange(std::time::Duration),
         RangeUnsupported,
         RetryableFailure,
+        TransientRange(StatusCode, &'static str),
+        EmptyRangeBody(std::time::Duration),
+        EmptyChunkedBody(std::time::Duration),
+        MissingBlob,
+        MissingRange,
         WrongContentRange,
         CorruptChunk,
         DropAfterPrefix,
@@ -48,6 +54,7 @@ mod proxy_integration {
         active_requests: AtomicUsize,
         max_active_requests: AtomicUsize,
         ranges: Mutex<Vec<Option<String>>>,
+        range_attempts: Mutex<Vec<(String, std::time::Instant)>>,
         uris: Mutex<Vec<String>>,
         route_auth: Mutex<Vec<Option<String>>>,
     }
@@ -159,13 +166,21 @@ mod proxy_integration {
                 if let Some(gate) = &state.head_gate {
                     gate.wait().await;
                 }
+                if let FixtureBehavior::DelayedHeadRange(delay) = state.behavior {
+                    tokio::time::sleep(delay).await;
+                }
                 fixture_response(
                     StatusCode::OK,
                     &state.bytes,
                     matches!(
                         state.behavior,
                         FixtureBehavior::ValidRange
+                            | FixtureBehavior::DelayedHeadRange(_)
                             | FixtureBehavior::RetryableFailure
+                            | FixtureBehavior::TransientRange(_, _)
+                            | FixtureBehavior::EmptyRangeBody(_)
+                            | FixtureBehavior::MissingBlob
+                            | FixtureBehavior::MissingRange
                             | FixtureBehavior::WrongContentRange
                             | FixtureBehavior::CorruptChunk
                             | FixtureBehavior::DropAfterPrefix
@@ -187,14 +202,82 @@ mod proxy_integration {
                     .lock()
                     .await
                     .push(requested_range.clone());
+                let range_attempt = if let Some(range) = &requested_range {
+                    let mut attempts = state.stats.range_attempts.lock().await;
+                    attempts.push((range.clone(), std::time::Instant::now()));
+                    attempts.len()
+                } else {
+                    0
+                };
                 match state.behavior {
+                    FixtureBehavior::MissingBlob => {
+                        fixture_response(StatusCode::NOT_FOUND, &[], false, None)
+                    }
+                    FixtureBehavior::MissingRange => {
+                        if requested_range.is_some() {
+                            fixture_response(StatusCode::NOT_FOUND, &[], false, None)
+                        } else {
+                            ranged_or_whole(&state.bytes, None, false)
+                        }
+                    }
+                    FixtureBehavior::EmptyRangeBody(delay)
+                    | FixtureBehavior::EmptyChunkedBody(delay) => {
+                        let (start, end) = requested_range
+                            .as_deref()
+                            .and_then(parse_range)
+                            .unwrap_or((0, state.bytes.len() as u64 - 1));
+                        state.stats.active_requests.fetch_add(1, Ordering::Relaxed);
+                        let activity = WholeRequestActivity(state.stats.clone());
+                        let body = futures_util::stream::once(async move {
+                            let _activity = activity;
+                            tokio::time::sleep(delay).await;
+                            Err::<bytes::Bytes, _>(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "fixture empty body",
+                            ))
+                        });
+                        let mut response = Response::new(Body::from_stream(body));
+                        if matches!(state.behavior, FixtureBehavior::EmptyChunkedBody(_)) {
+                            return response;
+                        }
+                        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+                        response.headers_mut().insert(
+                            header::CONTENT_LENGTH,
+                            (end - start + 1).to_string().parse().unwrap(),
+                        );
+                        response.headers_mut().insert(
+                            header::CONTENT_RANGE,
+                            format!("bytes {start}-{end}/{}", state.bytes.len())
+                                .parse()
+                                .unwrap(),
+                        );
+                        response
+                    }
+                    FixtureBehavior::TransientRange(status, retry_after) => {
+                        if range_attempt == 1 {
+                            let mut response = fixture_response(status, &[], false, None);
+                            let retry_after = if retry_after == "http-date" {
+                                (chrono::Utc::now() + chrono::Duration::days(1))
+                                    .format("%a, %d %b %Y %H:%M:%S GMT")
+                                    .to_string()
+                            } else {
+                                retry_after.to_owned()
+                            };
+                            response
+                                .headers_mut()
+                                .insert(header::RETRY_AFTER, retry_after.parse().unwrap());
+                            response
+                        } else {
+                            ranged_or_whole(&state.bytes, requested_range, false)
+                        }
+                    }
                     FixtureBehavior::RetryableFailure => {
                         fixture_response(StatusCode::SERVICE_UNAVAILABLE, &[], false, None)
                     }
                     FixtureBehavior::RangeUnsupported => {
                         fixture_response(StatusCode::OK, &state.bytes, false, None)
                     }
-                    FixtureBehavior::ValidRange => {
+                    FixtureBehavior::ValidRange | FixtureBehavior::DelayedHeadRange(_) => {
                         ranged_or_whole(&state.bytes, requested_range, false)
                     }
                     FixtureBehavior::WrongContentRange => {
@@ -439,6 +522,20 @@ mod proxy_integration {
             .map(|fixture| (*fixture, DOCKER_HUB_ROUTE_ID))
             .collect::<Vec<_>>();
         routed_proxy_state(&fixtures).await
+    }
+
+    async fn serial_stream_state(fixture: &Fixture) -> (AppState, tempfile::TempDir) {
+        let (state, directory) = proxy_state(&[fixture]).await;
+        let mut config = (*state.config).clone();
+        config.stream_fallback_timeout = std::time::Duration::ZERO;
+        config.chunk_concurrency = 1;
+        config.parallel_threshold = u64::MAX;
+        state.scheduler.update_runtime(&config).await;
+        let node = state.nodes.list().await.unwrap().remove(0);
+        donkey::db::set_node_max_concurrency(&state.db, node.node.id, 1)
+            .await
+            .unwrap();
+        (state, directory)
     }
 
     async fn routed_proxy_state(
@@ -995,11 +1092,20 @@ mod proxy_integration {
 
         #[tokio::test]
         async fn chunked_upstream_response_is_streamed_and_cached() {
+            for fallback_timeout in [
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(10),
+            ] {
+                assert_chunked_upstream_is_cached(fallback_timeout).await;
+            }
+        }
+
+        async fn assert_chunked_upstream_is_cached(fallback_timeout: std::time::Duration) {
             let bytes = vec![b'u'; 1024 * 1024 + 9];
             let fixture = Fixture::start(FixtureBehavior::ChunkedWhole, bytes.clone()).await;
             let directory = tempfile::tempdir().unwrap();
             let mut config = Config::for_test(directory.path().to_owned());
-            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.stream_fallback_timeout = fallback_timeout;
             let state = AppState::new(config).await.unwrap();
             state
                 .nodes
@@ -1037,6 +1143,21 @@ mod proxy_integration {
             );
             assert_eq!(state.cache.stats().await.unwrap().entries, 1);
             assert_eq!(state.cache.stats().await.unwrap().bytes, bytes.len() as u64);
+            let cached = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            assert_eq!(cached.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(cached.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
             assert_eq!(fixture.get_count(), 1);
         }
 
@@ -1186,7 +1307,11 @@ mod proxy_integration {
         async fn assert_resume_after_failure(behavior: FixtureBehavior, healthy_start: u64) {
             let bytes = vec![b'x'; 8 * 1024 * 1024 + 4];
             let failing = Fixture::start(behavior, bytes.clone()).await;
-            let healthy = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
+            let healthy = Fixture::start(
+                FixtureBehavior::DelayedHeadRange(std::time::Duration::from_secs(1)),
+                bytes.clone(),
+            )
+            .await;
             let directory = tempfile::tempdir().unwrap();
             let mut config = Config::for_test(directory.path().to_owned());
             config.parallel_threshold = bytes.len() as u64 + 1;
@@ -1299,6 +1424,177 @@ mod proxy_integration {
                     .is_some_and(|value| value.starts_with("bytes=4-"))
             }));
             assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+        }
+
+        #[tokio::test]
+        async fn streaming_empty_range_bodies_exhaust_one_cross_response_budget() {
+            let bytes = vec![b'e'; 32];
+            let fixture = Fixture::start(
+                FixtureBehavior::EmptyRangeBody(std::time::Duration::from_millis(20)),
+                bytes.clone(),
+            )
+            .await;
+            let (state, _directory) = serial_stream_state(&fixture).await;
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                to_bytes(response.into_body(), usize::MAX),
+            )
+            .await
+            .expect("valid 206 headers must not reset the no-progress budget");
+            assert!(result.is_err());
+            assert!(fixture.get_count() <= 4);
+            assert_eq!(state.cache.stats().await.unwrap().entries, 0);
+        }
+
+        #[tokio::test]
+        async fn streaming_zero_progress_disconnect_releases_blob_and_node_leases() {
+            for behavior in [
+                FixtureBehavior::EmptyRangeBody(std::time::Duration::from_secs(30)),
+                FixtureBehavior::EmptyChunkedBody(std::time::Duration::from_secs(30)),
+            ] {
+                let bytes = vec![b'c'; 32];
+                let fixture = Fixture::start(behavior, bytes.clone()).await;
+                let (state, _directory) = serial_stream_state(&fixture).await;
+                let router = registry_router(state.clone());
+                let path = blob_path(&digest(&bytes));
+                let abandoned = request(router.clone(), Method::GET, &path, None).await;
+                assert!(abandoned.status().is_success());
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                drop(abandoned);
+                let next = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    request(router, Method::GET, &path, None),
+                )
+                .await
+                .expect("client closure must cancel a pending body read and release both leases");
+                assert!(next.status().is_success());
+                drop(next);
+                assert_eq!(fixture.get_count(), 2);
+                assert_eq!(state.cache.stats().await.unwrap().entries, 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn streaming_real_offset_progress_resets_the_stall_budget() {
+            let bytes = vec![b'p'; 32];
+            let fixture = Fixture::start(FixtureBehavior::DropAfterPrefix, bytes.clone()).await;
+            let (state, _directory) = serial_stream_state(&fixture).await;
+            let mut config = (*state.config).clone();
+            config.upstream_timeout = std::time::Duration::from_millis(150);
+            state.upstream.update_runtime(&config).await;
+            let started = std::time::Instant::now();
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            let body = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                to_bytes(response.into_body(), usize::MAX),
+            )
+            .await
+            .unwrap()
+            .expect("a progressing transfer must not have a fixed total time or response limit");
+            assert_eq!(body.as_ref(), bytes);
+            assert!(started.elapsed() > config.upstream_timeout);
+            assert!(fixture.get_count() > 4);
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+        }
+
+        #[tokio::test]
+        async fn streaming_slow_read_preserves_node_capacity_samples() {
+            for behavior in [
+                FixtureBehavior::RangeUnsupported,
+                FixtureBehavior::ChunkedWhole,
+            ] {
+                let bytes = vec![b's'; 4 * 1024 * 1024];
+                let fixture = Fixture::start(behavior, bytes.clone()).await;
+                let (state, _directory) = serial_stream_state(&fixture).await;
+                let node = state.nodes.list().await.unwrap().remove(0);
+                state
+                    .nodes
+                    .record_transfer(
+                        node.node.id,
+                        64 * 1024 * 1024,
+                        std::time::Duration::from_secs(1),
+                        true,
+                    )
+                    .await;
+                let before = state.nodes.list().await.unwrap().remove(0).metric;
+                let response = request(
+                    registry_router(state.clone()),
+                    Method::GET,
+                    &blob_path(&digest(&bytes)),
+                    None,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                assert_eq!(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    bytes,
+                );
+                let after = state.nodes.list().await.unwrap().remove(0).metric;
+                assert_eq!(
+                    after.speed_bps, before.speed_bps,
+                    "downstream stalls must not change node speed"
+                );
+                assert_eq!(after.current_bps, before.current_bps);
+                assert_eq!(after.total_bytes, before.total_bytes + bytes.len() as i64);
+                assert!(after.healthy);
+                assert_eq!(after.success_rate, before.success_rate);
+                assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn streaming_unknown_length_client_idle_timeout_does_not_penalize_upstream() {
+            let bytes = vec![b'i'; 4 * 1024 * 1024];
+            let fixture = Fixture::start(FixtureBehavior::ChunkedWhole, bytes.clone()).await;
+            let (state, _directory) = serial_stream_state(&fixture).await;
+            let mut config = (*state.config).clone();
+            config.upstream_timeout = std::time::Duration::from_millis(100);
+            state.upstream.update_runtime(&config).await;
+            let node = state.nodes.list().await.unwrap().remove(0);
+            state
+                .nodes
+                .record_transfer(
+                    node.node.id,
+                    64 * 1024 * 1024,
+                    std::time::Duration::from_secs(1),
+                    true,
+                )
+                .await;
+            let before = state.nodes.list().await.unwrap().remove(0).metric;
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(to_bytes(response.into_body(), usize::MAX).await.is_err());
+            let after = state.nodes.list().await.unwrap().remove(0).metric;
+            assert_eq!(after.success_rate, before.success_rate);
+            assert_eq!(after.speed_bps, before.speed_bps);
+            assert_eq!(after.current_bps, before.current_bps);
+            assert!(after.healthy);
+            assert_eq!(state.cache.stats().await.unwrap().entries, 0);
         }
 
         #[tokio::test]
@@ -1485,6 +1781,128 @@ mod proxy_integration {
         }
 
         #[tokio::test]
+        async fn streaming_parallel_reads_finish_while_downstream_is_paused() {
+            const CHUNK: usize = 64 * 1024;
+            let bytes = vec![b'b'; 20 * CHUNK];
+            let fixture = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;
+            let (state, _directory) = proxy_state(&[&fixture]).await;
+            let mut config = (*state.config).clone();
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.chunk_size = CHUNK as u64;
+            config.upstream_timeout = std::time::Duration::from_millis(400);
+            state.scheduler.update_runtime(&config).await;
+            state.upstream.update_runtime(&config).await;
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let node = state.nodes.list().await.unwrap().remove(0);
+                    if node.metric.total_bytes >= (12 * CHUNK) as i64 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("already-started Range reads must finish independently of downstream polling");
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes,
+            );
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+        }
+
+        #[tokio::test]
+        async fn streaming_parallel_body_larger_than_memory_budget_is_collected() {
+            let bytes = vec![b'm'; 68 * 1024 * 1024];
+            let fixture = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
+            let (state, _directory) = proxy_state(&[&fixture]).await;
+            let mut config = (*state.config).clone();
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.chunk_size = 4 * 1024 * 1024;
+            state.scheduler.update_runtime(&config).await;
+            let response = request(
+                registry_router(state.clone()),
+                Method::GET,
+                &blob_path(&digest(&bytes)),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                to_bytes(response.into_body(), usize::MAX),
+            )
+            .await
+            .expect("delivered HTTP frames must not retain proxy-owned byte reservations")
+            .unwrap();
+            assert_eq!(body.as_ref(), bytes);
+            assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+        }
+
+        #[tokio::test]
+        async fn streaming_saturated_byte_budget_still_enforces_client_idle_timeout() {
+            const CHUNK: u64 = 8 * 1024 * 1024;
+            let bytes = vec![b'q'; 72 * 1024 * 1024];
+            let fixture = Fixture::start(FixtureBehavior::ValidRange, bytes.clone()).await;
+            let (state, _directory) = proxy_state(&[&fixture]).await;
+            let mut config = (*state.config).clone();
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.chunk_size = CHUNK;
+            config.upstream_timeout = std::time::Duration::from_secs(2);
+            state.scheduler.update_runtime(&config).await;
+            state.upstream.update_runtime(&config).await;
+            let path = blob_path(&digest(&bytes));
+            let key = donkey::cache::CacheStore::key(
+                &DOCKER_HUB_ROUTE_ID.to_string(),
+                &path,
+                None,
+                false,
+            );
+            let partial = state.cache.temp_dir().join(key).join("object.partial");
+            let response = request(registry_router(state.clone()), Method::GET, &path, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    if tokio::fs::metadata(&partial)
+                        .await
+                        .is_ok_and(|metadata| metadata.len() >= 5 * CHUNK)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the byte budget must fill before the client-idle interval starts");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                to_bytes(response.into_body(), usize::MAX),
+            )
+            .await
+            .unwrap();
+            let error = result
+                .expect_err("waiting on byte capacity must not bypass the client idle budget");
+            assert!(
+                error
+                    .to_string()
+                    .contains("stream byte capacity remained unavailable"),
+                "{error:?}"
+            );
+            assert_eq!(state.cache.stats().await.unwrap().entries, 0);
+        }
+
+        #[tokio::test]
         async fn single_node_capacity_parallelizes_one_blob() {
             let bytes = vec![b'p'; 1024 * 1024];
             let fixture = Fixture::start(FixtureBehavior::ThrottledRange, bytes.clone()).await;
@@ -1532,6 +1950,163 @@ mod proxy_integration {
             );
             assert!(fixture.max_active_requests() > 1);
             assert!(state.scheduler.stats().parallel_blobs >= 1);
+        }
+
+        #[tokio::test]
+        async fn streaming_parallel_retries_transient_ranges_after_initial_get_success() {
+            for status in [
+                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ] {
+                let bytes = vec![b't'; 32];
+                let fixture =
+                    Fixture::start(FixtureBehavior::TransientRange(status, "1"), bytes.clone())
+                        .await;
+                let (state, _directory) = proxy_state(&[&fixture]).await;
+                let mut config = (*state.config).clone();
+                config.stream_fallback_timeout = std::time::Duration::ZERO;
+                config.chunk_concurrency = 2;
+                state.scheduler.update_runtime(&config).await;
+
+                let response = request(
+                    registry_router(state.clone()),
+                    Method::GET,
+                    &blob_path(&digest(&bytes)),
+                    None,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    to_bytes(response.into_body(), usize::MAX),
+                )
+                .await
+                .expect("transient Range failures must have a bounded retry budget")
+                .expect("a transient Range failure must not exclude its source");
+                assert_eq!(body.as_ref(), bytes);
+                let attempts = fixture.state.stats.range_attempts.lock().await;
+                let (first_range, first_time) = &attempts[0];
+                let (_, retried_at) = attempts
+                    .iter()
+                    .skip(1)
+                    .find(|(range, _)| range == first_range)
+                    .expect("the failed Range must be retried");
+                assert!(
+                    retried_at.duration_since(*first_time) >= std::time::Duration::from_secs(1)
+                );
+                assert_eq!(state.cache.stats().await.unwrap().entries, 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn streaming_parallel_retry_after_seconds_and_http_date_are_capped() {
+            for retry_after in ["999999999", "http-date"] {
+                let bytes = vec![b'r'; 16];
+                let fixture = Fixture::start(
+                    FixtureBehavior::TransientRange(StatusCode::SERVICE_UNAVAILABLE, retry_after),
+                    bytes.clone(),
+                )
+                .await;
+                let (state, _directory) = proxy_state(&[&fixture]).await;
+                let mut config = (*state.config).clone();
+                config.stream_fallback_timeout = std::time::Duration::ZERO;
+                config.chunk_concurrency = 2;
+                state.scheduler.update_runtime(&config).await;
+                let response = request(
+                    registry_router(state.clone()),
+                    Method::GET,
+                    &blob_path(&digest(&bytes)),
+                    None,
+                )
+                .await;
+                let body = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    to_bytes(response.into_body(), usize::MAX),
+                )
+                .await
+                .expect("Retry-After must not delay a request without an upper bound")
+                .unwrap();
+                assert_eq!(body.as_ref(), bytes);
+                let attempts = fixture.state.stats.range_attempts.lock().await;
+                let (range, failed_at) = &attempts[0];
+                let (_, retried_at) = attempts
+                    .iter()
+                    .skip(1)
+                    .find(|(next, _)| next == range)
+                    .unwrap();
+                assert!(retried_at.duration_since(*failed_at) >= std::time::Duration::from_secs(2));
+            }
+        }
+
+        #[tokio::test]
+        async fn streaming_disconnect_cancels_retry_after_backoff() {
+            let bytes = vec![b'b'; 16];
+            let fixture = Fixture::start(
+                FixtureBehavior::TransientRange(StatusCode::SERVICE_UNAVAILABLE, "999999999"),
+                bytes.clone(),
+            )
+            .await;
+            let (state, _directory) = proxy_state(&[&fixture]).await;
+            let mut config = (*state.config).clone();
+            config.stream_fallback_timeout = std::time::Duration::ZERO;
+            config.chunk_concurrency = 2;
+            state.scheduler.update_runtime(&config).await;
+            let router = registry_router(state.clone());
+            let path = blob_path(&digest(&bytes));
+            let abandoned = request(router.clone(), Method::GET, &path, None).await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while fixture.state.stats.range_attempts.lock().await.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drop(abandoned);
+            let next = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                request(router, Method::GET, &path, None),
+            )
+            .await
+            .expect(
+                "a cancelled relay must release its Blob lease without waiting for Retry-After",
+            );
+            assert!(next.status().is_success());
+            drop(next);
+        }
+
+        #[tokio::test]
+        async fn streaming_missing_blob_does_not_penalize_node_health() {
+            for behavior in [FixtureBehavior::MissingBlob, FixtureBehavior::MissingRange] {
+                let bytes = vec![b'm'; 32];
+                let fixture = Fixture::start(behavior, bytes.clone()).await;
+                let (state, _directory) = proxy_state(&[&fixture]).await;
+                let mut config = (*state.config).clone();
+                config.stream_fallback_timeout = std::time::Duration::ZERO;
+                config.chunk_concurrency = 2;
+                state.scheduler.update_runtime(&config).await;
+                let before = state.nodes.list().await.unwrap().remove(0).metric;
+                let response = request(
+                    registry_router(state.clone()),
+                    Method::GET,
+                    &blob_path(&digest(&bytes)),
+                    None,
+                )
+                .await;
+                if response.status().is_success() {
+                    assert!(to_bytes(response.into_body(), usize::MAX).await.is_err());
+                } else {
+                    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+                }
+                let after = state.nodes.list().await.unwrap().remove(0).metric;
+                assert_eq!(
+                    after.success_rate, before.success_rate,
+                    "a missing object is not a node failure"
+                );
+                assert_eq!(after.healthy, before.healthy);
+                assert_eq!(state.scheduler.stats().cooling_nodes, 0);
+                assert_eq!(state.cache.stats().await.unwrap().entries, 0);
+            }
         }
 
         #[tokio::test]

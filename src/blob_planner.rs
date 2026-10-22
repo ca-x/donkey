@@ -152,7 +152,13 @@ impl BlobPlanner {
 
         let chunk_size = self.chunk_size(blob.size, requested_concurrency);
         let num_chunks = blob.size.div_ceil(chunk_size) as usize;
-        let benefit = estimated_benefit(blob.size, best_single, &range_nodes, chunk_size);
+        let benefit = estimated_benefit(
+            blob.size,
+            best_single,
+            &range_nodes,
+            chunk_size,
+            requested_concurrency,
+        );
         // A multi-node plan without throughput observations is deliberately
         // conservative: one full request teaches the scheduler the real
         // bandwidth without spending the Blob on speculative ranges.  A
@@ -207,7 +213,8 @@ fn estimated_benefit(
     size: u64,
     best_single: &NodeSnapshot,
     nodes: &[&NodeSnapshot],
-    _chunk_size: u64,
+    chunk_size: u64,
+    requested_concurrency: usize,
 ) -> Option<f64> {
     if nodes
         .iter()
@@ -215,8 +222,18 @@ fn estimated_benefit(
     {
         return None;
     }
+    let num_chunks = size.div_ceil(chunk_size);
+    let concurrency = (requested_concurrency as u64).min(num_chunks);
+    let mut active_nodes = nodes.to_vec();
+    active_nodes.sort_unstable_by(|left, right| {
+        right
+            .throughput_bps
+            .cmp(&left.throughput_bps)
+            .then_with(|| left.latency_ms.cmp(&right.latency_ms))
+    });
+    active_nodes.truncate(concurrency as usize);
     let single = estimated_time_ms(size, best_single);
-    let aggregate_throughput = nodes
+    let aggregate_throughput = active_nodes
         .iter()
         .filter_map(|node| node.throughput_bps)
         .map(|throughput| throughput as f64)
@@ -224,12 +241,13 @@ fn estimated_benefit(
     if aggregate_throughput <= 0.0 {
         return None;
     }
-    let coordination_latency = nodes
+    let coordination_latency = active_nodes
         .iter()
         .filter_map(|node| node.latency_ms)
         .max()
         .unwrap_or_default() as f64;
-    let multi = coordination_latency + size as f64 * 1_000.0 / aggregate_throughput;
+    let waves = num_chunks.div_ceil(concurrency);
+    let multi = waves as f64 * coordination_latency + size as f64 * 1_000.0 / aggregate_throughput;
     Some(single / multi.max(1.0))
 }
 
@@ -272,6 +290,238 @@ mod tests {
                 node_url: "https://fast".into()
             }
         );
+    }
+
+    #[test]
+    fn range_sources_only_help_with_enough_executable_concurrency() {
+        const MIB: u64 = 1024 * 1024;
+        let blob = BlobMeta {
+            digest: "sha256:abc".into(),
+            size: 128 * MIB,
+            media_type: "application/octet-stream".into(),
+        };
+        let mut nodes = vec![node("whole", Some(200 * MIB), false)];
+        nodes.extend((0..10).map(|index| NodeSnapshot {
+            max_concurrency: 1,
+            ..node(&format!("range-{index}"), Some(40 * MIB), true)
+        }));
+
+        for concurrency in [1, 2, 6, 7, 8, 10, 16] {
+            let plan = BlobPlanner::new(PlannerConfig {
+                max_concurrent_chunks: concurrency,
+                ..Default::default()
+            })
+            .plan(&blob, false, &nodes)
+            .unwrap();
+            if concurrency < 7 {
+                assert_eq!(
+                    plan.strategy,
+                    DownloadStrategy::SingleRequest {
+                        node_url: "whole".into()
+                    },
+                    "concurrency: {concurrency}"
+                );
+            } else {
+                let DownloadStrategy::MultiSourceChunked {
+                    recommended_concurrency,
+                    ..
+                } = plan.strategy
+                else {
+                    panic!("expected parallelism with concurrency {concurrency}");
+                };
+                assert_eq!(recommended_concurrency, concurrency.min(10));
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_request_waves_can_outweigh_parallel_throughput() {
+        const MIB: u64 = 1024 * 1024;
+        let blob = BlobMeta {
+            digest: "sha256:abc".into(),
+            size: 32 * MIB,
+            media_type: "application/octet-stream".into(),
+        };
+        let nodes = [
+            node("whole", Some(100 * MIB), false),
+            node("range-a", Some(75 * MIB), true),
+            node("range-b", Some(75 * MIB), true),
+        ];
+        let plan = BlobPlanner::new(PlannerConfig {
+            max_concurrent_chunks: 2,
+            ..Default::default()
+        })
+        .plan(&blob, false, &nodes)
+        .unwrap();
+        assert_eq!(
+            plan.strategy,
+            DownloadStrategy::SingleRequest {
+                node_url: "whole".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_partial_final_wave_still_pays_request_latency() {
+        const MIB: u64 = 1024 * 1024;
+        let nodes = [
+            node("whole", Some(100 * MIB), false),
+            node("range-a", Some(100 * MIB), true),
+            node("range-b", Some(100 * MIB), true),
+        ];
+        let planner = BlobPlanner::new(PlannerConfig {
+            min_chunk_size: 8 * MIB,
+            min_parallel_benefit: 1.6,
+            max_concurrent_chunks: 2,
+            ..Default::default()
+        });
+        for size_mib in [16, 17] {
+            let blob = BlobMeta {
+                digest: "sha256:abc".into(),
+                size: size_mib * MIB,
+                media_type: "application/octet-stream".into(),
+            };
+            let plan = planner.plan(&blob, false, &nodes).unwrap();
+            if size_mib == 16 {
+                assert_eq!(
+                    plan.strategy,
+                    DownloadStrategy::MultiSourceChunked {
+                        chunk_size: 8 * MIB,
+                        num_chunks: 2,
+                        recommended_concurrency: 2,
+                    }
+                );
+            } else {
+                assert_eq!(
+                    plan.strategy,
+                    DownloadStrategy::SingleRequest {
+                        node_url: "whole".into()
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fastest_active_range_sources_can_make_parallelism_worthwhile() {
+        const MIB: u64 = 1024 * 1024;
+        let blob = BlobMeta {
+            digest: "sha256:abc".into(),
+            size: 128 * MIB,
+            media_type: "application/octet-stream".into(),
+        };
+        let nodes = [
+            node("whole", Some(200 * MIB), false),
+            NodeSnapshot {
+                latency_ms: Some(10_000),
+                ..node("slow-range", Some(MIB), true)
+            },
+            node("fast-range-a", Some(200 * MIB), true),
+            node("fast-range-b", Some(200 * MIB), true),
+        ];
+        let plan = BlobPlanner::new(PlannerConfig {
+            max_concurrent_chunks: 2,
+            ..Default::default()
+        })
+        .plan(&blob, false, &nodes)
+        .unwrap();
+        assert!(matches!(
+            plan.strategy,
+            DownloadStrategy::MultiSourceChunked {
+                recommended_concurrency: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_single_chunk_cannot_aggregate_multiple_range_sources() {
+        const MIB: u64 = 1024 * 1024;
+        let blob = BlobMeta {
+            digest: "sha256:abc".into(),
+            size: 8 * MIB,
+            media_type: "application/octet-stream".into(),
+        };
+        let nodes = [
+            node("range-a", Some(40 * MIB), true),
+            node("range-b", Some(40 * MIB), true),
+        ];
+        let plan = BlobPlanner::new(PlannerConfig {
+            min_chunk_size: 8 * MIB,
+            max_concurrent_chunks: 2,
+            ..Default::default()
+        })
+        .plan(&blob, false, &nodes)
+        .unwrap();
+        assert_eq!(
+            plan.strategy,
+            DownloadStrategy::SingleRequest {
+                node_url: "range-a".into()
+            }
+        );
+    }
+
+    #[test]
+    fn node_capacity_does_not_multiply_observed_throughput() {
+        const MIB: u64 = 1024 * 1024;
+        let blob = BlobMeta {
+            digest: "sha256:abc".into(),
+            size: 128 * MIB,
+            media_type: "application/octet-stream".into(),
+        };
+        let nodes = [
+            node("whole", Some(200 * MIB), false),
+            NodeSnapshot {
+                max_concurrency: 16,
+                ..node("range-a", Some(40 * MIB), true)
+            },
+            node("range-b", Some(MIB), true),
+        ];
+        let plan = BlobPlanner::new(PlannerConfig::default())
+            .plan(&blob, false, &nodes)
+            .unwrap();
+        assert_eq!(
+            plan.strategy,
+            DownloadStrategy::SingleRequest {
+                node_url: "whole".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unmeasured_extra_range_sources_keep_the_plan_conservative() {
+        const MIB: u64 = 1024 * 1024;
+        let blob = BlobMeta {
+            digest: "sha256:abc".into(),
+            size: 128 * MIB,
+            media_type: "application/octet-stream".into(),
+        };
+        for unmeasured in [
+            node("unmeasured", None, true),
+            NodeSnapshot {
+                latency_ms: None,
+                ..node("unmeasured", Some(MIB), true)
+            },
+        ] {
+            let nodes = [
+                node("whole", Some(200 * MIB), false),
+                node("range-a", Some(200 * MIB), true),
+                node("range-b", Some(200 * MIB), true),
+                unmeasured,
+            ];
+            let plan = BlobPlanner::new(PlannerConfig {
+                max_concurrent_chunks: 2,
+                ..Default::default()
+            })
+            .plan(&blob, false, &nodes)
+            .unwrap();
+            assert_eq!(
+                plan.strategy,
+                DownloadStrategy::SingleRequest {
+                    node_url: "whole".into()
+                }
+            );
+        }
     }
 
     #[test]

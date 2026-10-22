@@ -22,6 +22,7 @@ use crate::{
     db::{self, node, node_metric},
     error::{ApiResult, AppError},
     registry_routes::RegistryRouteSummary,
+    resource_budget::{NodeCapacity, NodeLease, ProbeLease},
     security,
 };
 
@@ -35,6 +36,7 @@ pub struct NodeService {
     db: DatabaseConnection,
     cipher: CredentialCipher,
     live_rates: Arc<DashMap<Uuid, Arc<Mutex<RateWindow>>>>,
+    pub(crate) capacity: NodeCapacity,
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +236,7 @@ impl NodeService {
             db,
             cipher,
             live_rates: Arc::new(DashMap::new()),
+            capacity: NodeCapacity::default(),
         })
     }
 
@@ -246,6 +249,18 @@ impl NodeService {
 
     pub async fn health_interval(&self) -> std::time::Duration {
         self.runtime.read().await.health_interval
+    }
+
+    pub(crate) async fn acquire_request(&self, node: &NodeView) -> ApiResult<NodeLease> {
+        self.capacity
+            .acquire(node.node.id, node.max_concurrency)
+            .await
+    }
+
+    pub(crate) async fn acquire_probe(&self, node: &NodeView) -> ApiResult<ProbeLease> {
+        self.capacity
+            .acquire_probe(node.node.id, node.max_concurrency)
+            .await
     }
 
     pub async fn list(&self) -> ApiResult<Vec<NodeView>> {
@@ -493,8 +508,14 @@ impl NodeService {
     }
 
     async fn probe_model(&self, node: &node::Model) -> node_metric::Model {
+        let capacity = async {
+            let maximum = db::get_node_max_concurrency(&self.db, node.id).await?;
+            self.capacity.acquire_probe(node.id, maximum).await
+        }
+        .await;
         let started = Instant::now();
         let result = async {
+            let _lease = capacity?;
             let upstream = security::validate_upstream(&node.url, &self.config).await?;
             let timeout = self.runtime.read().await.upstream_timeout;
             let client = security::client_for(&upstream, timeout)?;
@@ -547,7 +568,19 @@ impl NodeService {
         elapsed: std::time::Duration,
         success: bool,
     ) {
-        if success && bytes > 0 {
+        self.record_transfer_observation(id, bytes, elapsed, success, true)
+            .await;
+    }
+
+    pub(crate) async fn record_transfer_observation(
+        &self,
+        id: Uuid,
+        bytes: u64,
+        elapsed: Duration,
+        success: bool,
+        measure_speed: bool,
+    ) {
+        if measure_speed && success && bytes > 0 && !elapsed.is_zero() {
             self.record_live_transfer(id, bytes, elapsed);
         }
         let sample = if success { 1.0_f64 } else { 0.0_f64 };
@@ -562,9 +595,15 @@ impl NodeService {
         if success {
             update = update.col_expr(node_metric::Column::Healthy, Expr::value(true));
         }
-        if success && bytes > 0 && elapsed.as_secs_f64() > 0.0 {
-            let bps = (bytes as f64 / elapsed.as_secs_f64()).min(i64::MAX as f64) as i64;
+        if success && bytes > 0 {
             let byte_count = std::cmp::min(bytes, i64::MAX as u64) as i64;
+            update = update.col_expr(
+                node_metric::Column::TotalBytes,
+                Expr::col(node_metric::Column::TotalBytes).add(byte_count),
+            );
+        }
+        if measure_speed && success && bytes > 0 && elapsed.as_secs_f64() > 0.0 {
+            let bps = (bytes as f64 / elapsed.as_secs_f64()).min(i64::MAX as f64) as i64;
             update = update
                 .col_expr(node_metric::Column::CurrentBps, Expr::value(bps))
                 .col_expr(
@@ -581,10 +620,6 @@ impl NodeService {
                                 .div(10),
                         )
                         .into(),
-                )
-                .col_expr(
-                    node_metric::Column::TotalBytes,
-                    Expr::col(node_metric::Column::TotalBytes).add(byte_count),
                 );
         }
         if let Err(error) = update.exec(&self.db).await {
@@ -989,6 +1024,34 @@ mod tests {
         assert_eq!(after_probe.speed_bps, metric.speed_bps);
         assert_eq!(after_probe.current_bps, metric.current_bps);
         assert_eq!(after_probe.total_bytes, metric.total_bytes);
+    }
+
+    #[tokio::test]
+    async fn resource_budget_counts_bytes_without_a_speed_sample() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path().to_owned());
+        let db = db::connect(&config.database_url).await.unwrap();
+        let service = NodeService::new(Arc::new(config), db.clone()).unwrap();
+        let node = service
+            .create(plain_node_input(DOCKER_HUB_ROUTE_ID))
+            .await
+            .unwrap();
+        service
+            .record_transfer(node.node.id, 900, Duration::ZERO, true)
+            .await;
+        let metric = db::metric_for(&db, node.node.id).await.unwrap().unwrap();
+        assert_eq!(metric.total_bytes, 900);
+        assert_eq!(metric.speed_bps, 0);
+        service
+            .record_transfer(node.node.id, 1_000, Duration::from_secs(1), true)
+            .await;
+        service
+            .record_transfer_observation(node.node.id, 10_000, Duration::from_secs(10), true, false)
+            .await;
+        let metric = db::metric_for(&db, node.node.id).await.unwrap().unwrap();
+        assert_eq!(metric.total_bytes, 11_900);
+        assert_eq!(metric.speed_bps, 1_000);
+        assert_eq!(metric.current_bps, 1_000);
     }
 
     #[tokio::test]

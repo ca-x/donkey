@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use futures_util::StreamExt;
 use http_content_range::ContentRange;
 use sha2::{Digest, Sha256};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
@@ -19,8 +19,12 @@ use crate::{
     db::registry_route,
     error::{ApiResult, AppError},
     registry_routes::RepositoryMode,
+    resource_budget::{BudgetedBytes, MemoryLease, StreamMemoryBudget},
     state::AppState,
 };
+
+const STREAM_READ_BYTES: usize = 64 * 1024;
+const SEQUENTIAL_STREAM_MEMORY_BYTES: u64 = 1024 * 1024;
 
 pub async fn handle(State(state): State<AppState>, request: Request) -> Response {
     let count_traffic = request.uri().path().starts_with("/v2");
@@ -267,7 +271,14 @@ async fn stream_blob(
         )
         .await;
     }
+    let memory_budget = state.scheduler.stream_memory_budget();
     let client_idle_timeout = state.upstream.timeout().await;
+    let sequential_memory = tokio::time::timeout(
+        client_idle_timeout,
+        memory_budget.acquire(SEQUENTIAL_STREAM_MEMORY_BYTES),
+    )
+    .await
+    .map_err(|_| AppError::Upstream("stream byte capacity remained unavailable".into()))??;
     let mut last_error = None;
     let mut attempted_nodes = std::collections::HashSet::new();
     loop {
@@ -302,13 +313,15 @@ async fn stream_blob(
                     response
                 }
                 Ok(response) => {
-                    state
-                        .scheduler
-                        .observe_node(node.node.id, 0, started.elapsed(), false);
-                    state
-                        .nodes
-                        .record_transfer(node.node.id, 0, started.elapsed(), false)
-                        .await;
+                    if response.status() != StatusCode::NOT_FOUND {
+                        state
+                            .scheduler
+                            .observe_node(node.node.id, 0, started.elapsed(), false);
+                        state
+                            .nodes
+                            .record_transfer(node.node.id, 0, started.elapsed(), false)
+                            .await;
+                    }
                     last_error = Some(AppError::Upstream(format!(
                         "{} returned {}",
                         node.node.name,
@@ -351,6 +364,7 @@ async fn stream_blob(
                     client_idle_timeout,
                     request_started,
                     metrics: metrics.clone(),
+                    sequential_memory,
                 })
                 .await;
             };
@@ -383,7 +397,7 @@ async fn stream_blob(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/octet-stream")
                 .to_owned();
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<BudgetedBytes, std::io::Error>>(8);
             let expected = expected_digest.map(str::to_owned);
             let relay = StreamRelay {
                 upstream: state.upstream.clone(),
@@ -405,6 +419,8 @@ async fn stream_blob(
                 scheduler: state.scheduler.clone(),
                 range_failures: std::sync::Arc::new(DashMap::new()),
                 metrics: metrics.clone(),
+                memory_budget,
+                sequential_memory,
             };
             let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
@@ -449,11 +465,13 @@ fn cached_get_request(path: &str, headers: &HeaderMap) -> ApiResult<Request> {
 // client must still see a terminal error when it resumes reading, even if
 // there was no room to enqueue that error before the relay timed out.
 fn relay_body(
-    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    rx: tokio::sync::mpsc::Receiver<Result<BudgetedBytes, std::io::Error>>,
     complete: tokio::sync::oneshot::Receiver<ApiResult<()>>,
 ) -> Body {
     let data = futures_util::stream::unfold(rx, |mut rx| async {
-        rx.recv().await.map(|chunk| (chunk, rx))
+        rx.recv()
+            .await
+            .map(|chunk| (chunk.map(BudgetedBytes::into_bytes), rx))
     });
     let terminal = futures_util::stream::once(async move {
         match complete.await {
@@ -469,8 +487,8 @@ fn relay_body(
 // A downstream consumer must not retain scarce upstream slots forever.
 // Reuse the configured upstream timeout as the per-send idle budget.
 async fn send_relay_chunk(
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    chunk: Result<Bytes, std::io::Error>,
+    tx: &tokio::sync::mpsc::Sender<Result<BudgetedBytes, std::io::Error>>,
+    chunk: Result<BudgetedBytes, std::io::Error>,
     idle_timeout: std::time::Duration,
 ) -> ApiResult<()> {
     tokio::time::timeout(idle_timeout, tx.send(chunk))
@@ -484,7 +502,7 @@ async fn stream_unknown_blob(relay: UnknownBlobRelay) -> ApiResult<Response> {
     let response_headers = relay.response.headers().clone();
     let request_started = relay.request_started;
     let metrics = relay.metrics.clone();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<BudgetedBytes, std::io::Error>>(8);
     let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let _ = complete_tx.send(relay_unknown_blob(relay, tx).await);
@@ -509,7 +527,19 @@ async fn stream_unknown_blob(relay: UnknownBlobRelay) -> ApiResult<Response> {
 
 async fn relay_unknown_blob(
     relay: UnknownBlobRelay,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    tx: tokio::sync::mpsc::Sender<Result<BudgetedBytes, std::io::Error>>,
+) -> ApiResult<()> {
+    let cancellation = tx.clone();
+    tokio::select! {
+        biased;
+        _ = cancellation.closed() => Err(stream_disconnected()),
+        result = relay_unknown_blob_inner(relay, tx) => result,
+    }
+}
+
+async fn relay_unknown_blob_inner(
+    relay: UnknownBlobRelay,
+    tx: tokio::sync::mpsc::Sender<Result<BudgetedBytes, std::io::Error>>,
 ) -> ApiResult<()> {
     let UnknownBlobRelay {
         cache,
@@ -525,6 +555,7 @@ async fn relay_unknown_blob(
         client_idle_timeout,
         request_started: _,
         metrics,
+        sequential_memory,
     } = relay;
     let partial_dir = cache.temp_dir().join(&key);
     tokio::fs::create_dir_all(&partial_dir).await?;
@@ -537,22 +568,42 @@ async fn relay_unknown_blob(
         .await?;
     let started = std::time::Instant::now();
     let mut transferred = 0_u64;
+    let mut non_network_wait = Duration::ZERO;
+    let no_progress_timeout = client_idle_timeout.min(Duration::from_secs(30));
+    let mut progress_deadline = tokio::time::Instant::now() + no_progress_timeout;
     let mut hasher = Sha256::new();
-    let mut body = response.bytes_stream();
+    let mut body = bounded_response_stream(response);
+    let mut node_outcome = None;
     let result = async {
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|error| AppError::Upstream(error.to_string()))?;
+        while let Some(chunk) = tokio::time::timeout_at(progress_deadline, body.next())
+            .await
+            .map_err(|_| {
+                node_outcome = Some(false);
+                stream_stalled()
+            })?
+        {
+            let chunk = chunk.map_err(|error| {
+                node_outcome = Some(false);
+                AppError::Upstream(error.to_string())
+            })?;
             if chunk.is_empty() {
                 continue;
             }
             hasher.update(&chunk);
-            file.write_all(&chunk).await?;
+            let wait_started = Instant::now();
             transferred = transferred.saturating_add(chunk.len() as u64);
             metrics.record_upstream_bytes(chunk.len() as u64);
-            node_service.record_live_bytes(node.node.id, chunk.len() as u64);
-            send_relay_chunk(&tx, Ok(chunk), client_idle_timeout).await?;
+            file.write_all(&chunk).await?;
+            send_relay_chunk(
+                &tx,
+                Ok(sequential_memory.clone().attach(chunk)),
+                client_idle_timeout,
+            )
+            .await?;
+            non_network_wait += wait_started.elapsed();
+            progress_deadline = tokio::time::Instant::now() + no_progress_timeout;
         }
-        file.flush().await?;
+        let wait_started = Instant::now();
         if let Some(expected) = expected_digest.as_deref() {
             let actual = format!("sha256:{:x}", hasher.finalize());
             if actual != expected {
@@ -560,19 +611,32 @@ async fn relay_unknown_blob(
                 // request; it would fail the same digest check forever while
                 // never giving an alternate node a chance to repair it.
                 let _ = tokio::fs::remove_file(&partial).await;
+                node_outcome = Some(false);
                 return Err(AppError::Integrity);
             }
         }
+        node_outcome = Some(true);
+        file.flush().await?;
         cache
             .admit(&key, &partial, &media_type, expected_digest)
             .await?;
+        non_network_wait += wait_started.elapsed();
         Ok(())
     }
     .await;
-    scheduler.observe_node(node.node.id, transferred, started.elapsed(), result.is_ok());
-    node_service
-        .record_transfer(node.node.id, transferred, started.elapsed(), result.is_ok())
-        .await;
+    let elapsed = started.elapsed();
+    if let Some(success) = node_outcome {
+        let measure_speed = result.is_ok() && measures_network_speed(elapsed, non_network_wait);
+        scheduler.observe_node(
+            node.node.id,
+            if measure_speed { transferred } else { 0 },
+            elapsed,
+            success,
+        );
+        node_service
+            .record_transfer_observation(node.node.id, transferred, elapsed, success, measure_speed)
+            .await;
+    }
     if result.is_ok() {
         let _ = tokio::fs::remove_dir_all(&partial_dir).await;
     } else {
@@ -608,6 +672,8 @@ struct StreamRelay {
     scheduler: crate::scheduler::Scheduler,
     range_failures: std::sync::Arc<DashMap<uuid::Uuid, ()>>,
     metrics: crate::transfer_metrics::TransferMetrics,
+    memory_budget: StreamMemoryBudget,
+    sequential_memory: MemoryLease,
 }
 
 struct UnknownBlobRelay {
@@ -624,6 +690,19 @@ struct UnknownBlobRelay {
     client_idle_timeout: std::time::Duration,
     request_started: Instant,
     metrics: crate::transfer_metrics::TransferMetrics,
+    sequential_memory: MemoryLease,
+}
+
+fn bounded_response_stream(
+    response: reqwest::Response,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+    tokio_util::io::ReaderStream::with_capacity(
+        tokio_util::io::StreamReader::new(stream),
+        STREAM_READ_BYTES,
+    )
 }
 
 struct ResumeRequest<'a> {
@@ -637,6 +716,7 @@ struct ResumeRequest<'a> {
     start: u64,
     end: u64,
     total: u64,
+    progress_deadline: tokio::time::Instant,
 }
 
 fn stream_window(response: &reqwest::Response) -> Option<StreamWindow> {
@@ -677,9 +757,61 @@ fn remaining_window_bytes(end: u64, offset: u64) -> Option<u64> {
     end.checked_sub(offset)?.checked_add(1)
 }
 
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(2);
+const MAX_STALLED_RESPONSES: usize = 4;
+
+fn stream_disconnected() -> AppError {
+    AppError::Upstream("client disconnected during Blob stream".into())
+}
+
+fn stream_stalled() -> AppError {
+    AppError::Upstream("Blob stream made no progress within its retry budget".into())
+}
+
+fn measures_network_speed(elapsed: Duration, non_network_wait: Duration) -> bool {
+    non_network_wait < Duration::from_millis(10) || non_network_wait.saturating_mul(5) < elapsed
+}
+
+fn transient_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
+}
+
+fn bounded_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
+    let delay = value
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .ok()
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc2822(value)
+                .ok()
+                .map(|deadline| {
+                    deadline
+                        .signed_duration_since(chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or(Duration::ZERO)
+                })
+        })?;
+    Some(delay.min(MAX_RETRY_AFTER))
+}
+
 async fn relay_stream_blob(
     relay: StreamRelay,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    tx: tokio::sync::mpsc::Sender<Result<BudgetedBytes, std::io::Error>>,
+) -> ApiResult<()> {
+    let cancellation = tx.clone();
+    tokio::select! {
+        biased;
+        _ = cancellation.closed() => Err(stream_disconnected()),
+        result = relay_stream_blob_inner(relay, tx) => result,
+    }
+}
+
+async fn relay_stream_blob_inner(
+    relay: StreamRelay,
+    tx: tokio::sync::mpsc::Sender<Result<BudgetedBytes, std::io::Error>>,
 ) -> ApiResult<()> {
     let StreamRelay {
         upstream,
@@ -701,6 +833,8 @@ async fn relay_stream_blob(
         scheduler,
         range_failures,
         metrics,
+        memory_budget,
+        sequential_memory,
     } = relay;
     let complete_blob = window.start == 0 && window.end.checked_add(1) == Some(window.total);
     let stable_partial_dir = cache.temp_dir().join(&key);
@@ -734,13 +868,16 @@ async fn relay_stream_blob(
     let mut hasher = Sha256::new();
     let mut offset = window.start;
     let mut response = Some((response, node_lease));
+    let no_progress_timeout = client_idle_timeout.min(Duration::from_secs(30));
+    let mut progress_deadline = tokio::time::Instant::now() + no_progress_timeout;
+    let mut stalled_responses = 0;
 
     if complete_blob && existing > 0 {
         // The initial body is superseded by replay/resume. Release its slot
         // before opening a replacement (including on a single-slot node).
         response.take();
         let mut saved = tokio::fs::File::open(&partial).await?;
-        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut buffer = vec![0_u8; STREAM_READ_BYTES];
         loop {
             let read = saved.read(&mut buffer).await?;
             if read == 0 {
@@ -749,7 +886,13 @@ async fn relay_stream_blob(
             let chunk = Bytes::copy_from_slice(&buffer[..read]);
             hasher.update(&chunk);
             offset += read as u64;
-            send_relay_chunk(&tx, Ok(chunk), client_idle_timeout).await?;
+            send_relay_chunk(
+                &tx,
+                Ok(sequential_memory.clone().attach(chunk)),
+                client_idle_timeout,
+            )
+            .await?;
+            progress_deadline = tokio::time::Instant::now() + no_progress_timeout;
         }
         if offset <= window.end {
             scheduler.record_resume();
@@ -764,6 +907,7 @@ async fn relay_stream_blob(
                 start: offset,
                 end: window.end,
                 total: window.total,
+                progress_deadline,
             })
             .await?;
             current_node = next_node;
@@ -797,6 +941,7 @@ async fn relay_stream_blob(
             tx: &tx,
             client_idle_timeout,
             range_failures: range_failures.clone(),
+            memory_budget: &memory_budget,
         })
         .await?;
         offset = window.end + 1;
@@ -808,9 +953,20 @@ async fn relay_stream_blob(
             .ok_or_else(|| AppError::Upstream("Blob stream response is missing".into()))?;
         let started = std::time::Instant::now();
         let mut transferred = 0_u64;
-        let mut body = current_response.bytes_stream();
+        let mut non_network_wait = Duration::ZERO;
+        let mut body = bounded_response_stream(current_response);
         let mut stream_error = None;
-        while let Some(chunk) = body.next().await {
+        loop {
+            let next = match tokio::time::timeout_at(progress_deadline, body.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    stream_error = Some(stream_stalled().to_string());
+                    break;
+                }
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             match chunk {
                 Ok(chunk) => {
                     if chunk.is_empty() {
@@ -825,12 +981,20 @@ async fn relay_stream_blob(
                     if complete_blob {
                         hasher.update(&chunk);
                     }
-                    node_service.record_live_bytes(nodes[current_node].node.id, chunk.len() as u64);
+                    let wait_started = Instant::now();
                     file.write_all(&chunk).await?;
                     offset += chunk.len() as u64;
                     transferred += chunk.len() as u64;
                     metrics.record_upstream_bytes(chunk.len() as u64);
-                    send_relay_chunk(&tx, Ok(chunk), client_idle_timeout).await?;
+                    send_relay_chunk(
+                        &tx,
+                        Ok(sequential_memory.clone().attach(chunk)),
+                        client_idle_timeout,
+                    )
+                    .await?;
+                    non_network_wait += wait_started.elapsed();
+                    stalled_responses = 0;
+                    progress_deadline = tokio::time::Instant::now() + no_progress_timeout;
                 }
                 Err(error) => {
                     stream_error = Some(error.to_string());
@@ -841,22 +1005,31 @@ async fn relay_stream_blob(
         let completed = offset > window.end;
         drop(body);
         drop(node_lease);
+        let elapsed = started.elapsed();
+        let measure_speed = measures_network_speed(elapsed, non_network_wait);
         scheduler.observe_node(
             nodes[current_node].node.id,
-            transferred,
-            started.elapsed(),
+            if measure_speed { transferred } else { 0 },
+            elapsed,
             completed,
         );
         node_service
-            .record_transfer(
+            .record_transfer_observation(
                 nodes[current_node].node.id,
                 transferred,
-                started.elapsed(),
+                elapsed,
                 completed,
+                measure_speed,
             )
             .await;
         if completed {
             break;
+        }
+        if transferred == 0 {
+            stalled_responses += 1;
+            if stalled_responses >= MAX_STALLED_RESPONSES {
+                return Err(stream_stalled());
+            }
         }
         tracing::warn!(
             path,
@@ -880,6 +1053,7 @@ async fn relay_stream_blob(
             start: offset,
             end: window.end,
             total: window.total,
+            progress_deadline,
         })
         .await?;
         current_node = next_node;
@@ -906,6 +1080,17 @@ async fn relay_stream_blob(
 async fn resume_stream_response(
     request: ResumeRequest<'_>,
 ) -> ApiResult<(usize, reqwest::Response, crate::node_selection::NodeLease)> {
+    tokio::time::timeout_at(
+        request.progress_deadline,
+        resume_stream_response_inner(request),
+    )
+    .await
+    .map_err(|_| stream_stalled())?
+}
+
+async fn resume_stream_response_inner(
+    request: ResumeRequest<'_>,
+) -> ApiResult<(usize, reqwest::Response, crate::node_selection::NodeLease)> {
     use backoff::backoff::Backoff;
 
     if request.nodes.is_empty() {
@@ -922,6 +1107,7 @@ async fn resume_stream_response(
     loop {
         let capacity_changed = request.scheduler.capacity_changed();
         let mut attempted = false;
+        let mut retry_delay = Duration::ZERO;
         let ordered = request
             .scheduler
             .ordered_parallel_nodes(
@@ -985,13 +1171,19 @@ async fn resume_stream_response(
                     return Ok((index, response, node_lease));
                 }
                 Ok(response) => {
-                    request
-                        .scheduler
-                        .observe_node(node.node.id, 0, started.elapsed(), false);
-                    request
-                        .node_service
-                        .record_transfer(node.node.id, 0, started.elapsed(), false)
-                        .await;
+                    if transient_status(response.status()) {
+                        retry_delay = retry_delay
+                            .max(bounded_retry_after(response.headers()).unwrap_or(Duration::ZERO));
+                    }
+                    if response.status() != StatusCode::NOT_FOUND {
+                        request
+                            .scheduler
+                            .observe_node(node.node.id, 0, started.elapsed(), false);
+                        request
+                            .node_service
+                            .record_transfer(node.node.id, 0, started.elapsed(), false)
+                            .await;
+                    }
                     last_error = Some(format!(
                         "{} returned an invalid resume response ({})",
                         node.node.name,
@@ -1017,7 +1209,7 @@ async fn resume_stream_response(
         let Some(delay) = policy.next_backoff() else {
             break;
         };
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(delay.max(retry_delay)).await;
     }
     Err(AppError::Upstream(last_error.unwrap_or_else(|| {
         "all nodes failed to resume the Blob stream".into()
@@ -1045,9 +1237,10 @@ struct ParallelRelay<'a> {
     scheduler: &'a crate::scheduler::Scheduler,
     file: &'a mut tokio::fs::File,
     hasher: &'a mut Sha256,
-    tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    tx: &'a tokio::sync::mpsc::Sender<Result<BudgetedBytes, std::io::Error>>,
     client_idle_timeout: std::time::Duration,
     range_failures: std::sync::Arc<DashMap<uuid::Uuid, ()>>,
+    memory_budget: &'a StreamMemoryBudget,
 }
 
 struct ParallelChunkRequest {
@@ -1081,9 +1274,10 @@ async fn relay_parallel_ranges(relay: ParallelRelay<'_>) -> ApiResult<()> {
         start = end + 1;
     }
     let concurrency = relay.config.concurrency.min(chunks.len()).max(1);
-    let mut results = futures_util::stream::iter(chunks)
-        .map(|chunk| {
-            fetch_parallel_chunk(ParallelChunkRequest {
+    let results = futures_util::stream::iter(chunks)
+        .then(|chunk| {
+            let memory_budget = relay.memory_budget.clone();
+            let request = ParallelChunkRequest {
                 upstream: relay.upstream.clone(),
                 nodes: nodes.clone(),
                 scheduler: relay.scheduler.clone(),
@@ -1093,20 +1287,38 @@ async fn relay_parallel_ranges(relay: ParallelRelay<'_>) -> ApiResult<()> {
                 chunk,
                 range_failures: relay.range_failures.clone(),
                 metrics: relay.scheduler.transfer_metrics(),
-            })
+            };
+            async move {
+                let memory = tokio::time::timeout(
+                    relay.client_idle_timeout,
+                    memory_budget.acquire(chunk.end - chunk.start + 1),
+                )
+                .await
+                .map_err(|_| {
+                    AppError::Upstream("stream byte capacity remained unavailable".into())
+                })??;
+                Ok::<_, AppError>(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                    fetch_parallel_chunk(request, memory),
+                )))
+            }
         })
+        .map(|task| async move { task?.await.map_err(AppError::internal)? })
         .buffered(concurrency);
+    futures_util::pin_mut!(results);
 
     while let Some(result) = results.next().await {
         let chunk = result?;
-        relay.hasher.update(&chunk);
-        relay.file.write_all(&chunk).await?;
+        relay.hasher.update(chunk.bytes());
+        relay.file.write_all(chunk.bytes()).await?;
         send_relay_chunk(relay.tx, Ok(chunk), relay.client_idle_timeout).await?;
     }
     Ok(())
 }
 
-async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes> {
+async fn fetch_parallel_chunk(
+    request: ParallelChunkRequest,
+    memory: MemoryLease,
+) -> ApiResult<BudgetedBytes> {
     use backoff::backoff::Backoff;
 
     let expected = request.chunk.end - request.chunk.start + 1;
@@ -1119,6 +1331,7 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
     loop {
         let capacity_changed = request.scheduler.capacity_changed();
         let mut attempted = false;
+        let mut retry_delay = Duration::ZERO;
         let eligible = request
             .nodes
             .iter()
@@ -1155,6 +1368,8 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
             };
             attempted = true;
             let started = std::time::Instant::now();
+            let mut penalize_node = true;
+            let mut unavailable = false;
             let result = async {
                 let response = request
                     .upstream
@@ -1166,6 +1381,19 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
                         crate::upstream::RangeMode::Exact(request.chunk.start, request.chunk.end),
                     )
                     .await?;
+                let status = response.status();
+                if !status.is_success() {
+                    penalize_node = status != StatusCode::NOT_FOUND;
+                    unavailable = !transient_status(status);
+                    if !unavailable {
+                        retry_delay = retry_delay
+                            .max(bounded_retry_after(response.headers()).unwrap_or(Duration::ZERO));
+                    }
+                    return Err(AppError::Upstream(format!(
+                        "{} returned {status} for a stream chunk",
+                        node.node.name,
+                    )));
+                }
                 if response.status() != StatusCode::PARTIAL_CONTENT
                     || !stream_window(&response).is_some_and(|window| {
                         window.start == request.chunk.start
@@ -1182,9 +1410,6 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
                     if bytes.len().saturating_add(chunk.len()) as u64 > expected {
                         return Err(AppError::Integrity);
                     }
-                    request
-                        .node_service
-                        .record_live_bytes(node.node.id, chunk.len() as u64);
                     request.metrics.record_upstream_bytes(chunk.len() as u64);
                     bytes.extend_from_slice(&chunk);
                 }
@@ -1195,30 +1420,28 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
             }
             .await;
             drop(permit);
-            request.scheduler.observe_node(
-                node.node.id,
-                result.as_ref().map_or(0, |bytes| bytes.len() as u64),
-                started.elapsed(),
-                result.is_ok(),
-            );
-            request
-                .node_service
-                .record_transfer(
+            let elapsed = started.elapsed();
+            if penalize_node {
+                request.scheduler.observe_node(
                     node.node.id,
                     result.as_ref().map_or(0, |bytes| bytes.len() as u64),
-                    started.elapsed(),
+                    elapsed,
                     result.is_ok(),
-                )
-                .await;
+                );
+                request
+                    .node_service
+                    .record_transfer(
+                        node.node.id,
+                        result.as_ref().map_or(0, |bytes| bytes.len() as u64),
+                        elapsed,
+                        result.is_ok(),
+                    )
+                    .await;
+            }
             match result {
-                Ok(bytes) => return Ok(bytes),
+                Ok(bytes) => return Ok(memory.attach(bytes)),
                 Err(error) => {
-                    // A malformed Range response is not useful for any other
-                    // chunk of this Blob.  Exclude the node for the remainder
-                    // of this stream so every chunk does not repeat the same
-                    // failed probe.  Transport failures still go through the
-                    // scheduler cooldown and may be retried later.
-                    if matches!(&error, AppError::Integrity) {
+                    if unavailable || matches!(&error, AppError::Integrity) {
                         request.range_failures.insert(node.node.id, ());
                     }
                     request.scheduler.record_retry();
@@ -1236,7 +1459,7 @@ async fn fetch_parallel_chunk(request: ParallelChunkRequest) -> ApiResult<Bytes>
         let Some(delay) = policy.next_backoff() else {
             break;
         };
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(delay.max(retry_delay)).await;
     }
     Err(last_error.unwrap_or_else(|| AppError::Upstream("all nodes failed a stream chunk".into())))
 }
@@ -1402,35 +1625,54 @@ async fn proxy_passthrough(
     nodes: Vec<crate::nodes::NodeView>,
 ) -> ApiResult<Response> {
     let mut last_error = None;
-    for node in nodes {
-        let result = async {
-            let upstream_response = state
-                .upstream
-                .send(
-                    &node,
-                    method.clone(),
-                    &path,
-                    &request_headers,
-                    crate::upstream::RangeMode::ForwardClient,
-                )
-                .await?;
-            if retryable_upstream_status(upstream_response.status()) {
-                return Err(AppError::Upstream(format!(
-                    "{} returned {}",
-                    node.node.name,
-                    upstream_response.status()
-                )));
+    let mut attempted_nodes = std::collections::HashSet::new();
+    loop {
+        let capacity_changed = state.scheduler.capacity_changed();
+        for node in &nodes {
+            if attempted_nodes.contains(&node.node.id) {
+                continue;
             }
-            Ok::<_, AppError>(to_response(
-                upstream_response,
-                Some(state.transfer_metrics.clone()),
-            ))
+            let Some(node_lease) = state
+                .scheduler
+                .try_acquire(node.node.id, node.max_concurrency)
+            else {
+                continue;
+            };
+            attempted_nodes.insert(node.node.id);
+            let result = async {
+                let upstream_response = state
+                    .upstream
+                    .send(
+                        node,
+                        method.clone(),
+                        &path,
+                        &request_headers,
+                        crate::upstream::RangeMode::ForwardClient,
+                    )
+                    .await?;
+                if retryable_upstream_status(upstream_response.status()) {
+                    return Err(AppError::Upstream(format!(
+                        "{} returned {}",
+                        node.node.name,
+                        upstream_response.status()
+                    )));
+                }
+                Ok::<_, AppError>(to_response(
+                    upstream_response,
+                    Some(state.transfer_metrics.clone()),
+                    node_lease,
+                ))
+            }
+            .await;
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) => last_error = Some(error),
+            }
         }
-        .await;
-        match result {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
+        if attempted_nodes.len() == nodes.len() {
+            break;
         }
+        capacity_changed.await;
     }
     Err(last_error.unwrap_or_else(|| AppError::unavailable("Registry route is unavailable")))
 }
@@ -1529,15 +1771,23 @@ fn path_and_query(uri: &http::Uri) -> String {
 fn to_response(
     upstream: reqwest::Response,
     metrics: Option<crate::transfer_metrics::TransferMetrics>,
+    node_lease: crate::node_selection::NodeLease,
 ) -> Response {
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let body = Body::from_stream(upstream.bytes_stream().map(move |chunk| {
-        if let (Some(metrics), Ok(bytes)) = (&metrics, &chunk) {
-            metrics.record_upstream_bytes(bytes.len() as u64);
-        }
-        chunk.map_err(std::io::Error::other)
-    }));
+    let body = Body::from_stream(futures_util::stream::unfold(
+        (upstream.bytes_stream(), node_lease),
+        move |(mut stream, node_lease)| {
+            let metrics = metrics.clone();
+            async move {
+                let chunk = stream.next().await?;
+                if let (Some(metrics), Ok(bytes)) = (&metrics, &chunk) {
+                    metrics.record_upstream_bytes(bytes.len() as u64);
+                }
+                Some((chunk.map_err(std::io::Error::other), (stream, node_lease)))
+            }
+        },
+    ));
     let mut response = Response::new(body);
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
@@ -1782,5 +2032,123 @@ mod tests {
     fn stream_rejects_an_overrun_without_panicking() {
         assert_eq!(remaining_window_bytes(9, 0), Some(10));
         assert_eq!(remaining_window_bytes(9, 10), None);
+    }
+
+    #[tokio::test]
+    async fn relay_queue_keeps_byte_capacity_until_http_delivery() {
+        let global = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        let budget = StreamMemoryBudget::new(global.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+        send_relay_chunk(
+            &tx,
+            Ok(budget
+                .acquire(8)
+                .await
+                .unwrap()
+                .attach(Bytes::from_static(b"12345678"))),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(global.available_permits(), 0);
+        drop(tx);
+        complete_tx.send(Ok(())).unwrap();
+        let bytes = axum::body::to_bytes(relay_body(rx, complete_rx), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"12345678");
+        assert_eq!(global.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn dropping_relay_body_releases_queued_byte_capacity() {
+        let global = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        let budget = StreamMemoryBudget::new(global.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (_complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+        tx.send(Ok(budget
+            .acquire(8)
+            .await
+            .unwrap()
+            .attach(Bytes::from_static(b"12345678"))))
+            .await
+            .ok()
+            .unwrap();
+        let body = relay_body(rx, complete_rx);
+        assert_eq!(global.available_permits(), 0);
+        drop(body);
+        assert!(tx.is_closed());
+        assert_eq!(global.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn passthrough_shares_node_capacity_until_body_completion() {
+        let upstream = httpmock::MockServer::start_async().await;
+        let manifest = upstream.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v2/test/manifests/latest");
+            then.status(200).body("manifest");
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(Config::for_test(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let node = state
+            .nodes
+            .create(NodeInput {
+                name: "shared-passthrough".into(),
+                url: upstream.base_url(),
+                registry_route_id: DOCKER_HUB_ROUTE_ID,
+                enabled: true,
+                priority: 0,
+                max_concurrency: 1,
+                cf_preferred: false,
+                connect_ip_type: "ip".into(),
+                connect_ip: None,
+                auth_mode: "none".into(),
+                auth_username: None,
+                auth_header: None,
+                auth_secret: None,
+            })
+            .await
+            .unwrap();
+        let held = state.nodes.acquire_request(&node).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            proxy_passthrough(
+                &state,
+                Method::GET,
+                "/v2/test/manifests/latest".into(),
+                HeaderMap::new(),
+                vec![node.clone()],
+            ),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "passthrough must not bypass Blob node leases"
+        );
+        manifest.assert_calls(0);
+        drop(held);
+        let response = proxy_passthrough(
+            &state,
+            Method::GET,
+            "/v2/test/manifests/latest".into(),
+            HeaderMap::new(),
+            vec![node.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.nodes.capacity.active(node.node.id), 1);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"manifest"
+        );
+        assert_eq!(state.nodes.capacity.active(node.node.id), 0);
+        manifest.assert_calls(1);
     }
 }

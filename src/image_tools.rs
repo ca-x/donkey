@@ -930,6 +930,7 @@ impl ImageTools {
         accept: &str,
         limit: usize,
     ) -> ApiResult<(HeaderMap, Vec<u8>)> {
+        let _lease = self.nodes.acquire_request(node).await?;
         let mut headers = HeaderMap::new();
         headers.insert(header::ACCEPT, accept.parse().map_err(AppError::internal)?);
         let response = self
@@ -1005,6 +1006,7 @@ impl ImageTools {
         descriptor: &oci_client::manifest::OciDescriptor,
         destination: &Path,
     ) -> ApiResult<()> {
+        let _lease = self.nodes.acquire_request(node).await?;
         let path = format!("/v2/{repository}/blobs/{}", descriptor.digest);
         let response = self
             .upstream
@@ -2323,6 +2325,57 @@ mod tests {
         let nodes = NodeService::new(config.clone(), db.clone()).unwrap();
         let service = ImageTools::new(config, db, nodes).await.unwrap();
         (directory, service)
+    }
+
+    #[tokio::test]
+    async fn node_metadata_requests_share_proxy_connection_capacity() {
+        let upstream = MockServer::start_async().await;
+        let request_mock = upstream
+            .mock_async(|when, then| {
+                when.method(GET).path("/v2/audit/manifests/latest");
+                then.status(200).body("manifest");
+            })
+            .await;
+        let (_directory, service) = test_service().await;
+        let node = service
+            .nodes
+            .create(crate::nodes::NodeInput {
+                name: "shared-node-budget".into(),
+                url: upstream.base_url(),
+                registry_route_id: crate::registry_routes::DOCKER_HUB_ROUTE_ID,
+                enabled: true,
+                priority: 0,
+                max_concurrency: 1,
+                cf_preferred: false,
+                connect_ip_type: "ip".into(),
+                connect_ip: None,
+                auth_mode: "none".into(),
+                auth_username: None,
+                auth_header: None,
+                auth_secret: None,
+            })
+            .await
+            .unwrap();
+        let lease = service.nodes.capacity.try_acquire(node.node.id, 1).unwrap();
+        let mut request = Box::pin(service.node_bytes_once(
+            &node,
+            "/v2/audit/manifests/latest",
+            "application/json",
+            1024,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut request)
+                .await
+                .is_err()
+        );
+        request_mock.assert_calls_async(0).await;
+        drop(lease);
+        let (_, body) = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, b"manifest");
+        request_mock.assert_calls_async(1).await;
     }
 
     fn test_job(status: JobStatus, lease_until: Option<DateTime<Utc>>) -> image_job::Model {

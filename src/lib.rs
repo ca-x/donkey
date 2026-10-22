@@ -14,6 +14,7 @@ mod node_selection;
 pub mod nodes;
 pub mod registry;
 pub mod registry_routes;
+mod resource_budget;
 pub mod scheduler;
 pub(crate) mod scheduling;
 pub mod security;
